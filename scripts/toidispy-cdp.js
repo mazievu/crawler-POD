@@ -65,7 +65,7 @@ class ToidispyAutomation {
   async scrollAndLoad(maxScrolls = 5) {
     let lastCount = 0;
     for (let i = 0; i < maxScrolls; i++) {
-      await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); // eslint-disable-line no-undef
       await this.page.waitForTimeout(2000);
 
       const currentCount = await this.page.$$eval('.p-item-col', els => els.length);
@@ -96,7 +96,7 @@ class ToidispyAutomation {
    *     .p-carousel-item-img            → image (background-image)
    */
   async scrapePosts() {
-    return await this.page.evaluate(() => {
+    return await this.page.evaluate(() => { /* eslint-disable no-undef */
       const cards = document.querySelectorAll('.p-item-col');
       const items = [];
 
@@ -116,9 +116,6 @@ class ToidispyAutomation {
         const reactionsSection = card.querySelector('.item-reactions');
         let reactions = 0, comments = 0, shares = 0;
         if (reactionsSection) {
-          const divs = reactionsSection.querySelectorAll('div > p, div > span');
-          // The structure: div > p(success) for count, div > span for icon
-          // Actually it's: div > p (value), repeated for each metric
           const pElements = reactionsSection.querySelectorAll('p');
           const values = [];
           pElements.forEach(p => {
@@ -197,7 +194,7 @@ class ToidispyAutomation {
    *     .p-carousel-item-img            → image
    */
   async scrapeAdsLibrary() {
-    return await this.page.evaluate(() => {
+    return await this.page.evaluate(() => { /* eslint-disable no-undef */
       const cards = document.querySelectorAll('.p-item-col');
       const items = [];
 

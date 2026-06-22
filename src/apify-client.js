@@ -102,7 +102,7 @@ const INPUT_BUILDERS = {
   }),
 
   // eBay Sold Listings — caffein.dev/ebay-sold-listings
-  ebay: ({ query, maxItems, country }) => ({
+  ebay: ({ query, maxItems, country: _country }) => ({
     keywords: [query],
     count: maxItems,
     daysToScrape: 30,

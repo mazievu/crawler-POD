@@ -202,8 +202,8 @@ function insertSnapshots(runId, platform, query, items) {
   let newCount = 0, activeCount = 0, droppedCount = 0;
   const currentUids = new Set();
 
-  const insertMany = db.transaction((items) => {
-    for (const item of items) {
+  const insertMany = db.transaction((txItems) => {
+    for (const item of txItems) {
       const parsed = parseItemData(item);
       const itemUid = generateUid(platform, query, parsed);
       currentUids.add(itemUid);

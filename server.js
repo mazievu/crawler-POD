@@ -10,7 +10,7 @@ const path = require('path');
 const db = require('./src/database');
 const { getPlatform } = require('./src/platform-config');
 const { startActor, getRunStatus, fetchDatasetItems } = require('./src/apify-client');
-const { getFilterConfig, getDefaultFilters, getFiltersForUI, POSTS_CARD_SCHEMA, ADS_CARD_SCHEMA } = require('./scripts/toidispy-filters');
+const { getDefaultFilters, getFiltersForUI, POSTS_CARD_SCHEMA, ADS_CARD_SCHEMA } = require('./scripts/toidispy-filters');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -143,7 +143,7 @@ app.post('/api/toidispy/import', (req, res) => {
 // Toidispy — Run CDP with filters from UI
 app.post('/api/toidispy/run', async (req, res) => {
   try {
-    const { keyword, section, filters, maxScrolls } = req.body;
+    const { keyword, section, filters } = req.body;
     if (!keyword?.trim()) return res.status(400).json({ error: 'keyword is required' });
 
     // Create a run record
