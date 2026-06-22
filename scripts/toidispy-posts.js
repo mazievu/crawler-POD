@@ -1,5 +1,6 @@
 // Toidispy Posts Scraper
 // Chạy trong browser context via CDP
+/* eslint-env browser */
 
 function scrapePosts() {
   const cards = document.querySelectorAll('.p-item-col');

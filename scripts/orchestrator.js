@@ -1,7 +1,7 @@
 // Main Orchestrator
 // Tích hợp SearXNG + Toidispy scraping
 
-const { search, discoverUrls } = require('./searxng');
+const { search: _search, discoverUrls } = require('./searxng'); // eslint-disable-line no-unused-vars
 
 // SearXNG search for URL discovery
 async function discoverProductUrls(keyword) {

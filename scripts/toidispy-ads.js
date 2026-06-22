@@ -1,5 +1,6 @@
 // Toidispy Ads Library Scraper
 // Chạy trong browser context via CDP
+/* eslint-env browser */
 
 function scrapeAdsLibrary() {
   const cards = document.querySelectorAll('.p-item-col');
