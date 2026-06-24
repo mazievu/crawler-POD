@@ -1,7 +1,7 @@
 // SearXNG Search Module
 // Tìm URLs từ nhiều nguồn
 
-const SEARXNG_URL = 'http://localhost:8888';
+const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8888';
 
 async function search(query, options = {}) {
   const {
