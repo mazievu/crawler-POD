@@ -149,15 +149,14 @@ Fallback: giữ Apify actor (chỉ khi thực sự cần).
 
 | Yếu tố | Đánh giá |
 |--------|----------|
-| Anti-bot | 🟡 TRUNG BÌNH |
-| Free API | ✅ **Etsy API (free tier) — 10 requests/sec, 10K listings/day** |
-| Playwright | ✅ |
-| **Khả thi free?** | 🟢 CÓ — dùng Etsy API |
+| Anti-bot | 🔴 CAO — Etsy search/category bị DataDome |
+| Free source | ✅ **SearXNG search discovery — indexed public listing URLs** |
+| Playwright | 🟡 Bị DataDome trong môi trường hiện tại |
+| **Khả thi free?** | 🟢 CÓ — dùng SearXNG, không dùng Etsy developer API |
 
 ```javascript
-// Etsy API — free, 10K listings/day
-GET https://openapi.etsy.com/v3/application/listings/search?keywords={keyword}
-Headers: x-api-key: {api_key}
+// Etsy free path — no developer approval
+GET http://localhost:8888/search?q=site:etsy.com/listing%20{keyword}&format=json
 ```
 
 ### 2.11 Twitter/X (xquik/x-tweet-scraper — PAID)
@@ -175,15 +174,14 @@ Headers: x-api-key: {api_key}
 
 | Yếu tố | Đánh giá |
 |--------|----------|
-| Anti-bot | 🟢 THẤP — eBay có API free |
-| Free API | ✅ **eBay Browse API (free) — 5000 calls/day** |
-| Playwright | ✅ |
-| **Khả thi free?** | 🟢 CÓ — dùng eBay API |
+| Anti-bot | 🔴 CAO — eBay public search trả 403/Error Page |
+| Free source | ✅ **SearXNG search discovery — indexed public item URLs** |
+| Playwright | 🟡 Fallback nhưng đang bị Error Page |
+| **Khả thi free?** | 🟢 CÓ — dùng SearXNG, không dùng eBay developer API |
 
 ```javascript
-// eBay Browse API — free, 5000 calls/day
-GET https://api.ebay.com/buy/browse/v1/item_summary/search?q={keyword}&filter=buyingOptions:{FIXED_PRICE}
-Headers: Authorization: Bearer {access_token}
+// eBay free path — no developer approval
+GET http://localhost:8888/search?q=site:ebay.com/itm%20{keyword}&format=json
 ```
 
 ### 2.13 Instagram (apify/instagram-search-scraper — PAID)
@@ -283,10 +281,9 @@ Tier 3: ĐÃ CÓ (Không cần làm gì thêm)
     "retry": { "max": 3, "backoff": "exponential" }
   },
   "etsy": {
-    "method": "api",
-    "baseUrl": "https://openapi.etsy.com/v3/application/listings/search",
-    "auth": "x-api-key",
-    "rateLimit": "10/sec",
+    "method": "search_discovery",
+    "baseUrl": "http://localhost:8888/search",
+    "query": "site:etsy.com/listing {keyword}",
     "retry": { "max": 5, "backoff": "exponential" }
   },
   "amazon": {
@@ -380,10 +377,10 @@ attempt 10: [log failure, skip platform]        → report
 ├────────────────────────────────────────────────────────┤
 │ 1. scaffold: scraper-factory.js + strategy-selector    │
 │ 2. src/scrapers/reddit.js — Reddit API                │
-│ 3. src/scrapers/ebay.js — eBay Browse API             │
+│ 3. src/scrapers/ebay.js — SearXNG item discovery      │
 │ 4. src/scrapers/shopify.js — Shopify Storefront API   │
-│ 5. src/scrapers/etsy.js — Etsy API                    │
-│ 6. src/scrapers/pinterest.js — Pinterest API           │
+│ 5. src/scrapers/etsy.js — SearXNG listing discovery   │
+│ 6. src/scrapers/pinterest.js — Public page fallback    │
 │ 7. server.js route: POST /api/scrape (unified)        │
 │ 8. test: node test/anti-bot/phase1-test.js            │
 └────────────────────────────────────────────────────────┘
@@ -596,10 +593,10 @@ const SCORE = {
 | Platform | Phương Pháp Free | Độ Khó | Thời Gian | Khả Thi? |
 |----------|-----------------|--------|-----------|---------|
 | Reddit | API | 🟢 | 1h | ✅ |
-| eBay | API | 🟢 | 1h | ✅ |
+| eBay | SearXNG discovery | 🟢 | 1h | ✅ |
 | Shopify | API | 🟢 | 1h | ✅ |
-| Etsy | API | 🟢 | 1h | ✅ |
-| Pinterest | API | 🟢 | 1h | ✅ |
+| Etsy | SearXNG discovery | 🟢 | 1h | ✅ |
+| Pinterest | Public page | 🟢 | 1h | ✅ |
 | Facebook Ads | Toidispy CDP / Meta API | 🟢 | 0h (đã có) | ✅ |
 | Facebook Posts | Toidispy CDP | 🟢 | 0h (đã có) | ✅ |
 | Twitter/X | API + Playwright | 🟡 | 3h | ✅ |
