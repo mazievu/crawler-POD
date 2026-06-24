@@ -62,3 +62,4 @@ http://localhost:3000
 - **Database**: SQLite (via better-sqlite3)
 - **Scraping**: Apify Client
 - **Frontend**: Vanilla JS (no framework)
+"# crawler-POD" 

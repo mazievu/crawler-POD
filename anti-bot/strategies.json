@@ -1,0 +1,105 @@
+{
+  "reddit": {
+    "method": "api",
+    "baseUrl": "https://www.reddit.com/search.json",
+    "rateLimit": { "perMinute": 60 },
+    "params": { "limit": "100", "sort": "new" },
+    "responseType": "json",
+    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 1000 },
+    "proxy": { "required": true, "type": "us" }
+  },
+  "ebay": {
+    "method": "playwright",
+    "url": "https://www.ebay.com/sch/i.html",
+    "selector": ".s-item",
+    "delay": { "min": 2000, "max": 5000 },
+    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 2000 },
+    "proxy": { "required": true, "type": "us" }
+  },
+  "shopify": {
+    "method": "api",
+    "rateLimit": { "perMinute": 40 },
+    "retry": { "maxAttempts": 3, "backoff": "exponential", "baseDelay": 1000 },
+    "proxy": { "required": false }
+  },
+  "etsy": {
+    "method": "playwright",
+    "url": "https://www.etsy.com/search",
+    "selector": "[data-listing-id]",
+    "delay": { "min": 2000, "max": 5000 },
+    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 2000 },
+    "proxy": { "required": true, "type": "us" }
+  },
+  "pinterest": {
+    "method": "playwright",
+    "url": "https://www.pinterest.com/search/pins/",
+    "selector": "[data-test-id='pin']",
+    "delay": { "min": 3000, "max": 6000 },
+    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 2000 },
+    "proxy": { "required": true, "type": "us" }
+  },
+  "facebook_ads": {
+    "method": "api",
+    "baseUrl": "https://graph.facebook.com/v19.0/ads_archive",
+    "rateLimit": { "perHour": 200 },
+    "params": { "limit": "100", "ad_type": "ALL", "ad_active_status": "ACTIVE" },
+    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 3000 },
+    "proxy": { "required": false }
+  },
+  "twitter": {
+    "method": "api",
+    "baseUrl": "https://api.twitter.com/2/tweets/search/recent",
+    "rateLimit": { "perMonth": 1500 },
+    "params": { "max_results": "100" },
+    "retry": { "maxAttempts": 3, "backoff": "exponential", "baseDelay": 2000 },
+    "proxy": { "required": false }
+  },
+  "google_shopping": {
+    "method": "playwright",
+    "url": "https://www.google.com/search",
+    "selector": "div[data-svl^='450']",
+    "fingerprint": "stealth",
+    "delay": { "min": 3000, "max": 6000 },
+    "retry": { "maxAttempts": 8, "backoff": "exponential", "baseDelay": 3000 },
+    "proxy": { "required": true, "type": "us" }
+  },
+  "amazon": {
+    "method": "playwright",
+    "url": "https://www.amazon.com/s",
+    "selector": "div[data-component-type='s-search-result']",
+    "fingerprint": "full",
+    "delay": { "min": 4000, "max": 8000 },
+    "retry": { "maxAttempts": 10, "backoff": "custom", "sequence": [1000, 3000, 7000, 15000, 30000] },
+    "proxy": { "required": true, "type": "residential" }
+  },
+  "tiktok_shop": {
+    "method": "playwright",
+    "url": "https://www.tiktok.com/search",
+    "mobileEmulation": true,
+    "fingerprint": "full",
+    "delay": { "min": 5000, "max": 10000 },
+    "retry": { "maxAttempts": 10, "backoff": "exponential", "baseDelay": 5000, "maxDelay": 60000 },
+    "proxy": { "required": true, "type": "residential" }
+  },
+  "instagram": {
+    "method": "playwright",
+    "url": "https://www.instagram.com/explore/search",
+    "fingerprint": "full",
+    "delay": { "min": 5000, "max": 10000 },
+    "retry": { "maxAttempts": 8, "backoff": "exponential", "baseDelay": 5000 },
+    "proxy": { "required": true, "type": "residential" }
+  },
+  "tiktok_ads": {
+    "method": "playwright",
+    "url": "https://www.tiktok.com/ad/library",
+    "mobileEmulation": true,
+    "fingerprint": "full",
+    "delay": { "min": 5000, "max": 10000 },
+    "retry": { "maxAttempts": 10, "backoff": "exponential", "baseDelay": 5000, "maxDelay": 60000 },
+    "proxy": { "required": true, "type": "residential" }
+  },
+  "toidispy": {
+    "method": "cdp",
+    "connectUrl": "http://localhost:9222"
+  }
+}
