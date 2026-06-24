@@ -219,13 +219,15 @@ test('amazon builder defaults marketplace to US', () => {
 
 console.log('\nCapability registry tests:');
 
+const packageJson = require('../package.json');
 const { CAPABILITIES, getCapability, selectActiveBackend } = require('../src/capability-registry');
 
 test('capability registry has web fallback and core target platforms', () => {
   const names = CAPABILITIES.map(c => c.name);
-  ['web', 'search', 'amazon', 'google_shopping', 'facebook_posts', 'twitter', 'instagram', 'tiktok'].forEach(name => {
+  ['web', 'search', 'amazon', 'google_shopping', 'facebook_posts', 'twitter', 'instagram', 'tiktok_shop'].forEach(name => {
     assert.ok(names.includes(name), `Missing capability: ${name}`);
   });
+  assert.ok(!names.includes('tiktok'), 'Use dashboard platform key tiktok_shop, not tiktok');
 });
 
 test('amazon keeps free SearXNG before paid fallbacks', () => {
@@ -263,6 +265,18 @@ test('google shopping has no active backend without verified free path or paid c
   const selected = selectActiveBackend(googleShopping.backends, { searxng: true, credentials: {} });
   assert.strictEqual(selected.active, null);
   assert.strictEqual(selected.backends[0].status, 'warn');
+});
+
+test('manual backends are not marked active without a probe', () => {
+  const reddit = getCapability('reddit');
+  const selected = selectActiveBackend(reddit.backends, { credentials: {} });
+  assert.strictEqual(selected.active, null);
+  assert.strictEqual(selected.backends[0].status, 'warn');
+});
+
+test('npm start attempts dependency startup without blocking server startup', () => {
+  assert.ok(packageJson.scripts.start.includes('start-deps.js --optional'));
+  assert.ok(packageJson.scripts.start.includes('node server.js'));
 });
 
 // ==================== web-reader.js ====================

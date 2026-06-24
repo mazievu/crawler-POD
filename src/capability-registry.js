@@ -113,8 +113,8 @@ const CAPABILITIES = [
     ],
   },
   {
-    name: 'tiktok',
-    displayName: 'TikTok',
+    name: 'tiktok_shop',
+    displayName: 'TikTok Shop',
     tier: 0,
     backends: [
       { id: 'searxng-tiktok', label: 'SearXNG indexed videos/photos', kind: 'free_local', check: 'searxng' },
@@ -176,8 +176,11 @@ function hasCredential(backend, checks = {}) {
 }
 
 function backendStatus(backend, checks = {}) {
-  if (backend.check === 'always' || backend.check === 'manual') {
+  if (backend.check === 'always') {
     return { status: 'ok', message: 'available' };
+  }
+  if (backend.check === 'manual') {
+    return { status: 'warn', message: 'available route, not probed by doctor' };
   }
   if (backend.check === 'paid') {
     if (hasCredential(backend, checks)) {

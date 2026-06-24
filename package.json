@@ -4,8 +4,8 @@
   "description": "Multi-platform data collector powered by Apify",
   "main": "server.js",
   "scripts": {
-    "start": "node scripts/start-deps.js && node server.js",
-    "dev": "node scripts/start-deps.js && node server.js",
+    "start": "node scripts/start-deps.js --optional && node server.js",
+    "dev": "node scripts/start-deps.js --optional && node server.js",
     "server": "node server.js",
     "start:deps": "node scripts/start-deps.js",
     "start:searxng": "node scripts/start-searxng.js",

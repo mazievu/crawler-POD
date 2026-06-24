@@ -15,10 +15,11 @@ function commandOk(command, args) {
 async function main() {
   const searxng = await searxngReady();
   const cdp = await cdpReady();
+  const browserPath = findBrowser();
   const checks = [
     { name: 'Node.js', ok: true, detail: process.version },
-    { name: 'Docker', ok: commandOk('docker', ['--version']), detail: 'needed to auto-start SearXNG' },
-    { name: 'Browser executable', ok: Boolean(findBrowser()), detail: findBrowser() || 'set CHROME_PATH' },
+    { name: 'Docker', ok: searxng || commandOk('docker', ['--version']), detail: searxng ? 'not needed; SearXNG already ready' : 'needed to auto-start SearXNG' },
+    { name: 'Browser executable', ok: cdp || Boolean(browserPath), detail: cdp ? 'not needed; CDP already ready' : (browserPath || 'set CHROME_PATH') },
     { name: 'SearXNG ready', ok: searxng, detail: process.env.SEARXNG_URL || 'http://localhost:8888' },
     { name: 'CDP ready', ok: cdp, detail: process.env.CDP_URL || 'http://localhost:9222' },
   ];
