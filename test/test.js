@@ -215,6 +215,67 @@ test('amazon builder defaults marketplace to US', () => {
   assert.strictEqual(input.marketplace, 'US');
 });
 
+// ==================== capability-registry.js ====================
+
+console.log('\nCapability registry tests:');
+
+const { CAPABILITIES, getCapability, selectActiveBackend } = require('../src/capability-registry');
+
+test('capability registry has web fallback and core target platforms', () => {
+  const names = CAPABILITIES.map(c => c.name);
+  ['web', 'search', 'amazon', 'google_shopping', 'facebook_posts', 'twitter', 'instagram', 'tiktok'].forEach(name => {
+    assert.ok(names.includes(name), `Missing capability: ${name}`);
+  });
+});
+
+test('amazon keeps free SearXNG before paid fallbacks', () => {
+  const amazon = getCapability('amazon');
+  assert.strictEqual(amazon.backends[0].check, 'searxng');
+  assert.strictEqual(amazon.backends[1].kind, 'paid_api');
+});
+
+test('selectActiveBackend prefers ready free backend', () => {
+  const amazon = getCapability('amazon');
+  const selected = selectActiveBackend(amazon.backends, { searxng: true });
+  assert.strictEqual(selected.active.id, 'searxng-amazon');
+  assert.strictEqual(selected.active.status, 'ok');
+});
+
+test('selectActiveBackend falls back to paid only when free backend is not ready', () => {
+  const amazon = getCapability('amazon');
+  const selected = selectActiveBackend(amazon.backends, { searxng: false });
+  assert.strictEqual(selected.active.kind, 'paid_api');
+  assert.strictEqual(selected.active.status, 'fallback');
+});
+
+test('google shopping stays on paid fallback until live data is verified', () => {
+  const googleShopping = getCapability('google_shopping');
+  const selected = selectActiveBackend(googleShopping.backends, { searxng: true });
+  assert.strictEqual(selected.active.kind, 'paid_api');
+  assert.strictEqual(selected.backends[0].status, 'warn');
+});
+
+// ==================== web-reader.js ====================
+
+console.log('\nWeb reader tests:');
+
+const { normalizeUrl, buildJinaReaderUrl } = require('../src/scrapers/web-reader');
+
+test('normalizeUrl keeps absolute HTTPS URLs', () => {
+  assert.strictEqual(normalizeUrl('https://example.com/a'), 'https://example.com/a');
+});
+
+test('normalizeUrl adds HTTPS to bare domains', () => {
+  assert.strictEqual(normalizeUrl('example.com/a'), 'https://example.com/a');
+});
+
+test('buildJinaReaderUrl prefixes normalized target URL', () => {
+  assert.strictEqual(
+    buildJinaReaderUrl('example.com/a', 'https://r.jina.ai'),
+    'https://r.jina.ai/https://example.com/a'
+  );
+});
+
 // ==================== Summary ====================
 
 console.log(`\n${'='.repeat(40)}`);

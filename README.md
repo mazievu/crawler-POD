@@ -49,6 +49,9 @@ To check the local runtime:
 ```bash
 npm run doctor
 ```
+The doctor follows the Agent-Reach-style capability model: each platform has
+ordered free/local/login backends first and paid API fallbacks last. It reports
+the currently active backend plus any paid fallback candidates.
 
 To run the Express server without starting local scraping dependencies:
 ```bash
@@ -76,4 +79,10 @@ http://localhost:3000
 - **Database**: SQLite (via better-sqlite3)
 - **Scraping**: Free-first scrapers, SearXNG discovery, Toidispy CDP, Apify fallback
 - **Frontend**: Vanilla JS (no framework)
+
+## Agent-Reach pattern adopted
+
+See `docs/AGENT_REACH_LEARNINGS.md`. The collector now keeps a capability
+registry so adding a new platform means adding ordered backends and probes,
+then verifying real data, instead of defaulting straight to paid APIs.
 "# crawler-POD" 
