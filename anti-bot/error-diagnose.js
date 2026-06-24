@@ -9,6 +9,7 @@ const PATTERNS = [
   { match: /429/,            reason: 'RATE_LIMITED',       action: 'increase_delay' },
   { match: /503/,            reason: 'TEMP_BLOCK',         action: 'wait_longer' },
   { match: /401/,            reason: 'AUTH_REQUIRED',      action: 'renew_token' },
+  { match: /AUTH_REQUIRED/i, reason: 'AUTH_REQUIRED',      action: 'renew_token' },
   { match: /too many requests/i, reason: 'RATE_LIMITED',  action: 'increase_delay' },
 
   // Captcha / Challenge
