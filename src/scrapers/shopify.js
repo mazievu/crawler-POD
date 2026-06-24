@@ -43,7 +43,7 @@ async function scrape(query, options) {
       title: p.title || '',
       url: 'https://' + host + '/products/' + (p.handle || ''),
       price: parseFloat(v.price || 0) || 0,
-      currency: 'USD',
+      currency: v.currency || p.currency || data.currency || '',
       image: img || '',
       vendor: p.vendor || '',
       productType: p.product_type || '',

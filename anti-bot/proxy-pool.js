@@ -56,6 +56,7 @@ class ProxyPool {
     }
 
     // Round-robin through available
+    this._index = this._index % available.length;
     const proxy = available[this._index];
     this._index = (this._index + 1) % available.length;
     proxy.lastUsed = now;

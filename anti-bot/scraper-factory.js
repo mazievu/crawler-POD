@@ -41,7 +41,8 @@ async function scrapeWithRetry(platform, query, options) {
     const escalation = getEscalationStep(attempt);
     const backoffDelay = calculateBackoff(attempt, strategy.retry);
     const needsProxy = strategy.proxy?.required || escalation.proxy;
-    const proxyUrl = (needsProxy && proxyPool?.isUsable()) ? proxyPool.next() : null;
+    const usePooledProxy = !options.proxyUrl && needsProxy && proxyPool?.isUsable();
+    const proxyUrl = options.proxyUrl || (usePooledProxy ? proxyPool.next() : null);
 
     console.log('[' + platform + '] Attempt ' + attempt + '/' + maxAttempts + ' -- ' + escalation.action + (proxyUrl ? ' (proxy)' : ''));
 
@@ -54,6 +55,7 @@ async function scrapeWithRetry(platform, query, options) {
 
       const data = await scraper.scrape(query, {
         ...strategy,
+        ...options,
         attempt,
         proxyUrl,
         maxAttempts,
@@ -63,7 +65,7 @@ async function scrapeWithRetry(platform, query, options) {
         throw new Error('VALIDATION_FAILED: empty or invalid data');
       }
 
-      if (proxyUrl && proxyPool) proxyPool.markGood(proxyUrl);
+      if (usePooledProxy && proxyUrl && proxyPool) proxyPool.markGood(proxyUrl);
 
       const items = Array.isArray(data) ? data : data.items || data.results || [];
       console.log('  Success: ' + items.length + ' items in ' + attempt + ' attempt(s)');
@@ -78,7 +80,7 @@ async function scrapeWithRetry(platform, query, options) {
       console.log('  ' + d.reason + ': ' + err.message.slice(0, 120));
       console.log('  Fix: ' + getFixHint(d.reason));
 
-      if (proxyUrl && proxyPool) proxyPool.markBad(proxyUrl);
+      if (usePooledProxy && proxyUrl && proxyPool) proxyPool.markBad(proxyUrl);
 
       if (d.reason === 'AUTH_REQUIRED') {
         console.log('  Fatal: auth required, stopping retries');

@@ -16,7 +16,7 @@ async function scrapePublic(query, options) {
 
   try {
     const page = browser.page;
-    const url = 'https://www.ebay.com/sch/i.html?_nkw=' + encodeURIComponent(query) + '&LH_BIN=1&_sop=12';
+    const url = 'https://www.ebay.com/sch/i.html?_nkw=' + encodeURIComponent(query) + '&LH_Sold=1&LH_Complete=1&_sop=13';
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForTimeout(2500);
 
@@ -35,7 +35,7 @@ async function scrapePublic(query, options) {
       const sold = el.querySelector('.s-item__quantitySold')?.textContent?.trim() || '';
       const price = parseFloat((priceText.match(/[\d,.]+/) || ['0'])[0].replace(/,/g, '')) || 0;
       return { platform: 'ebay', title, url: link, price, priceText, image, seller, shipping, sold, likes: 0, comments: 0, shares: 0, views: 0 };
-    }, limit), limit);
+    }), limit);
 
     const clean = items.filter(i => i.title && i.title !== 'Shop on eBay' && i.url).slice(0, limit);
     if (!clean.length) throw new Error('EMPTY_RESULT: no eBay items parsed');

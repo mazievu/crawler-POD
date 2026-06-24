@@ -10,10 +10,12 @@ const path = require('path');
 const db = require('./src/database');
 const { getPlatform } = require('./src/platform-config');
 const { startActor, getRunStatus, fetchDatasetItems } = require('./src/apify-client');
+const { scrapeWithRetry } = require('./anti-bot/scraper-factory');
 const { getDefaultFilters, getFiltersForUI, POSTS_CARD_SCHEMA, ADS_CARD_SCHEMA } = require('./scripts/toidispy-filters');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const LOCAL_SCRAPER_PLATFORMS = new Set(['shopify', 'reddit', 'pinterest', 'etsy', 'ebay']);
 
 app.use(cors());
 app.use(express.json());
@@ -52,8 +54,8 @@ app.post('/api/runs', async (req, res) => {
     const country = options?.country || null;
     const run = db.createRun({ platform, query, maxItems, country });
 
-    // Start Apify actor async
-    startRunAsync(run.id, platform, query, maxItems, country).catch(console.error);
+    // Start the best available collector path async.
+    startRunAsync(run.id, platform, query, { ...(options || {}), maxItems, country }).catch(console.error);
     res.status(201).json(run);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -143,14 +145,14 @@ app.post('/api/toidispy/import', (req, res) => {
 // Toidispy — Run CDP with filters from UI
 app.post('/api/toidispy/run', async (req, res) => {
   try {
-    const { keyword, section, filters } = req.body;
+    const { keyword, section, filters, maxItems } = req.body;
     if (!keyword?.trim()) return res.status(400).json({ error: 'keyword is required' });
 
     // Create a run record
     const run = db.createRun({
       platform: 'toidispy',
       query: keyword,
-      maxItems: 100,
+      maxItems: maxItems || 100,
     });
 
     // Build filter args for CDP script
@@ -212,10 +214,30 @@ app.get('/api/export/:runId', (req, res) => {
 
 // ==================== Apify Integration ====================
 
-async function startRunAsync(runId, platform, query, maxItems, country) {
+async function startLocalScraperRun(runId, platform, query, options) {
+  const maxItems = options?.maxItems || 20;
+  const result = await scrapeWithRetry(platform, query, {
+    ...options,
+    limit: options?.limit || maxItems,
+  });
+  const items = (result.items || []).slice(0, maxItems);
+  const counts = db.insertSnapshots(runId, platform, query, items);
+  db.updateRun(runId, { status: 'done', ...counts });
+  console.log(`Run ${runId}: ${items.length} local ${platform} items (${counts.newItems} new, ${counts.activeItems} active, ${counts.droppedItems} dropped)`);
+}
+
+async function startRunAsync(runId, platform, query, options = {}) {
   db.updateRun(runId, { status: 'running' });
 
   try {
+    const maxItems = options.maxItems || 20;
+    const country = options.country || null;
+
+    if (LOCAL_SCRAPER_PLATFORMS.has(platform)) {
+      await startLocalScraperRun(runId, platform, query, options);
+      return;
+    }
+
     const { runId: apifyRunId, datasetId } = await startActor(platform, { query, maxItems, country });
     db.updateRun(runId, { apifyRunId, apifyDatasetId: datasetId });
 

@@ -113,7 +113,7 @@ async function scrapePublic(query, options) {
   options = options || {};
   const limit = options.limit || 50;
   const browser = await launchStealth({
-    proxyUrl: options.proxyUrl || null,
+    proxyUrl: options.proxyUrl || process.env.REDDIT_PROXY || null,
     headless: options.headless !== false,
   });
 
@@ -188,13 +188,10 @@ async function scrape(query, options) {
     return await scrapeApi(query, options);
   } catch (err) {
     if (!/BLOCKED_IP|HTTP 403|403|Please wait for verification/i.test(err.message || '')) throw err;
-
-    try {
-      return await scrapePublic(query, { ...options, proxyUrl: null });
-    } catch (publicErr) {
-      if (!options.proxyUrl) throw publicErr;
-      return scrapePublic(query, options);
-    }
+    return scrapePublic(query, {
+      ...options,
+      proxyUrl: options.proxyUrl || process.env.REDDIT_PROXY || null,
+    });
   }
 }
 

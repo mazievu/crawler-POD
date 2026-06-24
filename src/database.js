@@ -316,9 +316,9 @@ function parseItemData(item) {
     : (d.author || d.advertiserName || d.username || '');
 
   const price = parseNum(d.price || d.adSpend || d.product_price || 0);
-  const likes = parseNum(d.likes || d.likeCount || d.like_count || d.upvotes || d.score || d.favouritesCount || 0);
-  const comments = parseNum(d.comments || d.commentCount || d.replyCount || d.num_comments || 0);
-  const shares = parseNum(d.shares || d.shareCount || d.retweetCount || d.reposts || 0);
+  const likes = parseNum(d.likes || d.likeCount || d.like_count || d.upvotes || d.score || d.favouritesCount || d.reactions_count || 0);
+  const comments = parseNum(d.comments || d.commentCount || d.replyCount || d.num_comments || d.numComments || d.comments_count || 0);
+  const shares = parseNum(d.shares || d.shareCount || d.retweetCount || d.reposts || d.reshare_count || 0);
   const views = parseNum(d.viewCount || d.view_count || d.impressions || 0);
 
   return { title: String(title).substring(0, 200), image, url, author: String(author).substring(0, 100),

@@ -36,6 +36,7 @@ const INPUT_BUILDERS = {
   facebook_ads: ({ query, maxItems, country }) => ({
     urls: [`https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country || 'ALL'}&q=${encodeURIComponent(query)}`],
     maxResults: maxItems,
+    maxItems: maxItems,
   }),
 
   // TikTok Ads — silva95gustavo (needs valid startUrls)
@@ -98,6 +99,7 @@ const INPUT_BUILDERS = {
     searchTerms: [query],
     maxTweets: maxItems,
     maxChargedResults: maxItems,
+    maxItems: maxItems,
     sort: 'Latest',
   }),
 
@@ -116,6 +118,8 @@ const INPUT_BUILDERS = {
     searchQueries: [query],
     searchType: 'hashtags',
     resultsLimit: maxItems,
+    searchLimit: maxItems,
+    maxItems: maxItems,
   }),
 };
 

@@ -27,6 +27,9 @@ function titleFromText(value) {
  * @returns {Promise<{items: object[]}>}
  */
 async function scrapeApi(query, options = {}) {
+  const token = options.token || process.env.PINTEREST_TOKEN;
+  if (!token) throw new Error('AUTH_REQUIRED: Pinterest token is required');
+
   const params = new URLSearchParams({
     query,
     page_size: String(options.limit || 50),
@@ -146,7 +149,7 @@ async function scrapePublic(query, options = {}) {
 
 async function scrape(query, options = {}) {
   const token = process.env.PINTEREST_TOKEN;
-  if (token) return scrapeApi(query, options);
+  if (token) return scrapeApi(query, { ...options, token });
   return scrapePublic(query, options);
 }
 

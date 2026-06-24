@@ -18,9 +18,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 async function loadData() {
   try {
-    const [platforms, items] = await Promise.all([
+    const [platforms, items, stats] = await Promise.all([
       apiFetch('/api/platforms'),
       apiFetch('/api/items'),
+      apiFetch('/api/stats').catch(() => ({ totalRuns: 0 })),
     ]);
     allPlatforms = platforms;
     allItems = items;
@@ -30,7 +31,7 @@ async function loadData() {
       counts[item.platform] = (counts[item.platform] || 0) + 1;
     }
     renderFilterPills(platforms, counts);
-    document.getElementById('stat-total').textContent = `${allItems.length} items`;
+    document.getElementById('stat-total').textContent = `${stats.totalRuns} runs / ${allItems.length} items`;
     renderItems(allItems);
   } catch (err) { console.error('Load failed:', err); }
 }
@@ -368,6 +369,60 @@ function exportAll() {
   a.href = URL.createObjectURL(blob);
   a.download = `apify-collector-${Date.now()}.json`;
   a.click();
+}
+
+// ==================== Jobs History ====================
+
+async function showHistoryModal() {
+  new bootstrap.Modal(document.getElementById('jobs-modal')).show();
+  await loadJobs();
+}
+
+async function loadJobs() {
+  const tbody = document.getElementById('jobs-tbody');
+  tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4">Loading...</td></tr>';
+  try {
+    const jobs = await apiFetch('/api/runs');
+    if (!jobs.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-muted">No jobs found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = jobs.map((j) => {
+      const config = allPlatforms.find((p) => p.name === j.platform);
+      const icon = config?.icon || '🔗';
+      const pName = config?.display_name || j.platform;
+      const statusBadge = 
+        j.status === 'done' ? '<span class="badge bg-success">Done</span>' :
+        j.status === 'running' ? '<span class="badge bg-primary">Running</span>' :
+        j.status === 'failed' ? '<span class="badge bg-danger">Failed</span>' :
+        '<span class="badge bg-secondary">Pending</span>';
+
+      return `<tr>
+        <td>#${j.id}</td>
+        <td>${icon} ${pName}</td>
+        <td class="text-truncate" style="max-width:200px;" title="${escapeAttr(j.query)}">${escapeHtml(j.query)}</td>
+        <td>${statusBadge}</td>
+        <td>${j.items_count}</td>
+        <td>${new Date(j.created_at).toLocaleString()}</td>
+        <td>
+          <button class="btn btn-sm btn-outline-danger py-0 px-2 fs-12" onclick="deleteJob(${j.id})">Delete</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="7" class="text-center py-4 text-danger">Error: ${err.message}</td></tr>`;
+  }
+}
+
+async function deleteJob(id) {
+  if (!confirm(`Are you sure you want to delete job #${id} and all its data?`)) return;
+  try {
+    await apiFetch(`/api/runs/${id}`, { method: 'DELETE' });
+    await loadJobs(); // reload jobs table
+    await loadData(); // reload main grid to remove deleted items
+  } catch (err) {
+    alert(`Delete failed: ${err.message}`);
+  }
 }
 
 // ==================== Helpers ====================

@@ -19,6 +19,9 @@
         <span class="topbar-badge" id="stat-total">0 items</span>
       </div>
       <div class="topbar-right">
+        <button class="btn-topbar" onclick="showHistoryModal()">
+          <i data-feather="list"></i> Jobs History
+        </button>
         <button class="btn-topbar" onclick="showCollectModal()">
           <i data-feather="plus-circle"></i> Collect
         </button>
@@ -131,6 +134,40 @@
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body" id="item-modal-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Jobs History Modal ===== -->
+  <div class="modal fade" id="jobs-modal" tabindex="-1">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-header border-0 pb-0">
+          <h5 class="modal-title fw-bold">
+            <i data-feather="list" class="me-2 text-primary"></i>Jobs History
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="table-responsive">
+            <table class="table table-hover table-sm align-middle fs-13">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Platform</th>
+                  <th>Query</th>
+                  <th>Status</th>
+                  <th>Items</th>
+                  <th>Date</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="jobs-tbody">
+                <tr><td colspan="7" class="text-center py-4">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   </div>

@@ -13,6 +13,39 @@ function parsePrice(text) {
   };
 }
 
+function normalizePriceNumber(numberText) {
+  const lastComma = numberText.lastIndexOf(',');
+  const lastDot = numberText.lastIndexOf('.');
+
+  if (lastComma > -1 && lastDot > -1) {
+    const decimalSeparator = lastComma > lastDot ? ',' : '.';
+    const thousandsSeparator = decimalSeparator === ',' ? '.' : ',';
+    return numberText
+      .replace(new RegExp('\\' + thousandsSeparator, 'g'), '')
+      .replace(decimalSeparator, '.');
+  }
+
+  if (lastComma > -1) {
+    const decimals = numberText.length - lastComma - 1;
+    return decimals > 0 && decimals <= 2
+      ? numberText.replace(/\./g, '').replace(',', '.')
+      : numberText.replace(/,/g, '');
+  }
+
+  return numberText.replace(/,/g, '');
+}
+
+function parseSearchPrice(text) {
+  const match = cleanText(text).match(/([$\u20ac\u00a3]\s?\d[\d,.]*)/u);
+  if (!match) return { price: 0, priceText: '' };
+  const numberText = match[1].replace(/[$\u20ac\u00a3\s]/gu, '');
+  const normalized = normalizePriceNumber(numberText);
+  return {
+    price: parseFloat(normalized.replace(/[^0-9.]/g, '')) || 0,
+    priceText: match[1],
+  };
+}
+
 function normalizeTitle(platform, title) {
   return cleanText(title)
     .replace(/\s+-\s+Etsy$/i, '')
@@ -40,7 +73,7 @@ async function discoverMarketplaceItems(platform, query, options = {}) {
   const limit = options.limit || 30;
   const siteQuery = platform === 'etsy'
     ? 'site:etsy.com/listing ' + query
-    : 'site:ebay.com/itm ' + query;
+    : 'site:ebay.com/itm ' + query + ' sold completed';
 
   const result = await search(siteQuery, {
     engines: options.engines || 'google,bing,duckduckgo',
@@ -58,7 +91,7 @@ async function discoverMarketplaceItems(platform, query, options = {}) {
 
     const title = normalizeTitle(platform, r.title);
     const description = cleanText(r.content, 500);
-    const price = parsePrice(r.content);
+    const price = parseSearchPrice(r.content);
 
     items.push({
       platform,
@@ -71,6 +104,7 @@ async function discoverMarketplaceItems(platform, query, options = {}) {
       description,
       listingId: platform === 'etsy' ? id : undefined,
       itemId: platform === 'ebay' ? id : undefined,
+      listingStatus: platform === 'ebay' ? 'sold_or_completed_search' : undefined,
       source: 'searxng',
       engine: r.engine || '',
       likes: 0,
