@@ -3,6 +3,7 @@
  */
 
 const { spawnSync } = require('child_process');
+require('dotenv').config();
 const { isReady: searxngReady } = require('./start-searxng');
 const { isReady: cdpReady, findBrowser } = require('./start-cdp');
 

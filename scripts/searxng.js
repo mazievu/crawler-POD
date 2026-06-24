@@ -1,6 +1,8 @@
 // SearXNG Search Module
 // Tìm URLs từ nhiều nguồn
 
+require('dotenv').config();
+
 const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8888';
 
 async function search(query, options = {}) {

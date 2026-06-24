@@ -7,6 +7,7 @@
 
 const { chromium } = require('playwright');
 const { ToidispyFilterAdapter } = require('./toidispy-filter-adapter');
+require('dotenv').config();
 
 // ==================== Database Helper ====================
 
@@ -325,6 +326,7 @@ async function main() {
   // Parse: node toidispy-cdp.js "keyword" [section] [filters-json]
   const keyword = args[0] || 'press on nail';
   const section = args[1] || 'posts';
+  const cdpUrl = process.env.CDP_URL || 'http://localhost:9222';
   let filters = {};
 
   if (args[2]) {
@@ -335,9 +337,9 @@ async function main() {
   const auto = new ToidispyAutomation();
 
   try {
-    const connected = await auto.connect();
+    const connected = await auto.connect(cdpUrl);
     if (!connected) {
-      console.log('\n💡 Run Chrome with: chrome.exe --remote-debugging-port=9222');
+      console.log('\n💡 Run `npm run start:cdp` or start Chrome with CDP at ' + cdpUrl);
       process.exit(1);
     }
 

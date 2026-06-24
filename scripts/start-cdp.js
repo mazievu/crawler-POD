@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+require('dotenv').config();
 
 const CDP_URL = process.env.CDP_URL || 'http://localhost:9222';
 const CDP_PORT = new URL(CDP_URL).port || '9222';

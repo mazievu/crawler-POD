@@ -3,6 +3,7 @@
  */
 
 const { spawnSync } = require('child_process');
+require('dotenv').config();
 
 function run(label, script) {
   console.log('\n[' + label + ']');

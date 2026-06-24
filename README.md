@@ -42,7 +42,7 @@ npm start
 ```
 
 `npm start` auto-starts local dependencies:
-- SearXNG on `http://localhost:8888` via Docker if it is not already running.
+- SearXNG on `http://localhost:8888` via Docker if it is not already running. The container is bound to `127.0.0.1` and generated with JSON output enabled.
 - A visible Chrome/Edge/Chromium CDP browser on `http://localhost:9222` for Toidispy login/session scraping.
 
 To check the local runtime:
