@@ -1,11 +1,98 @@
 /**
- * eBay Scraper — Playwright public search, no API key
- * Uses US proxy + stealth browser.
+ * eBay Scraper
+ * Free-first order:
+ *   1. eBay Browse API when free developer credentials are available.
+ *   2. Public search page fallback through Playwright.
  */
 
 const { launchStealth } = require('../../anti-bot/stealth-launcher');
 
-async function scrape(query, options) {
+let cachedToken = null;
+
+function hasBrowseApiCredentials() {
+  return Boolean(process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET);
+}
+
+async function getBrowseApiToken() {
+  if (cachedToken && cachedToken.expiresAt > Date.now() + 60000) return cachedToken.value;
+
+  const creds = Buffer.from(process.env.EBAY_CLIENT_ID + ':' + process.env.EBAY_CLIENT_SECRET).toString('base64');
+  const resp = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + creds,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      scope: 'https://api.ebay.com/oauth/api_scope',
+    }),
+  });
+
+  if (!resp.ok) throw new Error('AUTH_REQUIRED: eBay token request failed HTTP ' + resp.status);
+  const body = await resp.json();
+  if (!body.access_token) throw new Error('AUTH_REQUIRED: eBay token response missing access_token');
+
+  cachedToken = {
+    value: body.access_token,
+    expiresAt: Date.now() + ((body.expires_in || 7200) * 1000),
+  };
+  return cachedToken.value;
+}
+
+function mapBrowseItem(d) {
+  const price = d.price || {};
+  const shipping = d.shippingOptions?.[0]?.shippingCost || {};
+  return {
+    platform: 'ebay',
+    title: d.title || '',
+    url: d.itemWebUrl || '',
+    price: parseFloat(price.value || 0) || 0,
+    priceText: price.value ? `${price.value} ${price.currency || ''}`.trim() : '',
+    currency: price.currency || '',
+    image: d.image?.imageUrl || d.thumbnailImages?.[0]?.imageUrl || '',
+    seller: d.seller?.username || '',
+    sellerFeedback: d.seller?.feedbackScore || 0,
+    shipping: shipping.value ? `${shipping.value} ${shipping.currency || ''}`.trim() : '',
+    condition: d.condition || '',
+    buyingOptions: Array.isArray(d.buyingOptions) ? d.buyingOptions.join(', ') : '',
+    sold: '',
+    likes: 0,
+    comments: 0,
+    shares: 0,
+    views: 0,
+  };
+}
+
+async function scrapeBrowseApi(query, options) {
+  options = options || {};
+  const limit = Math.min(options.limit || 30, 200);
+  const token = await getBrowseApiToken();
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(limit),
+  });
+
+  const resp = await fetch('https://api.ebay.com/buy/browse/v1/item_summary/search?' + params.toString(), {
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Accept': 'application/json',
+      'X-EBAY-C-MARKETPLACE-ID': options.marketplace || 'EBAY_US',
+    },
+  });
+
+  if (resp.status === 401 || resp.status === 403) {
+    throw new Error('AUTH_REQUIRED: eBay Browse API credentials missing approval or expired');
+  }
+  if (!resp.ok) throw new Error('HTTP ' + resp.status + ': eBay Browse API search failed');
+
+  const body = await resp.json();
+  const items = (body.itemSummaries || []).map(mapBrowseItem).filter(i => i.title && i.url).slice(0, limit);
+  if (!items.length) throw new Error('EMPTY_RESULT: no eBay Browse API items parsed');
+  return { items };
+}
+
+async function scrapePublic(query, options) {
   options = options || {};
   const limit = options.limit || 30;
   const proxyUrl = options.proxyUrl || process.env.EBAY_PROXY || null;
@@ -40,6 +127,11 @@ async function scrape(query, options) {
   } finally {
     await browser.close();
   }
+}
+
+async function scrape(query, options) {
+  if (hasBrowseApiCredentials()) return scrapeBrowseApi(query, options);
+  return scrapePublic(query, options);
 }
 
 module.exports = { scrape };

@@ -4,7 +4,7 @@
  * Need: Etsy API key (register app at https://www.etsy.com/developers)
  */
 
-const BASE = 'https://openapi.etsy.com/v3/application/listings/search';
+const BASE = 'https://api.etsy.com/v3/application/listings/active';
 
 /**
  * Scrape Etsy search results
@@ -16,7 +16,7 @@ async function scrape(query, options = {}) {
   const apiKey = process.env.ETSY_API_KEY;
 
   if (!apiKey) {
-    throw new Error(`AUTH_REQUIRED: ETSY_API_KEY not set. Add to .env
+    throw new Error(`AUTH_REQUIRED: ETSY_API_KEY not set. Add keystring:shared_secret to .env
   Get at: https://www.etsy.com/developers/register`);
   }
 
