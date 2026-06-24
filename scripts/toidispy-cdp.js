@@ -35,7 +35,7 @@ class ToidispyAutomation {
    * Connect to existing Chrome via CDP.
    * Requires Chrome launched with: chrome.exe --remote-debugging-port=9222
    */
-  async connect(cdpUrl = 'http://localhost:9222') {
+  async connect(cdpUrl = process.env.CDP_URL || 'http://localhost:9222') {
     try {
       this.browser = await chromium.connectOverCDP(cdpUrl);
       const contexts = this.browser.contexts();
@@ -326,7 +326,6 @@ async function main() {
   // Parse: node toidispy-cdp.js "keyword" [section] [filters-json]
   const keyword = args[0] || 'press on nail';
   const section = args[1] || 'posts';
-  const cdpUrl = process.env.CDP_URL || 'http://localhost:9222';
   let filters = {};
 
   if (args[2]) {
@@ -337,9 +336,9 @@ async function main() {
   const auto = new ToidispyAutomation();
 
   try {
-    const connected = await auto.connect(cdpUrl);
+    const connected = await auto.connect();
     if (!connected) {
-      console.log('\n💡 Run `npm run start:cdp` or start Chrome with CDP at ' + cdpUrl);
+      console.log('\n💡 Run `npm run start:cdp` or start Chrome with CDP at ' + (process.env.CDP_URL || 'http://localhost:9222'));
       process.exit(1);
     }
 

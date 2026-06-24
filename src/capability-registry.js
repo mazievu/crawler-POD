@@ -8,7 +8,27 @@
 const { isReady: searxngReady } = require('../scripts/start-searxng');
 const { isReady: cdpReady } = require('../scripts/start-cdp');
 
-const STATUS_ORDER = ['ok', 'fallback', 'warn'];
+const STATUS_ORDER = ['ok', 'fallback'];
+
+const PAID_CREDENTIALS = {
+  'scrape-do': ['SCRAPE_DO_TOKEN', 'SCRAPEDO_TOKEN'],
+  scrapingdog: ['SCRAPINGDOG_API_KEY'],
+  'apify-amazon': ['APIFY_TOKEN'],
+  'serper-shopping': ['SERPER_API_KEY'],
+  'serpapi-shopping': ['SERPAPI_API_KEY'],
+  'apify-google-shopping': ['APIFY_TOKEN'],
+  'apify-facebook-posts': ['APIFY_TOKEN'],
+  getxapi: ['GETXAPI_KEY'],
+  'apify-twitter': ['APIFY_TOKEN'],
+  'apify-instagram': ['APIFY_TOKEN'],
+  'scrapfly-instagram': ['SCRAPFLY_API_KEY'],
+  'apify-tiktok': ['APIFY_TOKEN'],
+  'sociavault-tiktok': ['SOCIAVAULT_API_KEY'],
+  'apify-etsy': ['APIFY_TOKEN'],
+  'apify-ebay': ['APIFY_TOKEN'],
+  'apify-reddit': ['APIFY_TOKEN'],
+  'apify-shopify': ['APIFY_TOKEN'],
+};
 
 const CAPABILITIES = [
   {
@@ -144,12 +164,26 @@ function getCapability(name) {
   return CAPABILITIES.find(capability => capability.name === name) || null;
 }
 
+function hasCredential(backend, checks = {}) {
+  const required = PAID_CREDENTIALS[backend.id] || [];
+  if (!required.length) return false;
+
+  const source = Object.prototype.hasOwnProperty.call(checks, 'credentials')
+    ? checks.credentials || {}
+    : process.env;
+
+  return required.some(key => Boolean(source[key]));
+}
+
 function backendStatus(backend, checks = {}) {
   if (backend.check === 'always' || backend.check === 'manual') {
     return { status: 'ok', message: 'available' };
   }
   if (backend.check === 'paid') {
-    return { status: 'fallback', message: 'paid fallback only' };
+    if (hasCredential(backend, checks)) {
+      return { status: 'fallback', message: 'paid fallback configured' };
+    }
+    return { status: 'off', message: 'paid fallback candidate; credential not configured' };
   }
   if (backend.check === 'searxng_unverified') {
     return {
@@ -204,6 +238,7 @@ async function checkAllCapabilities(checks = null) {
 module.exports = {
   CAPABILITIES,
   getCapability,
+  hasCredential,
   selectActiveBackend,
   checkAllCapabilities,
   collectRuntimeChecks,

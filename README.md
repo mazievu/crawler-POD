@@ -35,6 +35,10 @@ Apify is optional for legacy actor fallback. Free-first discovery uses local Sea
 SEARXNG_URL=http://localhost:8888
 CDP_URL=http://localhost:9222
 ```
+Set `APIFY_TOKEN` when using normal dashboard submissions through `/api/runs`.
+The local free-first probes, SearXNG discovery scripts, and Toidispy CDP flow
+can run without it, but dashboard run routing has not yet been fully moved off
+Apify actors.
 
 ### 3. Run
 ```bash

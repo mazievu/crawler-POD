@@ -18,10 +18,7 @@ const BIND_HOST = process.env.SEARXNG_BIND_HOST || '127.0.0.1';
 const CONFIG_DIR = path.join(__dirname, '..', 'data', 'searxng');
 const SETTINGS_PATH = path.join(CONFIG_DIR, 'settings.yml');
 
-function ensureSettings() {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  if (fs.existsSync(SETTINGS_PATH)) return;
-
+function writeSettings() {
   const secret = Math.random().toString(36).slice(2) + Date.now().toString(36);
   fs.writeFileSync(SETTINGS_PATH, [
     'use_default_settings: true',
@@ -37,6 +34,21 @@ function ensureSettings() {
     '    - json',
     '',
   ].join('\n'));
+}
+
+function settingsTextEnablesJson(settings) {
+  return /^\s*-\s*json\s*$/mi.test(settings);
+}
+
+function settingsEnableJson() {
+  if (!fs.existsSync(SETTINGS_PATH)) return false;
+  return settingsTextEnablesJson(fs.readFileSync(SETTINGS_PATH, 'utf8'));
+}
+
+function ensureSettings() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  if (settingsEnableJson()) return;
+  writeSettings();
 }
 
 async function isReady() {
@@ -134,4 +146,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { isReady };
+module.exports = { isReady, settingsTextEnablesJson };

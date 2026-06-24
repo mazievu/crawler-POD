@@ -241,17 +241,27 @@ test('selectActiveBackend prefers ready free backend', () => {
   assert.strictEqual(selected.active.status, 'ok');
 });
 
-test('selectActiveBackend falls back to paid only when free backend is not ready', () => {
+test('selectActiveBackend does not activate paid fallback without credentials', () => {
   const amazon = getCapability('amazon');
-  const selected = selectActiveBackend(amazon.backends, { searxng: false });
-  assert.strictEqual(selected.active.kind, 'paid_api');
+  const selected = selectActiveBackend(amazon.backends, { searxng: false, credentials: {} });
+  assert.strictEqual(selected.active, null);
+  assert.strictEqual(selected.backends[1].status, 'off');
+});
+
+test('selectActiveBackend can activate configured paid fallback', () => {
+  const amazon = getCapability('amazon');
+  const selected = selectActiveBackend(amazon.backends, {
+    searxng: false,
+    credentials: { SCRAPE_DO_TOKEN: 'test-token' },
+  });
+  assert.strictEqual(selected.active.id, 'scrape-do');
   assert.strictEqual(selected.active.status, 'fallback');
 });
 
-test('google shopping stays on paid fallback until live data is verified', () => {
+test('google shopping has no active backend without verified free path or paid credentials', () => {
   const googleShopping = getCapability('google_shopping');
-  const selected = selectActiveBackend(googleShopping.backends, { searxng: true });
-  assert.strictEqual(selected.active.kind, 'paid_api');
+  const selected = selectActiveBackend(googleShopping.backends, { searxng: true, credentials: {} });
+  assert.strictEqual(selected.active, null);
   assert.strictEqual(selected.backends[0].status, 'warn');
 });
 
@@ -274,6 +284,29 @@ test('buildJinaReaderUrl prefixes normalized target URL', () => {
     buildJinaReaderUrl('example.com/a', 'https://r.jina.ai'),
     'https://r.jina.ai/https://example.com/a'
   );
+});
+
+// ==================== start-searxng.js ====================
+
+console.log('\nSearXNG bootstrap tests:');
+
+const { settingsTextEnablesJson } = require('../scripts/start-searxng');
+
+test('settingsTextEnablesJson detects json output format', () => {
+  assert.strictEqual(settingsTextEnablesJson([
+    'search:',
+    '  formats:',
+    '    - html',
+    '    - json',
+  ].join('\n')), true);
+});
+
+test('settingsTextEnablesJson rejects stale html-only settings', () => {
+  assert.strictEqual(settingsTextEnablesJson([
+    'search:',
+    '  formats:',
+    '    - html',
+  ].join('\n')), false);
 });
 
 // ==================== Summary ====================
