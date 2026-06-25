@@ -11,6 +11,7 @@ const db = require('./src/database');
 const { getPlatform } = require('./src/platform-config');
 const { startActor, getRunStatus, fetchDatasetItems } = require('./src/apify-client');
 const { getDefaultFilters, getFiltersForUI, POSTS_CARD_SCHEMA, ADS_CARD_SCHEMA } = require('./scripts/toidispy-filters');
+const { ToidispyAutomation } = require('./scripts/toidispy-cdp');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -52,8 +53,7 @@ app.post('/api/runs', async (req, res) => {
     const country = options?.country || null;
     const run = db.createRun({ platform, query, maxItems, country });
 
-    // Start Apify actor async
-    startRunAsync(run.id, platform, query, maxItems, country).catch(console.error);
+    startRunAsync(run.id, platform, query, { ...options, maxItems, country }).catch(console.error);
     res.status(201).json(run);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -110,28 +110,63 @@ app.get('/api/stats', (req, res) => {
 });
 
 // Toidispy import — save scraped items directly
+function normalizeToidispyItems(items, section = 'posts') {
+  return items.map((item) => ({
+    title: item.pageName || item.author || 'Unknown',
+    author: item.pageName || item.author || '',
+    domain: item.domain || '',
+    image: item.imageUrl || '',
+    url: item.domain ? `https://${item.domain}` : '',
+    likes: section === 'ads' ? item.adCount || 0 : item.reactions || 0,
+    comments: item.comments || 0,
+    shares: item.shares || 0,
+    isAd: item.isAd || section === 'ads',
+    timeAgo: item.timeAgo || item.time || '',
+    pageId: item.pageId || '',
+    adId: item.adId || '',
+    pixelId: item.pixelId || '',
+    gtmId: item.gtmId || '',
+    googleAdsId: item.googleAdsId || '',
+    platform: 'facebook',
+  }));
+}
+
+async function runToidispyAsync(runId, query, options = {}) {
+  const section = options.section || 'posts';
+  const auto = new ToidispyAutomation();
+
+  try {
+    const connected = await auto.connect();
+    if (!connected) {
+      throw new Error('Cannot connect to CDP. Run `npm run start:cdp` and log in to Toidispy.');
+    }
+
+    const result = await auto.run(query, {
+      section,
+      filters: options.filters || {},
+      maxScrolls: options.maxScrolls || 3,
+      saveToDb: false,
+    });
+    const rawItems = normalizeToidispyItems(result.items, section);
+    const counts = db.insertSnapshots(runId, 'toidispy', query, rawItems);
+    db.updateRun(runId, { status: 'done', itemsCount: rawItems.length, ...counts });
+    console.log(`Toidispy run ${runId}: ${rawItems.length} items scraped`);
+  } catch (err) {
+    db.updateRun(runId, { status: 'failed', errorMessage: err.message });
+  } finally {
+    await auto.close();
+  }
+}
+
 app.post('/api/toidispy/import', (req, res) => {
   try {
-    const { query, items } = req.body;
+    const { query, items, section } = req.body;
     if (!items || !items.length) return res.status(400).json({ error: 'No items' });
 
     // Create a run
     const run = db.createRun({ platform: 'toidispy', query: query || 'search', maxItems: items.length });
 
-    // Convert toidispy format to raw_data
-    const rawItems = items.map((item) => ({
-      title: item.author || 'Unknown',
-      author: item.author || '',
-      domain: item.domain || '',
-      image: item.imageUrl || '',
-      url: item.domain ? `https://${item.domain}` : '',
-      likes: item.reactions || 0,
-      comments: item.comments || 0,
-      shares: item.shares || 0,
-      isAd: item.isAd || false,
-      timeAgo: item.time || '',
-      platform: 'facebook',
-    }));
+    const rawItems = normalizeToidispyItems(items, section || 'posts');
 
     const result = db.insertSnapshots(run.id, 'toidispy', query || 'search', rawItems);
     db.updateRun(run.id, { status: 'done', ...result });
@@ -153,31 +188,8 @@ app.post('/api/toidispy/run', async (req, res) => {
       maxItems: 100,
     });
 
-    // Build filter args for CDP script
-    const filterArgs = JSON.stringify(filters || {});
-    const scriptPath = require('path').join(__dirname, 'scripts', 'toidispy-cdp.js');
-    const { spawn } = require('child_process');
-
-    const child = spawn('node', [scriptPath, keyword, section || 'posts', filterArgs], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
-    child.stderr.on('data', (d) => { stderr += d.toString(); });
-
-    child.on('close', (code) => {
-      if (code === 0) {
-        const match = stdout.match(/Scraped (\d+) items/);
-        const count = match ? parseInt(match[1]) : 0;
-        db.updateRun(run.id, { status: 'done', itemsCount: count });
-        console.log(`Toidispy run ${run.id}: ${count} items scraped`);
-      } else {
-        db.updateRun(run.id, { status: 'failed', errorMessage: stderr || 'CDP script failed' });
-        console.error(`Toidispy run ${run.id} failed:`, stderr);
-      }
-    });
+    db.updateRun(run.id, { status: 'running' });
+    runToidispyAsync(run.id, keyword, { section, filters }).catch(console.error);
 
     // Return immediately — client polls /api/runs/:id for status
     res.status(202).json({ runId: run.id, status: 'running', keyword, section, filters });
@@ -212,10 +224,17 @@ app.get('/api/export/:runId', (req, res) => {
 
 // ==================== Apify Integration ====================
 
-async function startRunAsync(runId, platform, query, maxItems, country) {
+async function startRunAsync(runId, platform, query, options = {}) {
   db.updateRun(runId, { status: 'running' });
 
   try {
+    if (platform === 'toidispy') {
+      await runToidispyAsync(runId, query, options);
+      return;
+    }
+
+    const maxItems = options.maxItems || 20;
+    const country = options.country || null;
     const { runId: apifyRunId, datasetId } = await startActor(platform, { query, maxItems, country });
     db.updateRun(runId, { apifyRunId, apifyDatasetId: datasetId });
 
