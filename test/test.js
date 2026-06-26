@@ -300,6 +300,19 @@ test('buildJinaReaderUrl prefixes normalized target URL', () => {
   );
 });
 
+// ==================== indexed-search.js ====================
+
+console.log('\nIndexed search tests:');
+
+const { CONFIGS: INDEXED_SEARCH_CONFIGS } = require('../src/scrapers/indexed-search');
+
+test('indexed search supports collect platform keys', () => {
+  ['amazon', 'facebook_posts', 'twitter', 'instagram', 'tiktok_shop'].forEach(platform => {
+    assert.ok(INDEXED_SEARCH_CONFIGS[platform], `Missing indexed search config for ${platform}`);
+  });
+  assert.ok(!INDEXED_SEARCH_CONFIGS.tiktok, 'Use collect key tiktok_shop, not tiktok');
+});
+
 // ==================== start-searxng.js ====================
 
 console.log('\nSearXNG bootstrap tests:');

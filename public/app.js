@@ -7,6 +7,7 @@ let allPlatforms = [];
 let allItems = [];
 let activeFilter = 'all';
 let collectPlatform = null;
+let toidispyFilterConfig = [];
 
 document.addEventListener('DOMContentLoaded', async () => {
   feather.replace();
@@ -278,6 +279,9 @@ function showCollectModal() {
   renderPlatformGrid();
   document.getElementById('collect-query').value = '';
   document.getElementById('collect-hint').textContent = '';
+  document.getElementById('toidispy-section').value = 'posts';
+  document.getElementById('toidispy-collect-options').classList.add('d-none');
+  document.getElementById('toidispy-filter-grid').innerHTML = '';
   document.getElementById('collect-start').disabled = true;
   document.getElementById('collect-status').innerHTML = '';
   new bootstrap.Modal(document.getElementById('collect-modal')).show();
@@ -299,8 +303,95 @@ function selectCollectPlatform(name, el) {
   const config = allPlatforms.find((p) => p.name === name);
   document.getElementById('collect-hint').textContent = config?.description || '';
   document.getElementById('collect-query').placeholder = config?.query_type === 'url' ? 'Enter store URL...' : 'Enter keyword...';
+  document.getElementById('toidispy-collect-options').classList.toggle('d-none', name !== 'toidispy');
+  if (name === 'toidispy') loadToidispyFilters();
   document.getElementById('collect-query').focus();
   updateCollectBtn();
+}
+
+async function loadToidispyFilters() {
+  if (collectPlatform !== 'toidispy') return;
+  const section = document.getElementById('toidispy-section').value || 'posts';
+  try {
+    const data = await apiFetch(`/api/toidispy/filters?section=${encodeURIComponent(section)}`);
+    toidispyFilterConfig = data.filters || [];
+    renderToidispyFilters(toidispyFilterConfig);
+  } catch (err) {
+    document.getElementById('toidispy-filter-grid').innerHTML = `<div class="col-12"><small class="text-danger">${escapeHtml(err.message)}</small></div>`;
+  }
+}
+
+function renderToidispyFilters(filters) {
+  const skip = new Set(['keyword']);
+  document.getElementById('toidispy-filter-grid').innerHTML = filters
+    .filter((filter) => !skip.has(filter.id))
+    .map(renderToidispyFilter)
+    .join('');
+}
+
+function renderToidispyFilter(filter) {
+  const id = `toidispy-filter-${filter.id}`;
+  const label = escapeHtml(filter.label);
+  const value = filter.default ?? '';
+
+  if (filter.type === 'checkbox') {
+    return `<div class="col-6">
+      <label class="filter-label">${label}</label>
+      <div class="form-check">
+        <input class="form-check-input toidispy-filter" type="checkbox" id="${id}" data-filter-id="${filter.id}" data-filter-type="${filter.type}" ${value ? 'checked' : ''}>
+        <label class="form-check-label fs-13" for="${id}">${label}</label>
+      </div>
+    </div>`;
+  }
+
+  if (filter.type === 'select' || filter.type === 'date-presets') {
+    const options = filter.type === 'date-presets' ? filter.presets || [] : filter.options || [];
+    const emptyLabel = filter.type === 'date-presets' ? 'Any time' : '';
+    return `<div class="col-6">
+      <label class="filter-label" for="${id}">${label}</label>
+      <select class="form-select toidispy-filter" id="${id}" data-filter-id="${filter.id}" data-filter-type="${filter.type}">
+        ${emptyLabel ? `<option value="">${emptyLabel}</option>` : ''}
+        ${options.map((option) => `<option value="${escapeAttr(option.value)}" ${option.value === value ? 'selected' : ''}>${escapeHtml(option.label)}</option>`).join('')}
+      </select>
+    </div>`;
+  }
+
+  if (filter.type === 'multi-select') {
+    return `<div class="col-12">
+      <label class="filter-label">${label}</label>
+      <div class="collect-check-grid" data-filter-id="${filter.id}" data-filter-type="${filter.type}">
+        ${(filter.options || []).map((option) => {
+          const optionId = `${id}-${String(option.value).replace(/[^a-z0-9]/gi, '-')}`;
+          return `<label class="collect-check" for="${optionId}">
+            <input class="toidispy-filter" type="checkbox" id="${optionId}" data-filter-id="${filter.id}" data-filter-type="${filter.type}" value="${escapeAttr(option.value)}">
+            <span>${escapeHtml(option.label)}</span>
+          </label>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }
+
+  return `<div class="col-6">
+    <label class="filter-label" for="${id}">${label}</label>
+    <input class="form-control toidispy-filter" id="${id}" data-filter-id="${filter.id}" data-filter-type="${filter.type}" type="${filter.type === 'number' ? 'number' : 'text'}" min="${filter.min ?? ''}" placeholder="${escapeAttr(filter.placeholder || '')}" value="${escapeAttr(value)}">
+  </div>`;
+}
+
+function collectToidispyFilters(query) {
+  const filters = { keyword: query };
+  for (const filter of toidispyFilterConfig) {
+    if (filter.id === 'keyword') continue;
+    if (filter.type === 'multi-select') {
+      filters[filter.id] = Array.from(document.querySelectorAll(`.toidispy-filter[data-filter-id="${filter.id}"]:checked`)).map((input) => input.value);
+    } else if (filter.type === 'checkbox') {
+      filters[filter.id] = Boolean(document.querySelector(`.toidispy-filter[data-filter-id="${filter.id}"]`)?.checked);
+    } else if (filter.type === 'number') {
+      filters[filter.id] = parseInt(document.querySelector(`.toidispy-filter[data-filter-id="${filter.id}"]`)?.value || '0', 10) || 0;
+    } else {
+      filters[filter.id] = document.querySelector(`.toidispy-filter[data-filter-id="${filter.id}"]`)?.value || '';
+    }
+  }
+  return filters;
 }
 
 function updateCollectBtn() {
@@ -315,6 +406,8 @@ async function startCollect() {
   const query = document.getElementById('collect-query').value.trim();
   const maxItems = parseInt(document.getElementById('collect-max').value) || 20;
   const country = document.getElementById('collect-country').value;
+  const section = document.getElementById('toidispy-section').value || 'posts';
+  const filters = collectPlatform === 'toidispy' ? collectToidispyFilters(query) : undefined;
 
   const btn = document.getElementById('collect-start');
   const status = document.getElementById('collect-status');
@@ -326,7 +419,7 @@ async function startCollect() {
   try {
     const result = await apiFetch('/api/runs', {
       method: 'POST',
-      body: JSON.stringify({ platform: collectPlatform, query, options: { maxItems, country } }),
+      body: JSON.stringify({ platform: collectPlatform, query, options: { maxItems, country, section, filters } }),
     });
     status.innerHTML = `<small class="text-success">✅ Run #${result.id} started. Polling...</small>`;
 

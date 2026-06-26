@@ -109,6 +109,16 @@
               </select>
             </div>
           </div>
+          <div class="d-none" id="toidispy-collect-options">
+            <div class="mb-3">
+              <label class="filter-label">Toidispy Section</label>
+              <select class="form-select" id="toidispy-section" onchange="loadToidispyFilters()">
+                <option value="posts">Posts</option>
+                <option value="ads">Ads Library</option>
+              </select>
+            </div>
+            <div class="row g-2" id="toidispy-filter-grid"></div>
+          </div>
         </div>
         <div class="modal-footer border-0">
           <div class="flex-grow-1" id="collect-status"></div>

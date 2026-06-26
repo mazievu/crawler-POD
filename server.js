@@ -12,6 +12,12 @@ const { getPlatform } = require('./src/platform-config');
 const { startActor, getRunStatus, fetchDatasetItems } = require('./src/apify-client');
 const { getDefaultFilters, getFiltersForUI, POSTS_CARD_SCHEMA, ADS_CARD_SCHEMA } = require('./scripts/toidispy-filters');
 const { ToidispyAutomation } = require('./scripts/toidispy-cdp');
+const pinterestScraper = require('./src/scrapers/pinterest');
+const redditScraper = require('./src/scrapers/reddit');
+const shopifyScraper = require('./src/scrapers/shopify');
+const etsyScraper = require('./src/scrapers/etsy');
+const ebayScraper = require('./src/scrapers/ebay');
+const { scrapeIndexedPlatform } = require('./src/scrapers/indexed-search');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -158,6 +164,37 @@ async function runToidispyAsync(runId, query, options = {}) {
   }
 }
 
+async function runFreeFirstAsync(runId, platform, query, options = {}) {
+  const maxItems = options.maxItems || 20;
+  const localScrapers = {
+    pinterest: pinterestScraper.scrape,
+    reddit: redditScraper.scrape,
+    shopify: shopifyScraper.scrape,
+    etsy: etsyScraper.scrape,
+    ebay: ebayScraper.scrape,
+  };
+  const indexedPlatforms = new Set(['amazon', 'facebook_posts', 'twitter', 'instagram', 'tiktok_shop']);
+  const scraper = localScrapers[platform] || (indexedPlatforms.has(platform) ? scrapeIndexedPlatform : null);
+
+  if (!scraper) return false;
+
+  try {
+    const result = localScrapers[platform]
+      ? await scraper(query, { limit: maxItems, maxItems })
+      : await scraper(platform, query, { limit: maxItems });
+    const items = result.items || result.results || [];
+    if (!items.length) throw new Error('EMPTY_RESULT: no items returned');
+    const limitedItems = items.slice(0, maxItems);
+    const counts = db.insertSnapshots(runId, platform, query, limitedItems);
+    db.updateRun(runId, { status: 'done', itemsCount: limitedItems.length, ...counts });
+    console.log(`Run ${runId}: ${limitedItems.length} items via free-first ${platform}`);
+    return true;
+  } catch (err) {
+    console.warn(`[free-first] ${platform} failed, falling back to Apify: ${err.message}`);
+    return false;
+  }
+}
+
 app.post('/api/toidispy/import', (req, res) => {
   try {
     const { query, items, section } = req.body;
@@ -235,6 +272,8 @@ async function startRunAsync(runId, platform, query, options = {}) {
 
     const maxItems = options.maxItems || 20;
     const country = options.country || null;
+    if (await runFreeFirstAsync(runId, platform, query, options)) return;
+
     const { runId: apifyRunId, datasetId } = await startActor(platform, { query, maxItems, country });
     db.updateRun(runId, { apifyRunId, apifyDatasetId: datasetId });
 
