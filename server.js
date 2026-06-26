@@ -156,7 +156,8 @@ async function runToidispyAsync(runId, query, options = {}) {
     const result = await auto.run(query, {
       section,
       filters: options.filters || {},
-      maxScrolls: options.maxScrolls || 3,
+      maxItems: options.maxItems || 20,
+      maxScrolls: options.maxScrolls,
       saveToDb: false,
     });
     const rawItems = normalizeToidispyItems(result.items, section);
@@ -221,18 +222,18 @@ app.post('/api/toidispy/import', (req, res) => {
 // Toidispy — Run CDP with filters from UI
 app.post('/api/toidispy/run', async (req, res) => {
   try {
-    const { keyword, section, filters } = req.body;
+    const { keyword, section, filters, maxItems } = req.body;
     if (!keyword?.trim()) return res.status(400).json({ error: 'keyword is required' });
 
     // Create a run record
     const run = db.createRun({
       platform: 'toidispy',
       query: keyword,
-      maxItems: 100,
+      maxItems: maxItems || 100,
     });
 
     db.updateRun(run.id, { status: 'running' });
-    runToidispyAsync(run.id, keyword, { section, filters }).catch(console.error);
+    runToidispyAsync(run.id, keyword, { section, filters, maxItems: maxItems || 100 }).catch(console.error);
 
     // Return immediately — client polls /api/runs/:id for status
     res.status(202).json({ runId: run.id, status: 'running', keyword, section, filters });

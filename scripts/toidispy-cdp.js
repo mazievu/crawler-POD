@@ -9,6 +9,19 @@ const { chromium } = require('playwright');
 const { ToidispyFilterAdapter } = require('./toidispy-filter-adapter');
 require('dotenv').config();
 
+function parsePositiveInt(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function calculateScrollBudget(maxItems, maxScrolls) {
+  const explicitMaxScrolls = parsePositiveInt(maxScrolls, null);
+  if (explicitMaxScrolls) return explicitMaxScrolls;
+
+  const targetItems = parsePositiveInt(maxItems, 20);
+  return Math.min(60, Math.max(3, Math.ceil(targetItems / 10)));
+}
+
 // ==================== Database Helper ====================
 
 const DB = {
@@ -63,13 +76,17 @@ class ToidispyAutomation {
 
   // ==================== SCROLLING ====================
 
-  async scrollAndLoad(maxScrolls = 5) {
+  async scrollAndLoad({ targetItems = 20, maxScrolls = 5 } = {}) {
     let lastCount = 0;
     for (let i = 0; i < maxScrolls; i++) {
       await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); // eslint-disable-line no-undef
       await this.page.waitForTimeout(2000);
 
       const currentCount = await this.page.$$eval('.p-item-col', els => els.length);
+      if (currentCount >= targetItems) {
+        console.log(`  Target item count reached: ${currentCount}/${targetItems}`);
+        break;
+      }
       console.log(`  📜 Scroll ${i + 1}/${maxScrolls}: ${currentCount} items`);
 
       if (currentCount === lastCount) {
@@ -262,10 +279,13 @@ class ToidispyAutomation {
     const {
       section = 'posts',
       filters = {},
-      maxScrolls = 3,
+      maxItems = 20,
+      maxScrolls = null,
       saveToDb = true,
     } = options;
 
+    const targetItems = parsePositiveInt(maxItems, 20);
+    const scrollBudget = calculateScrollBudget(targetItems, maxScrolls);
     const appliedFilters = { ...filters, keyword };
 
     console.log(`\n🚀 Starting Toidispy automation`);
@@ -292,14 +312,16 @@ class ToidispyAutomation {
     }
 
     // 5. Scroll to load more
-    await this.scrollAndLoad(maxScrolls);
+    await this.scrollAndLoad({ targetItems, maxScrolls: scrollBudget });
 
     // 6. Scrape data
     let items;
     if (section === 'ads') {
       items = await this.scrapeAdsLibrary();
+      items = items.slice(0, targetItems);
     } else {
       items = await this.scrapePosts();
+      items = items.slice(0, targetItems);
     }
 
     console.log(`📊 Scraped ${items.length} items`);
@@ -370,7 +392,7 @@ async function main() {
   }
 }
 
-module.exports = { ToidispyAutomation, DB };
+module.exports = { ToidispyAutomation, DB, calculateScrollBudget };
 
 if (require.main === module) {
   main();

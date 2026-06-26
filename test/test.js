@@ -21,6 +21,7 @@ const {
   validateFilters,
   getFiltersForUI,
 } = require('../scripts/toidispy-filters');
+const { calculateScrollBudget } = require('../scripts/toidispy-cdp');
 
 let passed = 0;
 let failed = 0;
@@ -132,6 +133,13 @@ test('ADS_CARD_SCHEMA has expected fields', () => {
   assert.ok(ADS_CARD_SCHEMA.adCount);
   assert.ok(ADS_CARD_SCHEMA.adId);
   assert.ok(ADS_CARD_SCHEMA.domain);
+});
+
+test('calculateScrollBudget scales with requested item count', () => {
+  assert.strictEqual(calculateScrollBudget(20), 3);
+  assert.strictEqual(calculateScrollBudget(50), 5);
+  assert.strictEqual(calculateScrollBudget(200), 20);
+  assert.strictEqual(calculateScrollBudget(200, 7), 7);
 });
 
 // ==================== database.js ====================
