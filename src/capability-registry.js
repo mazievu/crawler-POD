@@ -18,6 +18,8 @@ const PAID_CREDENTIALS = {
   'serpapi-shopping': ['SERPAPI_API_KEY'],
   'apify-google-shopping': ['APIFY_TOKEN'],
   'apify-facebook-posts': ['APIFY_TOKEN'],
+  'apify-facebook-ads': ['APIFY_TOKEN'],
+  'apify-pinterest': ['APIFY_TOKEN'],
   getxapi: ['GETXAPI_KEY'],
   'apify-twitter': ['APIFY_TOKEN'],
   'apify-instagram': ['APIFY_TOKEN'],
@@ -90,6 +92,23 @@ const CAPABILITIES = [
     backends: [
       { id: 'searxng-facebook', label: 'SearXNG indexed public posts', kind: 'free_local', check: 'searxng' },
       { id: 'apify-facebook-posts', label: 'Apify Facebook posts actor', kind: 'paid_api', check: 'paid' },
+    ],
+  },
+  {
+    name: 'facebook_ads',
+    displayName: 'Facebook Ads',
+    tier: 2,
+    backends: [
+      { id: 'apify-facebook-ads', label: 'Apify Facebook Ads actor', kind: 'paid_api', check: 'paid' },
+    ],
+  },
+  {
+    name: 'pinterest',
+    displayName: 'Pinterest',
+    tier: 0,
+    backends: [
+      { id: 'pinterest-public-search', label: 'Public Pinterest search via browser', kind: 'free_browser', check: 'manual' },
+      { id: 'apify-pinterest', label: 'Apify Pinterest actor', kind: 'paid_api', check: 'paid' },
     ],
   },
   {

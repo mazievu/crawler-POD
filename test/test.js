@@ -224,7 +224,7 @@ const { CAPABILITIES, getCapability, selectActiveBackend } = require('../src/cap
 
 test('capability registry has web fallback and core target platforms', () => {
   const names = CAPABILITIES.map(c => c.name);
-  ['web', 'search', 'amazon', 'google_shopping', 'facebook_posts', 'twitter', 'instagram', 'tiktok_shop'].forEach(name => {
+  ['web', 'search', 'amazon', 'google_shopping', 'facebook_posts', 'facebook_ads', 'pinterest', 'twitter', 'instagram', 'tiktok_shop'].forEach(name => {
     assert.ok(names.includes(name), `Missing capability: ${name}`);
   });
   assert.ok(!names.includes('tiktok'), 'Use dashboard platform key tiktok_shop, not tiktok');

@@ -18,6 +18,7 @@ const shopifyScraper = require('./src/scrapers/shopify');
 const etsyScraper = require('./src/scrapers/etsy');
 const ebayScraper = require('./src/scrapers/ebay');
 const { scrapeIndexedPlatform } = require('./src/scrapers/indexed-search');
+const { checkAllCapabilities } = require('./src/capability-registry');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -30,6 +31,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/api/platforms', (req, res) => {
   try { res.json(db.getAllPlatforms()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/capabilities', async (req, res) => {
+  try { res.json(await checkAllCapabilities()); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 

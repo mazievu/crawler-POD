@@ -5,6 +5,7 @@
 
 let allPlatforms = [];
 let allItems = [];
+let allCapabilities = [];
 let activeFilter = 'all';
 let collectPlatform = null;
 let toidispyFilterConfig = [];
@@ -19,12 +20,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 async function loadData() {
   try {
-    const [platforms, items] = await Promise.all([
+    const [platforms, items, capabilities] = await Promise.all([
       apiFetch('/api/platforms'),
       apiFetch('/api/items'),
+      apiFetch('/api/capabilities'),
     ]);
     allPlatforms = platforms;
     allItems = items;
+    allCapabilities = capabilities;
 
     const counts = {};
     for (const item of allItems) {
@@ -274,11 +277,14 @@ function renderTimeline(history) {
 
 // ==================== Collect ====================
 
-function showCollectModal() {
+async function showCollectModal() {
+  if (!allPlatforms.length) await loadData();
   collectPlatform = null;
   renderPlatformGrid();
   document.getElementById('collect-query').value = '';
   document.getElementById('collect-hint').textContent = '';
+  document.getElementById('collect-route').classList.add('d-none');
+  document.getElementById('collect-route').innerHTML = '';
   document.getElementById('toidispy-section').value = 'posts';
   document.getElementById('toidispy-collect-options').classList.add('d-none');
   document.getElementById('toidispy-filter-grid').innerHTML = '';
@@ -303,10 +309,34 @@ function selectCollectPlatform(name, el) {
   const config = allPlatforms.find((p) => p.name === name);
   document.getElementById('collect-hint').textContent = config?.description || '';
   document.getElementById('collect-query').placeholder = config?.query_type === 'url' ? 'Enter store URL...' : 'Enter keyword...';
+  renderCollectRoute(name);
   document.getElementById('toidispy-collect-options').classList.toggle('d-none', name !== 'toidispy');
   if (name === 'toidispy') loadToidispyFilters();
   document.getElementById('collect-query').focus();
   updateCollectBtn();
+}
+
+function renderCollectRoute(name) {
+  const route = allCapabilities.find((capability) => capability.name === name);
+  const el = document.getElementById('collect-route');
+  if (!route) {
+    el.classList.add('d-none');
+    el.innerHTML = '';
+    return;
+  }
+
+  el.classList.remove('d-none');
+  el.innerHTML = `
+    <div class="collect-route-title">Fallback route</div>
+    <div class="collect-route-steps">
+      ${route.backends.map((backend, index) => `
+        <div class="collect-route-step">
+          <span class="route-index">${index + 1}</span>
+          <span class="route-label">${escapeHtml(backend.label)}</span>
+          <span class="route-status route-${backend.status}">${escapeHtml(backend.status)}</span>
+        </div>
+      `).join('')}
+    </div>`;
 }
 
 async function loadToidispyFilters() {
