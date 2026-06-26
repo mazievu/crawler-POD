@@ -5,6 +5,7 @@
 
 const assert = require('assert');
 const path = require('path');
+const { PLATFORMS } = require('../src/platform-config');
 
 // ==================== toidispy-filters.js ====================
 
@@ -143,6 +144,12 @@ test('getAllPlatforms returns array', () => {
   const platforms = db.getAllPlatforms();
   assert.ok(Array.isArray(platforms));
   assert.ok(platforms.length > 0);
+});
+
+test('getAllPlatforms matches current platform config', () => {
+  const actual = db.getAllPlatforms().map((p) => p.name).sort();
+  const expected = PLATFORMS.map((p) => p.name).sort();
+  assert.deepStrictEqual(actual, expected);
 });
 
 test('createRun + getRunById works', () => {

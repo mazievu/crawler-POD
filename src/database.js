@@ -90,11 +90,27 @@ if (!hasRuns) {
 
 // ==================== Seed Platforms ====================
 
-const insertPlatform = db.prepare(`
-  INSERT OR IGNORE INTO platforms (name, display_name, description, query_type, actor_id, country_support, icon, color)
+const upsertPlatform = db.prepare(`
+  INSERT INTO platforms (name, display_name, description, query_type, actor_id, country_support, icon, color)
   VALUES (@name, @displayName, @description, @queryType, @actorId, @countrySupport, @icon, @color)
+  ON CONFLICT(name) DO UPDATE SET
+    display_name=excluded.display_name,
+    description=excluded.description,
+    query_type=excluded.query_type,
+    actor_id=excluded.actor_id,
+    country_support=excluded.country_support,
+    icon=excluded.icon,
+    color=excluded.color
 `);
-db.transaction(() => { for (const p of PLATFORMS) insertPlatform.run(p); })();
+const configuredPlatformNames = PLATFORMS.map((p) => p.name);
+const deleteStalePlatforms = db.prepare(`
+  DELETE FROM platforms
+  WHERE name NOT IN (${configuredPlatformNames.map(() => '?').join(', ')})
+`);
+db.transaction(() => {
+  for (const p of PLATFORMS) upsertPlatform.run(p);
+  deleteStalePlatforms.run(...configuredPlatformNames);
+})();
 
 // ==================== Prepared Statements ====================
 
