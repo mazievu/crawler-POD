@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { enumerateEtsyVariants, normalizeMaxVariants, parseVisibleEtsyPrice, summarizeVariantPrices } = require('../src/marketplaces/variant-pricing');
+const { enumerateEtsyVariants, extractEtsyPriceText, normalizeMaxVariants, parseVisibleEtsyPrice, summarizeVariantPrices } = require('../src/marketplaces/variant-pricing');
 const { isEtsyVariationSelectId, marketplaceVariationSelector } = require('../src/marketplaces/etsy-variants');
 
 test('variant enumeration excludes quantity and returns every selectable Size × Shape combination', () => {
@@ -39,6 +39,13 @@ test('visible Etsy price parsing recognizes the Vietnamese dong suffix used by E
     currency: 'VND',
     displayText: '8 inches (826,171₫)',
   });
+});
+
+test('Etsy price capture keeps only the labeled price excerpt instead of the whole product page', () => {
+  assert.equal(
+    extractEtsyPriceText('Homepage text. Now Price: 826,171₫ Original Price: 1,652,342₫ Loading product details.'),
+    '826,171₫ 1,652,342₫',
+  );
 });
 
 test('Etsy variation selectors use stable listing IDs that survive a DOM re-render', () => {
