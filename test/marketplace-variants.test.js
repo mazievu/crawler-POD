@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { enumerateEtsyVariants, extractEtsyPriceText, normalizeMaxVariants, normalizeVariantMode, parseVisibleEtsyPrice, summarizeVariantPrices } = require('../src/marketplaces/variant-pricing');
-const { changedEtsyVariationSelections, isEtsyVariationSelectId, marketplaceVariationSelector } = require('../src/marketplaces/etsy-variants');
+const { changedEtsyVariationSelections, etsyVariantInteractionOptions, isEtsyVariationSelectId, marketplaceVariationSelector } = require('../src/marketplaces/etsy-variants');
 
 test('variant enumeration excludes quantity and returns every selectable Size × Shape combination', () => {
   const variants = enumerateEtsyVariants([
@@ -61,6 +61,10 @@ test('successive Etsy combinations only select controls whose values changed', (
     { selector: '#variation-selector-1', value: 'waves' },
   ];
   assert.deepEqual(changedEtsyVariationSelections(previous, next), [{ selector: '#variation-selector-1', value: 'waves' }]);
+});
+
+test('Etsy control changes have a short bounded timeout and a render-settle delay', () => {
+  assert.deepEqual(etsyVariantInteractionOptions(), { timeout: 1000, settleMs: 150 });
 });
 
 test('variant summary reports a price range instead of pretending one option is the listing price', () => {
