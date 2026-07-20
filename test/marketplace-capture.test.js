@@ -6,6 +6,8 @@ process.env.CREDENTIAL_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('base64');
 const { encryptText, decryptText } = require('../src/security/encrypted-store');
 const { parseMarketplaceHtml } = require('../src/marketplaces/html-parser');
 const { assertMarketplaceUrl } = require('../src/marketplaces/validation');
+const { captureMarketplaceHtml } = require('../src/marketplaces/html-capture');
+const db = require('../src/database');
 
 const PRODUCT_HTML = {
   amazon: `<!doctype html><html><head><script type="application/ld+json">{
@@ -71,4 +73,50 @@ test('capture only accepts URLs belonging to the selected marketplace', () => {
   assert.doesNotThrow(() => assertMarketplaceUrl('etsy', 'https://www.etsy.com/listing/123456789/ceramic-mug'));
   assert.throws(() => assertMarketplaceUrl('amazon', 'https://attacker.example/amazon.com'), /does not belong/i);
   assert.throws(() => assertMarketplaceUrl('shopify', 'https://example.test'), /Unsupported marketplace/i);
+});
+
+test('a marketplace account stores its session encrypted and never exposes it in account listings', () => {
+  const storageState = JSON.stringify({ cookies: [{ name: 'session-id', value: 'private-cookie' }], origins: [] });
+  const account = db.createMarketplaceAccount({ platform: 'amazon', label: 'Research account', storageState });
+
+  const listedAccount = db.getMarketplaceAccounts('amazon').find((candidate) => candidate.id === account.id);
+  assert.deepEqual(listedAccount, {
+    id: account.id,
+    platform: 'amazon',
+    label: 'Research account',
+    created_at: listedAccount.created_at,
+    updated_at: listedAccount.updated_at,
+  });
+  assert.equal(db.getMarketplaceStorageState(account.id), storageState);
+  db.deleteMarketplaceAccount(account.id);
+});
+
+test('a rendered HTML capture uses the saved browser state and returns normalized metrics', async () => {
+  const storageState = { cookies: [{ name: 'session-id', value: 'private-cookie' }], origins: [] };
+  let contextOptions;
+  let visitedUrl;
+  const page = {
+    goto: async (url) => { visitedUrl = url; },
+    content: async () => PRODUCT_HTML.amazon,
+    close: async () => {},
+  };
+  const browser = {
+    newContext: async (options) => {
+      contextOptions = options;
+      return { newPage: async () => page, close: async () => {} };
+    },
+    close: async () => {},
+  };
+
+  const result = await captureMarketplaceHtml({
+    platform: 'amazon',
+    url: 'https://www.amazon.com/dp/B012345678',
+    storageState,
+    browserFactory: async () => browser,
+  });
+
+  assert.equal(visitedUrl, 'https://www.amazon.com/dp/B012345678');
+  assert.deepEqual(contextOptions.storageState, storageState);
+  assert.equal(result.html, PRODUCT_HTML.amazon);
+  assert.equal(result.metrics.reviewCount, 1234);
 });
