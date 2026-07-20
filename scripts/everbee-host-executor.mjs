@@ -10,7 +10,7 @@ const { deriveEverbeeHostToken } = require('../src/marketplaces/everbee-host-cli
 const { assertMarketplaceUrl, assertSupportedMarketplace } = require('../src/marketplaces/validation');
 const { normalizeBrowserStorageState } = require('../src/marketplaces/storage-state');
 const { enumerateEtsyVariants, extractEtsyPriceText, normalizeMaxVariants, normalizeVariantMode, parseVisibleEtsyPrice } = require('../src/marketplaces/variant-pricing');
-const { changedEtsyVariationSelections, marketplaceVariationSelector } = require('../src/marketplaces/etsy-variants');
+const { changedEtsyVariationSelections, etsyVariantInteractionOptions, marketplaceVariationSelector } = require('../src/marketplaces/etsy-variants');
 
 const PORT = Number(process.env.EVERBEE_HOST_EXECUTOR_PORT || 9333);
 const HOST = process.env.EVERBEE_HOST_EXECUTOR_BIND || '127.0.0.1';
@@ -106,13 +106,14 @@ async function captureEtsyVariants(page, maxVariants) {
   const plan = enumerateEtsyVariants(await discoverEtsyVariationGroups(page), maxVariants);
   const variants = [];
   const previousSelections = new Map();
+  const interaction = etsyVariantInteractionOptions();
   for (const selections of plan.combinations) {
     try {
       for (const selection of changedEtsyVariationSelections(previousSelections, selections)) {
-        await page.selectOption(selection.selector, selection.value, { timeout: 3000 });
+        await page.selectOption(selection.selector, selection.value, { timeout: interaction.timeout });
         previousSelections.set(selection.selector, selection.value);
+        await page.waitForTimeout(interaction.settleMs);
       }
-      await page.waitForTimeout(250);
       variants.push({
         selections: selections.map(({ label, value, text }) => ({ label, value, text })),
         price: parseVisibleEtsyPrice(await readEtsyVisiblePrice(page)),

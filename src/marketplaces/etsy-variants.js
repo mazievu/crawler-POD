@@ -13,4 +13,8 @@ function changedEtsyVariationSelections(previousSelections, selections) {
     .filter((selection) => selection && previous.get(selection.selector) !== selection.value);
 }
 
-module.exports = { changedEtsyVariationSelections, isEtsyVariationSelectId, marketplaceVariationSelector };
+function etsyVariantInteractionOptions() {
+  return { timeout: 1000, settleMs: 150 };
+}
+
+module.exports = { changedEtsyVariationSelections, etsyVariantInteractionOptions, isEtsyVariationSelectId, marketplaceVariationSelector };
