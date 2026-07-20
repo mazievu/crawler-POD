@@ -102,6 +102,15 @@ async function readEtsyVisiblePrice(page) {
   return extractEtsyPriceText(text);
 }
 
+async function applyEtsyVariantSelections(page, selections, previousSelections, interaction, forceAll = false) {
+  const pending = forceAll ? selections : changedEtsyVariationSelections(previousSelections, selections);
+  for (const selection of pending) {
+    await page.selectOption(selection.selector, selection.value, { timeout: interaction.timeout });
+    previousSelections.set(selection.selector, selection.value);
+    await page.waitForTimeout(interaction.settleMs);
+  }
+}
+
 async function captureEtsyVariants(page, maxVariants) {
   const plan = enumerateEtsyVariants(await discoverEtsyVariationGroups(page), maxVariants);
   const variants = [];
@@ -109,10 +118,11 @@ async function captureEtsyVariants(page, maxVariants) {
   const interaction = etsyVariantInteractionOptions();
   for (const selections of plan.combinations) {
     try {
-      for (const selection of changedEtsyVariationSelections(previousSelections, selections)) {
-        await page.selectOption(selection.selector, selection.value, { timeout: interaction.timeout });
-        previousSelections.set(selection.selector, selection.value);
-        await page.waitForTimeout(interaction.settleMs);
+      try {
+        await applyEtsyVariantSelections(page, selections, previousSelections, interaction);
+      } catch {
+        await page.waitForTimeout(interaction.retryDelayMs);
+        await applyEtsyVariantSelections(page, selections, previousSelections, interaction, true);
       }
       variants.push({
         selections: selections.map(({ label, value, text }) => ({ label, value, text })),

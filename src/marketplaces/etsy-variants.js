@@ -14,7 +14,7 @@ function changedEtsyVariationSelections(previousSelections, selections) {
 }
 
 function etsyVariantInteractionOptions() {
-  return { timeout: 1000, settleMs: 150 };
+  return { timeout: 1000, settleMs: 150, retryDelayMs: 500 };
 }
 
 module.exports = { changedEtsyVariationSelections, etsyVariantInteractionOptions, isEtsyVariationSelectId, marketplaceVariationSelector };
