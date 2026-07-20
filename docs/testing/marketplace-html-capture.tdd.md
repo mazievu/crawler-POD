@@ -22,6 +22,7 @@ capture, and parsable product metrics.
 | Account persistence and render capture | Same target failed because `html-capture` did not exist | Same target: 7 tests passed | Account lists never expose browser storage state; an injected browser context receives the selected state and returns parsed metrics. |
 | Account API journey | `node --test test/marketplace-api.test.js` failed because the endpoint returned the dashboard HTML (404 fallback) | Same target: 1 test passed | The HTTP flow saves, lists, and deletes an encrypted session without returning its secret. |
 | Dashboard controls | `node --test test/marketplace-ui.test.js` failed because the account/capture modal IDs were absent | Same target: 1 test passed | The dashboard exposes account management and HTML capture entry points. |
+| Interactive login helper | `node --test test/marketplace-login.test.js` failed because `session-login` did not exist | Same target: 1 test passed | The helper opens the matching marketplace in a visible browser, waits for the user to finish login/MFA, then returns browser storage state without collecting a password. |
 
 ## Validation
 
@@ -51,6 +52,7 @@ could trigger third-party anti-bot controls.
 - `05c6dea` — RED: account and rendered-capture coverage.
 - `0eced52` — RED: account API journey.
 - `8ef1ae9` — RED: dashboard controls.
+- `cdcd18c` — RED: interactive marketplace-session helper.
 
 The final GREEN validation is the focused 9-test run recorded above. The
 repository already had unrelated uncommitted edits in shared integration files,
