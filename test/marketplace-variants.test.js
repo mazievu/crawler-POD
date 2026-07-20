@@ -64,7 +64,7 @@ test('successive Etsy combinations only select controls whose values changed', (
 });
 
 test('Etsy control changes have a short bounded timeout and a render-settle delay', () => {
-  assert.deepEqual(etsyVariantInteractionOptions(), { timeout: 1000, settleMs: 150 });
+  assert.deepEqual(etsyVariantInteractionOptions(), { timeout: 1000, settleMs: 150, retryDelayMs: 500 });
 });
 
 test('variant summary reports a price range instead of pretending one option is the listing price', () => {
