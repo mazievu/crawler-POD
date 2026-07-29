@@ -41,7 +41,7 @@ const PLATFORMS = [
       'site:google.com/shopping/product "press on nail"',
       'press on nail Google Shopping product',
     ],
-    urlPattern: /(?:shopping\.google\.com|google\.[^/]+\/shopping\/product)/i,
+    urlPattern: /(?:shopping\.google\.com\/product|google\.[^/]+\/shopping\/product)/i,
     paidFallback: ['Serper.dev Google Shopping', 'SerpAPI Google Shopping', 'Apify Google Shopping actor'],
   },
   {
