@@ -565,10 +565,11 @@ function insertSnapshots(runId, platform, query, items) {
   return { newItems: newCount, activeItems: activeCount, droppedItems: droppedCount };
 }
 
-function getLatestSnapshots({ search = '', platform = '', limit = 200 } = {}) {
+function getLatestSnapshots({ search = '', platform = '', limit = 1000 } = {}) {
   const terms = String(search).trim().toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
   const filters = [];
-  const params = { limit: Math.min(500, Math.max(1, Number.parseInt(limit, 10) || 200)) };
+  const params = { limit: Math.min(5000, Math.max(1, Number.parseInt(limit, 10) || 1000)) };
+
   if (String(platform).trim()) {
     filters.push('s.platform = @platform');
     params.platform = String(platform).trim();

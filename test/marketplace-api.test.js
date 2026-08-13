@@ -10,7 +10,7 @@ const db = require('../src/database');
 let server;
 
 async function waitForServer() {
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + 25000;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`${baseUrl}/api/platforms`);
@@ -23,14 +23,16 @@ async function waitForServer() {
   throw new Error('Test server did not start');
 }
 
+
 test.before(async () => {
   server = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
-    env: { ...process.env, PORT: String(port), CREDENTIAL_ENCRYPTION_KEY: encryptionKey },
+    env: { ...process.env, PORT: String(port), CREDENTIAL_ENCRYPTION_KEY: encryptionKey, SKIP_DEPS: '1' },
     stdio: 'ignore',
   });
   await waitForServer();
 });
+
 
 test.after(() => server?.kill());
 

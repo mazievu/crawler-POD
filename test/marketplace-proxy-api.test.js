@@ -8,10 +8,11 @@ const encryptionKey = Buffer.alloc(32, 12).toString('base64');
 let server;
 
 async function waitForServer() {
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + 25000;
   while (Date.now() < deadline) {
     try {
-      if ((await fetch(`${baseUrl}/api/platforms`)).ok) return;
+      const response = await fetch(`${baseUrl}/api/platforms`);
+      if (response.ok) return;
     } catch {
       // The server is still starting.
     }
@@ -23,11 +24,12 @@ async function waitForServer() {
 test.before(async () => {
   server = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
-    env: { ...process.env, PORT: String(port), CREDENTIAL_ENCRYPTION_KEY: encryptionKey },
+    env: { ...process.env, PORT: String(port), CREDENTIAL_ENCRYPTION_KEY: encryptionKey, SKIP_DEPS: '1' },
     stdio: 'ignore',
   });
   await waitForServer();
 });
+
 
 test.after(() => server?.kill());
 

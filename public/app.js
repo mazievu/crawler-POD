@@ -23,7 +23,7 @@ async function loadData() {
   try {
     const [platforms, items, stats] = await Promise.all([
       apiFetch('/api/platforms'),
-      apiFetch('/api/items?limit=200'),
+      apiFetch('/api/items?limit=1000'),
       apiFetch('/api/stats').catch(() => ({ totalRuns: 0 })),
     ]);
     allPlatforms = platforms;
@@ -74,7 +74,8 @@ function setupSearch() {
 async function applyFilters() {
   const query = document.getElementById('search-input').value.toLowerCase().trim();
   const sort = document.getElementById('sort-select').value;
-  const params = new URLSearchParams({ limit: '200' });
+  const params = new URLSearchParams({ limit: '1000' });
+
   if (activeFilter !== 'all') params.set('platform', activeFilter);
   if (query) params.set('search', query);
   let filtered;

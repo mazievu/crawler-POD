@@ -6,6 +6,11 @@ const { spawnSync } = require('child_process');
 require('dotenv').config();
 
 const OPTIONAL = process.argv.includes('--optional');
+if (process.env.SKIP_DEPS === 'true' || process.env.SKIP_DEPS === '1') {
+  console.log('[Deps] Skipping dependency probes (SKIP_DEPS=1)');
+  process.exit(0);
+}
+
 
 function run(label, script) {
   console.log('\n[' + label + ']');
