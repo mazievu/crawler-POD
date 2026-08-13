@@ -19,14 +19,20 @@ class EtsyJourneyHandler {
 
   async performSearch(keyword) {
     console.log(`[EtsyJourney] J3: Performing search for '${keyword}'...`);
-    const searchInput = this.page.locator('input[id*="search-query"], input[name="q"]').first();
-    await searchInput.waitFor({ state: 'visible', timeout: 15000 });
-    await searchInput.fill(keyword);
-    await this.page.keyboard.press('Enter');
+    try {
+      const searchInput = this.page.locator('input[id*="search-query"], input[name="q"]').first();
+      await searchInput.waitFor({ state: 'attached', timeout: 5000 });
+      await searchInput.fill(keyword);
+      await this.page.keyboard.press('Enter');
+    } catch (e) {
+      console.warn('[EtsyJourney] Direct search input interaction failed, navigating directly to search URL...');
+      await this.page.goto(`https://www.etsy.com/search?q=${encodeURIComponent(keyword)}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
     await this.page.waitForLoadState('domcontentloaded');
     await this.page.waitForTimeout(2000);
     this.store.saveHtmlCheckpoint('search_results', await this.page.content());
   }
+
 
   async applyFilters(filters = {}) {
     console.log('[EtsyJourney] J4: Applying filters (Free shipping, Price)...');

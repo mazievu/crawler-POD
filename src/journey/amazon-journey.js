@@ -34,17 +34,23 @@ class AmazonJourneyHandler {
 
   async performSearch(keyword) {
     console.log(`[AmazonJourney] J3: Performing search for '${keyword}'...`);
-    const searchInput = this.page.locator('#twotabsearchtextbox').first();
-    await searchInput.waitFor({ state: 'visible', timeout: 15000 });
-    await searchInput.fill(keyword);
-    const searchBtn = this.page.locator('#nav-search-submit-button').first();
-    if (await searchBtn.isVisible()) await searchBtn.click();
-    else await this.page.keyboard.press('Enter');
+    try {
+      const searchInput = this.page.locator('#twotabsearchtextbox').first();
+      await searchInput.waitFor({ state: 'attached', timeout: 5000 });
+      await searchInput.fill(keyword);
+      const searchBtn = this.page.locator('#nav-search-submit-button').first();
+      if (await searchBtn.isVisible()) await searchBtn.click();
+      else await this.page.keyboard.press('Enter');
+    } catch (e) {
+      console.warn('[AmazonJourney] Direct search input interaction failed, navigating directly to search URL...');
+      await this.page.goto(`https://www.amazon.com/s?k=${encodeURIComponent(keyword)}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
 
     await this.page.waitForLoadState('domcontentloaded');
     await this.page.waitForTimeout(2500);
     this.store.saveHtmlCheckpoint('search_results', await this.page.content());
   }
+
 
   async applyFilters(filters = {}) {
     console.log('[AmazonJourney] J4: Applying Amazon filters...');

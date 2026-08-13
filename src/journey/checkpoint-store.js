@@ -36,26 +36,32 @@ class CheckpointStore {
     return record;
   }
 
-  processAndSaveProductDetail(url, html, runId = null) {
+  processAndSaveProductDetail(url, html, runId = null, fallbackItem = null) {
     try {
-      const { metrics } = analyzeMarketplaceHtml({ platform: this.platform, url, html });
-      if (!metrics || !metrics.title) return null;
+      let metrics = null;
+      try {
+        const result = analyzeMarketplaceHtml({ platform: this.platform, url, html });
+        metrics = result?.metrics;
+      } catch (e) {}
+
+      const title = metrics?.title || fallbackItem?.title;
+      if (!title) return null;
 
       const productRecord = {
         platform: this.platform,
-        title: metrics.title,
-        url: metrics.url || url,
-        image: metrics.image || '',
-        author: metrics.brand || 'Seller',
-        price: metrics.price || 0,
-        rating: metrics.rating || 0,
-        reviews: metrics.reviewCount || 0,
+        title,
+        url: metrics?.url || fallbackItem?.url || url,
+        image: metrics?.image || fallbackItem?.image || '',
+        author: metrics?.brand || fallbackItem?.author || 'Seller',
+        price: metrics?.price || fallbackItem?.price || 0,
+        rating: metrics?.rating || 0,
+        reviews: metrics?.reviewCount || 0,
         soldCount: 0,
         likes: 0,
         comments: 0,
         shares: 0,
         views: 0,
-        status: metrics.availability === 'out_of_stock' ? 'dropped' : 'new'
+        status: metrics?.availability === 'out_of_stock' ? 'dropped' : 'new'
       };
 
       this.savedProducts.push(productRecord);
@@ -70,6 +76,7 @@ class CheckpointStore {
       return null;
     }
   }
+
 
   saveSummary(status = 'COMPLETED') {
     const summary = {

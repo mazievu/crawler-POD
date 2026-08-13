@@ -18,25 +18,34 @@ class EbayJourneyHandler {
           if (await applyBtn.isVisible()) await applyBtn.click();
           await this.page.waitForTimeout(1500);
         }
+        await this.page.keyboard.press('Escape').catch(() => {});
+        await this.page.waitForTimeout(500);
       }
     } catch (e) {
       console.warn('[EbayJourney] ZIP setup warning:', e.message);
     }
   }
 
+
   async performSearch(keyword) {
     console.log(`[EbayJourney] J3: Performing search for '${keyword}'...`);
-    const searchInput = this.page.locator('input[id="gh-ac"], input[name="_nkw"]').first();
-    await searchInput.waitFor({ state: 'visible', timeout: 15000 });
-    await searchInput.fill(keyword);
-    const searchBtn = this.page.locator('input[id="gh-btn"], button[id="gh-search-btn"]').first();
-    if (await searchBtn.isVisible()) await searchBtn.click();
-    else await this.page.keyboard.press('Enter');
+    try {
+      const searchInput = this.page.locator('input[id="gh-ac"], input[name="_nkw"]').first();
+      await searchInput.waitFor({ state: 'attached', timeout: 5000 });
+      await searchInput.fill(keyword);
+      const searchBtn = this.page.locator('input[id="gh-btn"], button[id="gh-search-btn"]').first();
+      if (await searchBtn.isVisible()) await searchBtn.click();
+      else await this.page.keyboard.press('Enter');
+    } catch (e) {
+      console.warn('[EbayJourney] Direct search input interaction failed, navigating directly to search URL...');
+      await this.page.goto(`https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(keyword)}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
     
     await this.page.waitForLoadState('domcontentloaded');
     await this.page.waitForTimeout(2000);
     this.store.saveHtmlCheckpoint('search_results', await this.page.content());
   }
+
 
   async applyFilters(filters = {}) {
     console.log('[EbayJourney] J4: Applying eBay filters (Buy It Now, Condition)...');
