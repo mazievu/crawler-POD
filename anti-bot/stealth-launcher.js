@@ -21,10 +21,11 @@ async function launchStealth(options = {}) {
     headless = true,
     userAgent = null,
     viewport = null,
+    cdpUrl = null,
   } = options;
 
-  // Launch browser
-  const browser = await chromium.launch({
+  const isRemoteBrowser = Boolean(cdpUrl);
+  const browser = isRemoteBrowser ? await chromium.connectOverCDP(cdpUrl) : await chromium.launch({
     headless,
     args: [
       '--no-sandbox',
@@ -46,7 +47,7 @@ async function launchStealth(options = {}) {
     viewport: viewport || (mobileEmulation ? { width: 390, height: 844, isMobile: true, deviceScaleFactor: 3 } : null),
   });
 
-  const context = await browser.newContext(contextOptions);
+  const context = isRemoteBrowser ? (browser.contexts()[0] || await browser.newContext(contextOptions)) : await browser.newContext(contextOptions);
 
   // Inject anti-detection scripts
   await context.addInitScript(() => {
@@ -91,7 +92,7 @@ async function launchStealth(options = {}) {
     Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
   });
 
-  const page = await context.newPage();
+  const page = isRemoteBrowser ? (context.pages()[0] || await context.newPage()) : await context.newPage();
   await page.setDefaultTimeout(30000);
   await page.setDefaultNavigationTimeout(30000);
 
@@ -100,8 +101,10 @@ async function launchStealth(options = {}) {
     context,
     page,
     async close() {
-      await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      if (!isRemoteBrowser) {
+        await context.close().catch(() => {});
+        await browser.close().catch(() => {});
+      }
     },
   };
 }

@@ -1,0 +1,44 @@
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: crawler-pod:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: 3000
+      SEARXNG_URL: http://searxng:8080
+      # Everbee-style persistent browser profiles run inside this server
+      # container. No client or host Chrome/CDP connection is required.
+      EVERBEE_HEADLESS: "true"
+      EVERBEE_PROFILE_ROOT: /app/data/everbee-profiles
+      CLOAKBROWSER_CACHE_DIR: /app/data/cloakbrowser-cache
+      # This is an authenticated local HTTP executor on the Windows host, not CDP.
+      EVERBEE_HOST_EXECUTOR_URL: ${EVERBEE_HOST_EXECUTOR_URL:-http://host.docker.internal:9333}
+      CDP_URL: ""
+    ports:
+      - "${HOST_PORT:-9999}:3000"
+    volumes:
+      # Use the project's existing database and keep the prior named volume as a recovery copy.
+      - ./data:/app/data
+      - ./server.js:/app/server.js:ro
+      - ./public:/app/public:ro
+      - ./src:/app/src:ro
+    depends_on:
+      - searxng
+
+  searxng:
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    environment:
+      # Replace this via .env before exposing SearXNG outside the Compose network.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-local-only-change-this-secret}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng_cache:/var/cache/searxng
+
+volumes:
+  collector_data:
+  searxng_cache:

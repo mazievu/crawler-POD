@@ -64,13 +64,18 @@ const INPUT_BUILDERS = {
   }),
 
   // Amazon — automation-lab/amazon-scraper
-  amazon: ({ query, maxItems, country }) => ({
-    searchQueries: [query],
-    marketplace: country || 'US',
-    maxProductsPerSearch: maxItems,
-    maxSearchPages: 1,
-    sort: 'relevance',
-  }),
+  amazon: ({ query, maxItems, country }) => {
+    // The selected actor accepts at most 1,000 products and 20 search pages
+    // per keyword. Amazon normally renders roughly 16-48 products per page.
+    const productsPerSearch = Math.min(1000, Math.max(1, Number.parseInt(maxItems, 10) || 100));
+    return {
+      searchQueries: [query],
+      marketplace: country || 'US',
+      maxProductsPerSearch: productsPerSearch,
+      maxSearchPages: Math.min(20, Math.max(1, Math.ceil(productsPerSearch / 48))),
+      sort: 'relevance',
+    };
+  },
 
   // Reddit — automation-lab/reddit-scraper
   reddit: ({ query, maxItems }) => ({
@@ -115,11 +120,11 @@ const INPUT_BUILDERS = {
 
   // Instagram Search — apify/instagram-search-scraper (keyword search)
   instagram: ({ query, maxItems }) => ({
-    searchQueries: [query],
-    searchType: 'hashtags',
-    resultsLimit: maxItems,
+    // The actor expects a singular `search` string and `hashtag` (not
+    // `hashtags`) as the search type.
+    search: query,
+    searchType: 'hashtag',
     searchLimit: maxItems,
-    maxItems: maxItems,
   }),
 };
 
@@ -127,18 +132,18 @@ const INPUT_BUILDERS = {
 
 /**
  * Start an Apify actor for the given platform.
+ * @param {string} actorId - The actor ID to run
  * @param {string} platform - Platform name
  * @param {{ query: string, maxItems: number, country?: string }} input
  * @returns {{ runId: string, datasetId: string }}
  */
-async function startActor(platform, input) {
-  if (!client) {
+async function startActor(actorId, platform, input, apiClient = client) {
+  if (!apiClient) {
     throw new Error('Apify client not initialized. Set APIFY_TOKEN in .env');
   }
 
-  const config = getPlatform(platform);
-  if (!config) {
-    throw new Error(`Unknown platform: ${platform}`);
+  if (!actorId) {
+    throw new Error(`actorId is missing for platform: ${platform}`);
   }
 
   const buildInput = INPUT_BUILDERS[platform];
@@ -147,9 +152,9 @@ async function startActor(platform, input) {
   }
 
   const actorInput = buildInput(input);
-  console.log(`[Apify] Starting ${config.actorId}...`);
+  console.log(`[Apify] Starting ${actorId}...`);
 
-  const run = await client.actor(config.actorId).call(actorInput, {
+  const run = await apiClient.actor(actorId).call(actorInput, {
     waitSecs: 0, // Don't wait, we'll poll
   });
 
@@ -166,32 +171,54 @@ async function startActor(platform, input) {
  * @param {string} runId
  * @returns {string} - 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'ABORTED'
  */
-async function getRunStatus(runId) {
-  if (!client) {
+async function getRunStatus(runId, apiClient = client) {
+  if (!apiClient) {
     throw new Error('Apify client not initialized');
   }
 
-  const run = await client.run(runId).get();
+  const run = await apiClient.run(runId).get();
   return run.status;
+}
+
+/**
+ * Fetch a dataset in bounded pages. Actors can return thousands of records,
+ * while one listItems call is intentionally kept small and predictable.
+ * @param {{ listItems: Function }} dataset
+ * @param {number} limit
+ * @param {{ pageSize?: number }} options
+ * @returns {Promise<object[]>}
+ */
+async function paginateDatasetItems(dataset, limit = 100, { pageSize = 1000 } = {}) {
+  const target = Math.max(1, Number.parseInt(limit, 10) || 100);
+  const boundedPageSize = Math.max(1, Math.min(1000, Number.parseInt(pageSize, 10) || 1000));
+  const collected = [];
+  let offset = 0;
+
+  while (collected.length < target) {
+    const requestLimit = Math.min(boundedPageSize, target - collected.length);
+    const response = await dataset.listItems({ offset, limit: requestLimit, clean: true });
+    const page = Array.isArray(response?.items) ? response.items : [];
+    collected.push(...page.slice(0, target - collected.length));
+
+    if (page.length < requestLimit) break;
+    offset += page.length;
+  }
+
+  return collected;
 }
 
 /**
  * Fetch items from an Apify dataset.
  * @param {string} datasetId
  * @param {number} limit
- * @returns {object[]}
+ * @returns {Promise<object[]>}
  */
-async function fetchDatasetItems(datasetId, limit = 100) {
-  if (!client) {
+async function fetchDatasetItems(datasetId, limit = 100, apiClient = client) {
+  if (!apiClient) {
     throw new Error('Apify client not initialized');
   }
 
-  const { items } = await client.dataset(datasetId).listItems({
-    limit,
-    clean: true,
-  });
-
-  return items;
+  return paginateDatasetItems(apiClient.dataset(datasetId), limit);
 }
 
 // ==================== Exports ====================
@@ -200,5 +227,6 @@ module.exports = {
   startActor,
   getRunStatus,
   fetchDatasetItems,
+  paginateDatasetItems,
   INPUT_BUILDERS,
 };

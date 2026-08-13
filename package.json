@@ -10,11 +10,22 @@
     "start:deps": "node scripts/start-deps.js",
     "start:searxng": "node scripts/start-searxng.js",
     "start:cdp": "node scripts/start-cdp.js",
-    "doctor": "node scripts/doctor.js"
+    "doctor": "node scripts/doctor.js",
+    "doctor:channels": "node scripts/doctor.js --channels",
+    "setup:capabilities": "node scripts/setup-capabilities.js",
+    "verify:apify": "node scripts/verify-apify.js",
+    "verify:real-backends": "node scripts/verify-real-backends.js",
+    "codemap": "node scripts/generate-codemap.js",
+    "validate:codemap": "node scripts/validate-codemap.js",
+    "test": "node --test",
+    "e2e:release": "node scripts/e2e-test.js",
+    "import:etsy-analytics": "node scripts/import-etsy-analytics.js",
+    "enrich:etsy-images": "node scripts/enrich-etsy-images.js"
   },
   "dependencies": {
     "apify-client": "^2.9.0",
     "better-sqlite3": "^11.0.0",
+    "cloakbrowser": "0.4.8",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
     "express": "^4.18.0",

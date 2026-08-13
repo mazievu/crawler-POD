@@ -12,7 +12,7 @@ async function scrapePublic(query, options) {
   options = options || {};
   const limit = options.limit || 30;
   const proxyUrl = options.proxyUrl || process.env.EBAY_PROXY || null;
-  const browser = await launchStealth({ proxyUrl, headless: true });
+  const browser = await launchStealth({ proxyUrl, headless: true, cdpUrl: options.cdpUrl || null });
 
   try {
     const page = browser.page;
@@ -47,7 +47,12 @@ async function scrapePublic(query, options) {
 
 async function scrape(query, options) {
   try {
-    return await discoverMarketplaceItems('ebay', query, options || {});
+    const discovered = await discoverMarketplaceItems('ebay', query, options || {});
+    // SearXNG occasionally returns a result page without an accessible image.
+    // Use the rendered eBay search fallback so image-only collection still
+    // returns usable product cards instead of empty image placeholders.
+    if (discovered.items.some((item) => item.image)) return discovered;
+    return await scrapePublic(query, options);
   } catch (err) {
     if (!/SearXNG|EMPTY_RESULT|fetch failed|ECONNREFUSED/i.test(err.message || '')) throw err;
     return scrapePublic(query, options);
