@@ -3,13 +3,13 @@ const assert = require('node:assert/strict');
 
 const { createMarketplaceCaptureScheduler, normalizeScheduleInput, nextScheduleRunAt } = require('../src/marketplaces/capture-scheduler');
 
-test('scheduler enforces Etsy, a keyword, 30 listing maximum, and an hourly cadence', () => {
+test('scheduler enforces Etsy, a keyword, 30 listing default/200 maximum, and an hourly cadence', () => {
   assert.deepEqual(normalizeScheduleInput({
     platform: 'etsy', keyword: 'press on nails', accountId: 7, everyHours: 24,
     variantMode: 'base', maxVariants: 0, maxListings: 999,
   }), {
     platform: 'etsy', keyword: 'press on nails', accountId: 7, everyMinutes: 1440,
-    variantMode: 'base', maxVariants: 0, maxListings: 30, scheduleType: 'interval', dailyTime: '09:00', runAt: null,
+    variantMode: 'base', maxVariants: 0, maxListings: 200, scheduleType: 'interval', dailyTime: '09:00', runAt: null,
   });
   assert.throws(() => normalizeScheduleInput({ platform: 'amazon', keyword: 'x' }), /Etsy only/);
   assert.throws(() => normalizeScheduleInput({ platform: 'etsy', keyword: '' }), /Keyword/);
@@ -18,6 +18,8 @@ test('scheduler enforces Etsy, a keyword, 30 listing maximum, and an hourly cade
     platform: 'etsy', keyword: 'x', accountId: null, everyMinutes: 10080, variantMode: 'all', maxVariants: 250, maxListings: 30, scheduleType: 'interval', dailyTime: '09:00', runAt: null,
   });
 });
+
+
 
 test('due schedule discovers up to 30 Etsy URLs and captures them sequentially', async () => {
   const calls = [];

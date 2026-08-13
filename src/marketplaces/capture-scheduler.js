@@ -30,7 +30,7 @@ function normalizeScheduleInput(input = {}) {
   return {
     platform, keyword, accountId, everyMinutes: everyHours * 60,
     variantMode, maxVariants: variantMode === 'all' ? normalizeMaxVariants(input.maxVariants) : 0,
-    maxListings: Math.min(Math.max(Number(input.maxListings) || 30, 1), 30),
+    maxListings: Math.min(Math.max(Number(input.maxListings) || 30, 1), 200),
     scheduleType, dailyTime, runAt,
   };
 }
@@ -51,7 +51,7 @@ function createMarketplaceCaptureScheduler({ discover, capture, markComplete = a
     let result;
     try {
       result = await discover(schedule.keyword, {
-        limit: Math.min(Number(schedule.max_listings) || 30, 30),
+        limit: Math.min(Number(schedule.max_listings) || 30, 200),
         accountId: schedule.account_id == null ? null : Number(schedule.account_id),
       });
     } catch (error) {
@@ -59,7 +59,8 @@ function createMarketplaceCaptureScheduler({ discover, capture, markComplete = a
       await markComplete(schedule.id, summary);
       return summary;
     }
-    const items = (result.items || []).filter((item) => item?.url).slice(0, Math.min(Number(schedule.max_listings) || 30, 30));
+    const items = (result.items || []).filter((item) => item?.url).slice(0, Math.min(Number(schedule.max_listings) || 30, 200));
+
     const summary = { discovered: items.length, captured: 0, blocked: 0, failed: 0 };
     for (const item of items) {
       try {
