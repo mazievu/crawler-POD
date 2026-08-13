@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 process.env.CREDENTIAL_ENCRYPTION_KEY = Buffer.alloc(32, 6).toString('base64');
 
 const db = require('../src/database');
+const { normalizeMarketplaceCaptureUrl } = require('../src/marketplaces/validation');
 
 function successfulData() {
   return {
@@ -47,4 +48,25 @@ test('does not reuse a capture for different variant options or a blocked page',
 
   assert.equal(db.getCachedMarketplaceCapture({ platform: 'etsy', url, accountId: null, variantMode: 'base', maxVariants: 0 }), null);
   assert.equal(db.getCachedMarketplaceCapture({ platform: 'etsy', url, accountId: null, variantMode: 'all', maxVariants: 10 }), null);
+});
+
+test('cache URL normalization removes tracking parameters without removing product options', () => {
+  assert.equal(
+    normalizeMarketplaceCaptureUrl('amazon', 'https://www.amazon.com/dp/B012345678?th=1&utm_source=mail&ref=homepage'),
+    'https://www.amazon.com/dp/B012345678?th=1',
+  );
+});
+
+test('marketplace URLs without a scheme default to HTTPS', () => {
+  assert.equal(
+    normalizeMarketplaceCaptureUrl('etsy', 'www.etsy.com/listing/123456789/ceramic-mug'),
+    'https://www.etsy.com/listing/123456789',
+  );
+});
+
+test('marketplace cache normalizes an explicit HTTP URL to HTTPS', () => {
+  assert.equal(
+    normalizeMarketplaceCaptureUrl('etsy', 'http://etsy.com/listing/123456789/ceramic-mug'),
+    'https://etsy.com/listing/123456789',
+  );
 });

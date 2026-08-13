@@ -3,7 +3,7 @@
 
 require('dotenv').config();
 
-const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8888';
+const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8080';
 
 async function search(query, options = {}) {
   const {

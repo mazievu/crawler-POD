@@ -6,6 +6,7 @@ function parseMarketplaceHtml({ platform, url, html }) {
 
   const product = findProductJsonLd(html) || {};
   const offer = Array.isArray(product.offers) ? product.offers[0] : (product.offers || {});
+  const pricing = findPricePair(product, html);
   const rating = product.aggregateRating || {};
   const image = Array.isArray(product.image) ? product.image[0] : product.image;
 
@@ -15,12 +16,45 @@ function parseMarketplaceHtml({ platform, url, html }) {
     url,
     listingId: product.sku || product.mpn || listingIdFromUrl(platform, url),
     image: imageUrl(image) || findMeta(html, 'og:image'),
-    price: decimal(offer.price || findMeta(html, 'product:price:amount')),
-    currency: cleanText(offer.priceCurrency || findMeta(html, 'product:price:currency')).toUpperCase(),
+    price: pricing.price,
+    currency: pricing.currency,
     rating: decimal(rating.ratingValue || findItemprop(html, 'ratingValue')),
     reviewCount: number(rating.reviewCount || rating.ratingCount || findItemprop(html, 'reviewCount')),
     availability: normalizeAvailability(offer.availability || findMeta(html, 'product:availability')),
     brand: cleanText(typeof product.brand === 'object' ? product.brand?.name : product.brand),
+  };
+}
+
+function findPricePair(product, html) {
+  const offers = Array.isArray(product.offers) ? product.offers : [product.offers];
+  const structured = offers.find((offer) => offer && offer.price != null && cleanText(offer.priceCurrency));
+  if (structured) {
+    return { price: decimal(structured.price), currency: cleanText(structured.priceCurrency).toUpperCase() };
+  }
+  const metaPrice = findMeta(html, 'product:price:amount');
+  const metaCurrency = cleanText(findMeta(html, 'product:price:currency')).toUpperCase();
+  if (metaPrice && metaCurrency) return { price: decimal(metaPrice), currency: metaCurrency };
+  return { price: 0, currency: '' };
+}
+
+function analyzeMarketplaceHtml({ platform, url, html }) {
+  const metrics = parseMarketplaceHtml({ platform, url, html });
+  const pageTitle = cleanText(findFirstTag(html, 'title'));
+  const canonicalUrl = findCanonicalUrl(html) || url;
+  const challengeText = /captcha|verify you are human|unusual traffic|robot check|automated access|pardon our interruption/i.test(html);
+  // A title by itself is not enough: challenge pages often have a generic title.
+  const hasProductEvidence = Boolean(metrics.title || metrics.price || metrics.image);
+  const blocked = challengeText && !hasProductEvidence;
+
+  return {
+    metrics,
+    capture: {
+      status: blocked ? 'blocked' : 'ok',
+      reason: blocked ? 'possible_bot_challenge' : null,
+      pageTitle,
+      canonicalUrl,
+      parserVersion: 'marketplace-html-v1',
+    },
   };
 }
 
@@ -75,6 +109,11 @@ function findFirstTag(html, tag) {
   return match ? cleanText(match[1].replace(/<[^>]+>/g, ' ')) : '';
 }
 
+function findCanonicalUrl(html) {
+  const match = /<link\b(?=[^>]*rel\s*=\s*["']canonical["'])[^>]*href\s*=\s*["']([^"']*)["'][^>]*>/i.exec(html);
+  return match ? decodeEntities(match[1]) : '';
+}
+
 function listingIdFromUrl(platform, url) {
   const patterns = {
     amazon: /\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i,
@@ -118,4 +157,4 @@ function normalizeAvailability(value) {
   return cleanText(normalized).replace(/\s+/g, '_');
 }
 
-module.exports = { parseMarketplaceHtml };
+module.exports = { parseMarketplaceHtml, analyzeMarketplaceHtml };

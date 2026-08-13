@@ -138,6 +138,52 @@ test('ADS_CARD_SCHEMA has expected fields', () => {
 console.log('\n📋 database.js tests:');
 
 const db = require('../src/database');
+const { extractImage } = require('../src/image-utils');
+const { imageFromSearchResult, isMerchantResult } = require('../src/scrapers/search-discovery');
+
+test('extractImage resolves nested social media URLs', () => {
+  const image = extractImage({ attachments: [{ media: { image: { src: 'https://cdn.example.com/post.jpg' } } }] });
+  assert.strictEqual(image, 'https://cdn.example.com/post.jpg');
+});
+
+test('extractImage selects a product image from an image array', () => {
+  const image = extractImage({ productImages: [{ url: 'https://cdn.example.com/product.webp' }] });
+  assert.strictEqual(image, 'https://cdn.example.com/product.webp');
+});
+
+test('extractImage ignores Reddit placeholder thumbnails', () => {
+  assert.strictEqual(extractImage({ thumbnail: 'self' }), '');
+});
+
+test('extractImage does not mistake an item link for an image', () => {
+  assert.strictEqual(extractImage({ url: 'https://www.reddit.com/r/example/comments/1' }), '');
+});
+
+test('marketplace discovery keeps an image returned by search', () => {
+  assert.strictEqual(
+    imageFromSearchResult({ img_src: 'https://cdn.example.com/listing.jpg' }),
+    'https://cdn.example.com/listing.jpg'
+  );
+});
+
+test('shopping discovery rejects non-merchant sources', () => {
+  assert.strictEqual(isMerchantResult('https://en.wikipedia.org/wiki/Cat'), false);
+  assert.strictEqual(isMerchantResult('https://store.example.com/product/cat-nails'), true);
+});
+
+test('product snapshot persists rating, review count, and sold count', () => {
+  const run = db.createRun({ platform: 'test', query: 'product-metrics', maxItems: 1 });
+  db.insertSnapshots(run.id, 'test', 'product-metrics', [{
+    title: 'Metric Product', url: 'https://example.com/product', image: 'https://example.com/product.jpg',
+    price: '$24.50', rating: '4.6', reviewCount: '1.2K', soldCount: '321',
+  }]);
+  const snapshot = db.getSnapshotsByRunId(run.id)[0];
+  assert.strictEqual(snapshot.price, 24.5);
+  assert.strictEqual(snapshot.rating, 4.6);
+  assert.strictEqual(snapshot.reviews, 1200);
+  assert.strictEqual(snapshot.sold_count, 321);
+  db.deleteRun(run.id);
+});
 
 test('getAllPlatforms returns array', () => {
   const platforms = db.getAllPlatforms();
@@ -321,6 +367,13 @@ test('settingsTextEnablesJson rejects stale html-only settings', () => {
     '  formats:',
     '    - html',
   ].join('\n')), false);
+});
+
+test('instagram builder uses the current Apify hashtag input schema', () => {
+  const input = INPUT_BUILDERS.instagram({ query: 'streetwear', maxItems: 3 });
+  assert.strictEqual(input.search, 'streetwear');
+  assert.strictEqual(input.searchType, 'hashtag');
+  assert.strictEqual(input.searchLimit, 3);
 });
 
 // ==================== Summary ====================

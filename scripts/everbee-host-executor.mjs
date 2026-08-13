@@ -175,17 +175,67 @@ async function capture(request) {
   }
 }
 
+async function discoverEtsyListings(request) {
+  if (request.platform !== 'etsy') throw new Error('CloakBrowser discovery currently supports Etsy only');
+  const keyword = String(request.keyword || '').trim();
+  if (!keyword || keyword.length > 200) throw new Error('Keyword must be between 1 and 200 characters');
+  const limit = Math.min(Math.max(Number(request.limit) || 30, 1), 30);
+  const storageState = request.storageState ? normalizeBrowserStorageState(request.platform, request.storageState) : null;
+  if (request.proxy != null && (typeof request.proxy !== 'string' || request.proxy.length > 1024)) throw new Error('Proxy configuration is invalid');
+  const userDataDir = accountProfileDir(request.platform, request.accountId);
+  if (activeProfiles.has(userDataDir)) throw new Error('This account browser is already capturing');
+
+  activeProfiles.add(userDataDir);
+  let context;
+  let page;
+  try {
+    const { launchPersistentContext } = await loadCloakBrowser();
+    const options = { userDataDir, headless: HEADLESS, locale: 'en-US' };
+    if (request.proxy) options.proxy = request.proxy;
+    context = await launchPersistentContext(options);
+    if (storageState?.cookies?.length) await context.addCookies(storageState.cookies);
+    page = context.pages()[0] || await context.newPage();
+    await page.goto(`https://www.etsy.com/search?q=${encodeURIComponent(keyword)}`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(1500);
+    const response = await page.evaluate((maxItems) => {
+      const text = document.body?.innerText || '';
+      const blocked = /captcha|verify you are human|unusual traffic|access denied/i.test(text)
+        || Boolean(document.querySelector('iframe[src*="captcha"], [id*="captcha"], [class*="captcha"]'));
+      const seen = new Set();
+      const items = [];
+      for (const anchor of document.querySelectorAll('a[href*="/listing/"]')) {
+        const match = anchor.href.match(/etsy\.com\/listing\/(\d+)/i);
+        if (!match || seen.has(match[1])) continue;
+        seen.add(match[1]);
+        const title = (anchor.getAttribute('aria-label') || anchor.querySelector('h3')?.textContent || anchor.textContent || '').replace(/\s+/g, ' ').trim();
+        items.push({ url: `https://www.etsy.com/listing/${match[1]}`, title: title.slice(0, 300) });
+        if (items.length >= maxItems) break;
+      }
+      return { blocked, items };
+    }, limit);
+    if (response.blocked) throw new Error('Etsy search is blocked by anti-bot or CAPTCHA');
+    if (!response.items.length) throw new Error('Etsy search returned no listing results');
+    return { items: response.items };
+  } finally {
+    await page?.close().catch(() => {});
+    await context?.close().catch(() => {});
+    activeProfiles.delete(userDataDir);
+  }
+}
+
 const server = http.createServer(async (request, response) => {
   if (request.method === 'GET' && request.url === '/health') return sendJson(response, 200, { ok: true });
-  if (request.method !== 'POST' || request.url !== '/v1/captures') return sendJson(response, 404, { error: 'Not found' });
+  if (request.method !== 'POST' || !['/v1/captures', '/v1/discoveries'].includes(request.url)) return sendJson(response, 404, { error: 'Not found' });
   if (!isAuthorized(request.headers['x-everbee-executor-token'])) return sendJson(response, 401, { error: 'Unauthorized' });
 
   try {
-    sendJson(response, 200, await capture(await readJson(request)));
+    const payload = await readJson(request);
+    sendJson(response, 200, request.url === '/v1/discoveries' ? await discoverEtsyListings(payload) : await capture(payload));
   } catch (error) {
     // Credentials and raw browser errors must never be sent back to the Docker client.
     const status = /already capturing/.test(error.message) ? 409 : 400;
-    sendJson(response, status, { error: status === 409 ? error.message : 'Everbee host capture failed' });
+    const safeError = /^(Etsy search|CloakBrowser discovery|Keyword must|Proxy configuration)/.test(error.message) ? error.message : null;
+    sendJson(response, status, { error: status === 409 ? error.message : safeError || 'Everbee host capture failed' });
   }
 });
 

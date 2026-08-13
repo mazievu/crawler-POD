@@ -19,6 +19,18 @@
         <span class="topbar-badge" id="stat-total">0 items</span>
       </div>
       <div class="topbar-right">
+        <button class="btn-topbar" onclick="showMarketplaceAccountsModal()">
+          <i data-feather="key"></i> Marketplace Accounts
+        </button>
+        <button class="btn-topbar" onclick="showCaptureHtmlModal()">
+          <i data-feather="code"></i> Capture HTML
+        </button>
+        <button class="btn-topbar" onclick="showSavedCapturesModal()">
+          <i data-feather="archive"></i> Saved Captures
+        </button>
+        <button class="btn-topbar" onclick="showMarketplaceSchedulesModal()">
+          <i data-feather="clock"></i> Schedules
+        </button>
         <button class="btn-topbar" onclick="showHistoryModal()">
           <i data-feather="list"></i> Jobs History
         </button>
@@ -91,14 +103,32 @@
           </div>
           <!-- Query -->
           <div class="mb-3">
-            <label class="filter-label">Search Query</label>
+            <label class="filter-label" id="collect-query-label">Search Query</label>
             <input type="text" class="form-control" id="collect-query" placeholder="keyword or URL...">
             <small class="text-muted" id="collect-hint"></small>
+          </div>
+          <div class="row g-2 mb-3" id="collect-platform-fields"></div>
+          <div id="toidispy-checklist" class="mb-3 d-none">
+            <div class="card bg-light border-warning shadow-sm">
+              <div class="card-body py-2 px-3">
+                <h6 class="card-title text-warning mb-2" style="font-size: 13px; font-weight: 600;">
+                  <i data-feather="alert-triangle" style="width: 14px;"></i> Toidispy Readiness
+                </h6>
+                <ul class="mb-2 ps-3" style="font-size: 12px; color: var(--text-2);">
+                  <li>Chrome CDP reachable</li>
+                  <li>Toidispy logged in</li>
+                  <li>Ads/posts page accessible</li>
+                </ul>
+                <button type="button" class="btn btn-outline-warning btn-sm py-1 w-100" id="btn-check-toidispy-login" style="font-size: 11px;" onclick="checkToidispyLogin()">
+                  <i data-feather="log-in" style="width: 12px;"></i> Check Toidispy Login
+                </button>
+              </div>
+            </div>
           </div>
           <div class="row g-2 mb-3">
             <div class="col-6">
               <label class="filter-label">Max Items</label>
-              <input type="number" class="form-control" id="collect-max" value="20" min="1" max="500">
+              <input type="number" class="form-control" id="collect-max" value="20" min="1" max="10000">
             </div>
             <div class="col-6">
               <label class="filter-label">Country</label>
@@ -123,6 +153,168 @@
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- ===== Marketplace Accounts Modal ===== -->
+  <div class="modal fade" id="marketplace-accounts-modal" tabindex="-1">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-header border-0 pb-0">
+          <h5 class="modal-title fw-bold"><i data-feather="key" class="me-2 text-primary"></i>Marketplace Accounts</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted">Save a Playwright browser storage-state export. Passwords are never saved; the session is encrypted on the server.</p>
+          <div class="row g-2 mb-2">
+            <div class="col-md-4"><label class="filter-label">Platform</label><select id="marketplace-account-platform" class="form-select" onchange="loadMarketplaceAccounts()"><option value="amazon">Amazon</option><option value="ebay">eBay</option><option value="etsy">Etsy</option></select></div>
+            <div class="col-md-8"><label class="filter-label">Account label</label><input id="marketplace-account-label" class="form-control" maxlength="100" placeholder="e.g. US research account"></div>
+          </div>
+          <div class="mb-3"><label class="filter-label">SOCKS5 proxy (optional)</label><select id="marketplace-account-proxy" class="form-select"><option value="">No proxy</option></select><small class="text-muted">Assign one stable proxy profile to this account.</small></div>
+          <div class="mb-3"><label class="filter-label">Cookie hoặc browser storage state</label><textarea id="marketplace-account-state" class="form-control font-monospace" rows="6" placeholder='Dán một cookie: sessionid=...  hoặc JSON cookie / Playwright storage state'></textarea><small class="text-muted">Một cookie Etsy được tự gán domain <code>.etsy.com</code>; không cần dán cả storage state.</small></div>
+          <div class="d-flex gap-2 align-items-center mb-2">
+            <button class="btn btn-outline-primary btn-sm" onclick="startMarketplaceBrowserLogin()"><i data-feather="log-in" style="width:14px"></i> Sign in with browser</button>
+            <button id="marketplace-login-confirm" class="btn btn-success btn-sm d-none" onclick="confirmMarketplaceBrowserLogin()"><i data-feather="check" style="width:14px"></i> I have signed in</button>
+            <button id="marketplace-login-cancel" class="btn btn-outline-secondary btn-sm d-none" onclick="cancelMarketplaceBrowserLogin()">Cancel login</button>
+          </div>
+          <div id="marketplace-login-status" class="small text-muted mb-2"></div>
+          <div id="marketplace-account-status" class="small mb-2"></div>
+          <button class="btn btn-primary btn-sm" onclick="saveMarketplaceAccount()"><i data-feather="save" style="width:14px"></i> Save encrypted session</button>
+          <hr>
+          <h6 class="fw-bold">SOCKS5 Proxy Profiles</h6>
+          <p class="small text-muted">Credentials are encrypted on the server and never shown again.</p>
+          <div class="row g-2 mb-2">
+            <div class="col-md-4"><label class="filter-label">Label</label><input id="marketplace-proxy-label" class="form-control" maxlength="100" placeholder="e.g. Etsy US proxy"></div>
+            <div class="col-md-5"><label class="filter-label">Host</label><input id="marketplace-proxy-host" class="form-control" placeholder="proxy.example.com"></div>
+            <div class="col-md-3"><label class="filter-label">Port</label><input id="marketplace-proxy-port" class="form-control" type="number" min="1" max="65535" value="1080"></div>
+            <div class="col-md-6"><label class="filter-label">Username (optional)</label><input id="marketplace-proxy-username" class="form-control" autocomplete="off"></div>
+            <div class="col-md-6"><label class="filter-label">Password (optional)</label><input id="marketplace-proxy-password" class="form-control" type="password" autocomplete="new-password"></div>
+          </div>
+          <div id="marketplace-proxy-status" class="small mb-2"></div>
+          <button class="btn btn-outline-primary btn-sm" onclick="saveMarketplaceProxy()"><i data-feather="shield" style="width:14px"></i> Save SOCKS5 proxy</button>
+          <div id="marketplace-proxies-list" class="small text-muted mt-2">Loading...</div>
+          <hr>
+          <h6 class="fw-bold">Saved accounts</h6>
+          <div id="marketplace-accounts-list" class="small text-muted">Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== HTML Capture Modal ===== -->
+  <div class="modal fade" id="capture-html-modal" tabindex="-1">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-header border-0 pb-0">
+          <h5 class="modal-title fw-bold"><i data-feather="code" class="me-2 text-primary"></i>Capture &amp; Parse HTML</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted">Hỗ trợ 2 chế độ: Chụp HTML từ URL sản phẩm đơn lẻ HOẶC Chạy kịch bản User Journey tự động (Mô phỏng vị trí/ZIP, gõ từ khóa, lọc và chụp HTML từng chốt).</p>
+          
+          <div class="row g-2 mb-3">
+            <div class="col-md-4">
+              <label class="filter-label fw-bold">Platform</label>
+              <select id="capture-platform" class="form-select" onchange="loadCaptureAccounts(); updateCaptureVariantOptions()">
+                <option value="amazon">Amazon</option>
+                <option value="ebay">eBay</option>
+                <option value="etsy">Etsy</option>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="filter-label fw-bold">Chế độ Capture (Mode)</label>
+              <select id="capture-mode" class="form-select" onchange="toggleCaptureModeUI()">
+                <option value="single">1. Chụp URL sản phẩm đơn lẻ</option>
+                <option value="user_journey">2. Luồng Kịch bản User Journey tự động</option>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="filter-label">Tài khoản session (tùy chọn)</label>
+              <select id="capture-account" class="form-select">
+                <option value="">Public / no login</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Mode 1: Single Product URL Inputs -->
+          <div id="capture-mode-single-wrap">
+            <div class="row g-2 mb-3" id="capture-variant-controls">
+              <div class="col-md-7">
+                <label class="filter-label">Etsy price capture</label>
+                <select id="capture-variant-mode" class="form-select" onchange="updateCaptureVariantOptions()">
+                  <option value="base">Base product only</option>
+                  <option value="all">All dropdown variants</option>
+                </select>
+                <small class="text-muted">All variants selects each Size / Shape combination, never Quantity.</small>
+              </div>
+              <div class="col-md-5">
+                <label class="filter-label">Maximum combinations</label>
+                <input id="capture-max-variants" class="form-control" type="number" min="1" max="250" value="150">
+              </div>
+            </div>
+            <div class="mb-3">
+              <label class="filter-label">Product URL</label>
+              <input id="capture-url" class="form-control" type="url" placeholder="https://www.amazon.com/dp/...">
+            </div>
+            <button id="capture-html-submit" class="btn btn-primary btn-sm" onclick="captureMarketplaceHtml()">
+              <i data-feather="camera" style="width:14px"></i> Capture and parse
+            </button>
+          </div>
+
+          <!-- Mode 2: User Journey Automation Inputs -->
+          <div id="capture-mode-uj-wrap" class="d-none border rounded p-3 bg-light mb-3">
+            <h6 class="fw-bold text-warning mb-2"><i data-feather="compass" class="me-1"></i>Cấu hình Kịch bản User Journey</h6>
+            <div class="row g-2 mb-2">
+              <div class="col-md-6">
+                <label class="filter-label fw-bold">Từ khóa tìm kiếm (Keyword)</label>
+                <input id="uj-mode-keyword" class="form-control form-control-sm" placeholder="e.g. press on nails" value="press on nails">
+              </div>
+              <div class="col-md-3">
+                <label class="filter-label fw-bold">Mã ZIP Mỹ (Location)</label>
+                <input id="uj-mode-zipcode" class="form-control form-control-sm" placeholder="90210" value="90210">
+              </div>
+              <div class="col-md-3">
+                <label class="filter-label fw-bold">Max Products</label>
+                <input id="uj-mode-maxproducts" class="form-control form-control-sm" type="number" min="1" max="50" value="5">
+              </div>
+            </div>
+            <button id="uj-mode-submit" class="btn btn-warning btn-sm fw-bold w-100 mt-2" onclick="runUserJourneyFromCaptureModal()">
+              <i data-feather="play" style="width:14px"></i> Chạy Kịch bản User Journey
+            </button>
+          </div>
+
+          <div id="capture-html-status" class="small mb-2"></div>
+          <div id="capture-html-result" class="mt-3"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Saved HTML Captures Modal ===== -->
+  <div class="modal fade" id="saved-captures-modal" tabindex="-1">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-header border-0 pb-0">
+          <h5 class="modal-title fw-bold"><i data-feather="archive" class="me-2 text-primary"></i>Saved Captures</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted">Successful captures are encrypted locally and reused for the same product, account, and dropdown settings.</p>
+          <div id="saved-captures-list" class="small text-muted">Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="marketplace-schedules-modal" tabindex="-1">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content border-0 shadow-lg">
+      <div class="modal-header border-0 pb-0"><h5 class="modal-title fw-bold"><i data-feather="clock" class="me-2 text-primary"></i>Scheduled Etsy Captures</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+      <div class="modal-body">
+        <p class="small text-muted">Each run discovers up to 30 Etsy listings for the keyword, then captures them sequentially on the server.</p>
+        <div class="row g-2 mb-2"><div class="col-md-7"><label class="filter-label">Keyword</label><input id="marketplace-schedule-keyword" class="form-control" maxlength="200" placeholder="e.g. lavender press on nails"></div><div class="col-md-5"><label class="filter-label">Saved Etsy account (optional)</label><select id="marketplace-schedule-account" class="form-select"><option value="">Public / no login</option></select></div></div>
+        <div class="row g-2 mb-2"><div class="col-md-4"><label class="filter-label">Schedule</label><select id="marketplace-schedule-type" class="form-select" onchange="updateMarketplaceScheduleTimeFields()"><option value="interval">Every X hours</option><option value="daily">Daily at a time</option><option value="once">One time at date &amp; time</option></select></div><div class="col-md-4" id="marketplace-schedule-hours-wrap"><label class="filter-label">Repeat every (hours)</label><input id="marketplace-schedule-every-hours" class="form-control" type="number" min="1" max="168" value="24"></div><div class="col-md-4 d-none" id="marketplace-schedule-time-wrap"><label class="filter-label">Daily time (Vietnam)</label><input id="marketplace-schedule-daily-time" class="form-control" type="time" value="09:00"></div><div class="col-md-4 d-none" id="marketplace-schedule-once-wrap"><label class="filter-label">Date &amp; time (Vietnam)</label><input id="marketplace-schedule-once-datetime" class="form-control" type="datetime-local"></div><div class="col-md-4"><label class="filter-label">Dropdown capture</label><select id="marketplace-schedule-variant-mode" class="form-select"><option value="base">Base product</option><option value="all">All dropdown variants</option></select></div><div class="col-md-4"><label class="filter-label">Max variants/listing</label><input id="marketplace-schedule-max-variants" class="form-control" type="number" min="1" max="250" value="150"></div></div>
+        <button class="btn btn-primary btn-sm" onclick="saveMarketplaceSchedule()"><i data-feather="calendar" style="width:14px"></i> Save schedule</button><div id="marketplace-schedule-status" class="small mt-2"></div><hr><div id="marketplace-schedules-list" class="small text-muted">Loading...</div>
+      </div>
+    </div></div>
   </div>
 
   <!-- ===== Item Detail Modal ===== -->
@@ -156,17 +348,69 @@
                   <th>ID</th>
                   <th>Platform</th>
                   <th>Query</th>
+                  <th>Backend</th>
                   <th>Status</th>
                   <th>Items</th>
                   <th>Date</th>
-                  <th>Action</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody id="jobs-tbody">
-                <tr><td colspan="7" class="text-center py-4">Loading...</td></tr>
+                <tr><td colspan="8" class="text-center py-4">Loading...</td></tr>
               </tbody>
             </table>
           </div>
+  <!-- ===== User Journey Modal ===== -->
+  <div class="modal fade" id="user-journey-modal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-header border-0 pb-0">
+          <h5 class="modal-title fw-bold text-warning">
+            <i data-feather="compass" class="me-2"></i>User Journey Automation Runner
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted mb-3">
+            Tự động mô phỏng luồng người dùng thật (Session -> Cài mã ZIP/Location -> Tìm kiếm -> Filter -> Mở Tab chi tiết -> Chọn Biến thể -> Chụp HTML Snapshots -> Phân tích dữ liệu sản phẩm vào SQLite).
+          </p>
+          <div class="row g-3 mb-3">
+            <div class="col-md-4">
+              <label class="filter-label fw-bold">Platform (Nền tảng)</label>
+              <select id="uj-platform" class="form-select">
+                <option value="etsy">Etsy</option>
+                <option value="ebay">eBay</option>
+                <option value="amazon">Amazon</option>
+              </select>
+            </div>
+            <div class="col-md-5">
+              <label class="filter-label fw-bold">Keyword (Từ khóa)</label>
+              <input id="uj-keyword" class="form-control" placeholder="e.g. press on nails, custom mug..." value="press on nails">
+            </div>
+            <div class="col-md-3">
+              <label class="filter-label fw-bold">Mã ZIP (Mỹ)</label>
+              <input id="uj-zipcode" class="form-control" placeholder="90210" value="90210">
+            </div>
+          </div>
+          <div class="row g-3 mb-3">
+            <div class="col-md-4">
+              <label class="filter-label">Số sản phẩm tối đa (Max Products)</label>
+              <input id="uj-maxproducts" class="form-control" type="number" min="1" max="50" value="5">
+            </div>
+            <div class="col-md-4">
+              <label class="filter-label">Free Shipping Filter</label>
+              <select id="uj-freeshipping" class="form-select">
+                <option value="true">Bật (True)</option>
+                <option value="false">Tắt (False)</option>
+              </select>
+            </div>
+          </div>
+          
+          <button id="uj-start-btn" class="btn btn-warning w-100 fw-bold py-2 mt-2" onclick="startUserJourneyRun()">
+            <i data-feather="play" class="me-1"></i> Bắt đầu chạy Kịch bản User Journey
+          </button>
+
+          <div id="uj-status" class="mt-3"></div>
         </div>
       </div>
     </div>

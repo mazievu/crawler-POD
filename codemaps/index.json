@@ -1,0 +1,79 @@
+{
+  "name": "crawler-pod-capability-layer-root-manifest",
+  "version": "1.0.0",
+  "phaseMaps": [
+    "codemaps/phases/phase-01-codemaps-gate.md",
+    "codemaps/phases/phase-02-channel-registry.md",
+    "codemaps/phases/phase-03-backend-adapters.md",
+    "codemaps/phases/phase-04-backend-router.md",
+    "codemaps/phases/phase-05-doctor-system.md",
+    "codemaps/phases/phase-06-database-migration.md",
+    "codemaps/phases/phase-07-normalizer-layer.md",
+    "codemaps/phases/phase-08-run-service-refactor.md",
+    "codemaps/phases/phase-09-ui-additions.md",
+    "codemaps/phases/phase-10-agent-skill.md",
+    "codemaps/phases/phase-11-tests.md",
+    "codemaps/phases/phase-12-release-e2e-regression.md"
+  ],
+  "moduleMaps": [
+    "codemaps/modules/channels.md",
+    "codemaps/modules/backends.md",
+    "codemaps/modules/router.md",
+    "codemaps/modules/doctor.md",
+    "codemaps/modules/backend-coverage.md",
+    "codemaps/modules/database.md",
+    "codemaps/modules/normalizers.md",
+    "codemaps/modules/run-service.md",
+    "codemaps/modules/ui.md",
+    "codemaps/modules/agent-skill.md",
+    "codemaps/modules/e2e.md"
+  ],
+  "apiMaps": [
+    "codemaps/api/api-changes.md"
+  ],
+  "databaseMaps": [
+    "codemaps/database/migrations.md"
+  ],
+  "exceptionMaps": [
+    "codemaps/exceptions/legacy-toidispy-route.md",
+    "codemaps/exceptions/toidispy-login-state.md"
+  ],
+  "trackedFiles": [
+    "src/channels/amazon.channel.js",
+    "src/channels/ebay.channel.js",
+    "src/channels/etsy.channel.js",
+    "src/channels/facebook_ads.channel.js",
+    "src/channels/facebook_posts.channel.js",
+    "src/channels/google_shopping.channel.js",
+    "src/channels/instagram.channel.js",
+    "src/channels/pinterest.channel.js",
+    "src/channels/reddit.channel.js",
+    "src/channels/registry.js",
+    "src/channels/schema.js",
+    "src/channels/shopify.channel.js",
+    "src/channels/tiktok_shop.channel.js",
+    "src/channels/toidispy.channel.js",
+    "src/channels/twitter.channel.js",
+    "src/backends/apify.backend.js",
+    "src/backends/base.backend.js",
+    "src/backends/cdp.backend.js",
+    "src/backends/local-scraper.backend.js",
+    "src/backends/mock.backend.js",
+    "src/router/backend-router.js",
+    "src/doctor/index.js",
+    "src/normalize/ad-creative.js",
+    "src/normalize/index.js",
+    "src/normalize/product-listing.js",
+    "src/normalize/social-post.js",
+    "src/normalize/trend-signal.js",
+    "src/runs.service.js",
+    "skills/crawler-pod/SKILL.md",
+    "scripts/e2e-test.js"
+  ],
+  "acceptanceCommands": [
+    "npm run validate:codemap",
+    "npm run doctor -- --json",
+    "npm test",
+    "npm run e2e:release"
+  ]
+}

@@ -8,12 +8,14 @@
 const { chromium } = require('playwright');
 const { ToidispyFilterAdapter } = require('./toidispy-filter-adapter');
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 
 // ==================== Database Helper ====================
 
 const DB = {
-  async savePosts(items, keyword, filters = {}) {
-    const response = await fetch('http://localhost:3000/api/toidispy/import', {
+  async savePosts(items, keyword, filters = {}, importUrl = 'http://localhost:3000/api/toidispy/import') {
+    const response = await fetch(importUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query: keyword, filters, items }),
@@ -37,12 +39,12 @@ class ToidispyAutomation {
    */
   async connect(cdpUrl = process.env.CDP_URL || 'http://localhost:9222') {
     try {
-      this.browser = await chromium.connectOverCDP(cdpUrl);
+      this.browser = await chromium.connectOverCDP(cdpUrl, { timeout: 10000 });
       const contexts = this.browser.contexts();
       if (contexts.length === 0) throw new Error('No browser contexts found');
       this.page = contexts[0].pages()[0];
       this.filterAdapter = new ToidispyFilterAdapter(this.page);
-      console.log('✅ Connected to Chrome');
+      console.error('✅ Connected to Chrome');
       return true;
     } catch (err) {
       console.error('❌ Connection failed:', err.message);
@@ -56,8 +58,8 @@ class ToidispyAutomation {
     const url = section === 'ads'
       ? 'https://app.toidispy.com/libraries'
       : 'https://app.toidispy.com/posts';
-    await this.page.goto(url, { waitUntil: 'networkidle' });
-    console.log(`📄 Navigated to ${section}`);
+    await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    console.error(`📄 Navigated to ${section}`);
     await this.page.waitForTimeout(2000);
   }
 
@@ -70,10 +72,10 @@ class ToidispyAutomation {
       await this.page.waitForTimeout(2000);
 
       const currentCount = await this.page.$$eval('.p-item-col', els => els.length);
-      console.log(`  📜 Scroll ${i + 1}/${maxScrolls}: ${currentCount} items`);
+      console.error(`  📜 Scroll ${i + 1}/${maxScrolls}: ${currentCount} items`);
 
       if (currentCount === lastCount) {
-        console.log('  ⏹️ No more items to load');
+        console.error('  ⏹️ No more items to load');
         break;
       }
       lastCount = currentCount;
@@ -264,17 +266,25 @@ class ToidispyAutomation {
       filters = {},
       maxScrolls = 3,
       saveToDb = true,
+      importUrl = 'http://localhost:3000/api/toidispy/import'
     } = options;
 
     const appliedFilters = { ...filters, keyword };
 
-    console.log(`\n🚀 Starting Toidispy automation`);
-    console.log(`   Section: ${section}`);
-    console.log(`   Keyword: "${keyword}"`);
-    console.log(`   Filters:`, JSON.stringify(appliedFilters, null, 2));
+    console.error(`\n🚀 Starting Toidispy automation`);
+    console.error(`   Section: ${section}`);
+    console.error(`   Keyword: "${keyword}"`);
+    console.error(`   Filters:`, JSON.stringify(appliedFilters, null, 2));
 
     // 1. Navigate
     await this.navigate(section);
+
+    const currentUrl = this.page.url();
+    if (currentUrl.includes('/login')) {
+      const err = new Error("Toidispy login required. Open the CDP browser, login to Toidispy, then retry.");
+      err.code = 'TOIDISPY_LOGIN_REQUIRED';
+      throw err;
+    }
 
     // 2. Apply all filters
     await this.filterAdapter.applyFilters(appliedFilters, section);
@@ -285,9 +295,9 @@ class ToidispyAutomation {
     // 4. Wait for results
     try {
       await this.page.waitForSelector('.p-item-col', { timeout: 10000 });
-      console.log('✅ Results loaded');
+      console.error('✅ Results loaded');
     } catch {
-      console.log('⚠️ No results found');
+      console.error('⚠️ No results found');
       return { items: [], filters: appliedFilters };
     }
 
@@ -302,12 +312,12 @@ class ToidispyAutomation {
       items = await this.scrapePosts();
     }
 
-    console.log(`📊 Scraped ${items.length} items`);
+    console.error(`📊 Scraped ${items.length} items`);
 
     // 7. Save to database
     if (saveToDb && items.length > 0) {
-      const result = await DB.savePosts(items, keyword, appliedFilters);
-      console.log(`💾 Saved: ${result.count} items`);
+      const result = await DB.savePosts(items, keyword, appliedFilters, importUrl);
+      console.error(`💾 Saved: ${result.count} items`);
     }
 
     return { items, filters: appliedFilters };
@@ -320,57 +330,126 @@ class ToidispyAutomation {
 
 // ==================== CLI Runner ====================
 
+async function fatal(error, context = {}, page = null) {
+  const diagnostic = {
+    level: 'error',
+    event: 'toidispy_fatal',
+    code: error?.code,
+    message: error?.message || String(error),
+    stack: error?.stack,
+    ...context
+  };
+
+  try {
+    if (page) {
+      diagnostic.currentUrl = page.url();
+      diagnostic.title = await page.title().catch(() => null);
+
+      const debugDir = process.env.TOIDISPY_DEBUG_DIR;
+      if (debugDir) {
+        if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
+        const prefix = `run-${Date.now()}`;
+        const screenshotPath = path.join(debugDir, `${prefix}.png`);
+        const htmlPath = path.join(debugDir, `${prefix}.html`);
+        await page.screenshot({ path: screenshotPath, fullPage: true, timeout: 5000 }).catch(() => null);
+        const html = await page.content().catch(() => '');
+        fs.writeFileSync(htmlPath, html, 'utf-8');
+        diagnostic.screenshotPath = screenshotPath;
+        diagnostic.htmlPath = htmlPath;
+      }
+    }
+  } catch (debugError) {
+    diagnostic.debugCaptureError = debugError.message;
+  }
+
+  console.error(JSON.stringify(diagnostic));
+}
+
 async function main() {
   const args = process.argv.slice(2);
-
-  // Parse: node toidispy-cdp.js "keyword" [section] [filters-json]
-  const keyword = args[0] || 'press on nail';
-  const section = args[1] || 'posts';
+  let output = 'import'; // default legacy
+  let keyword = 'press on nail';
+  let section = 'posts';
   let filters = {};
+  let importUrl = 'http://localhost:3000/api/toidispy/import';
+  let cdpUrl = process.env.CDP_URL || 'http://localhost:9222';
 
-  if (args[2]) {
-    try { filters = JSON.parse(args[2]); }
-    catch { console.log('⚠️ Invalid filters JSON, using defaults'); }
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--output' && args[i + 1]) output = args[++i];
+    else if (args[i] === '--query' && args[i + 1]) keyword = args[++i];
+    else if (args[i] === '--section' && args[i + 1]) section = args[++i];
+    else if (args[i] === '--import-url' && args[i + 1]) importUrl = args[++i];
+    else if (args[i] === '--cdp-url' && args[i + 1]) cdpUrl = args[++i];
+    else if (args[i] === '--filters' && args[i + 1]) {
+      try { filters = JSON.parse(args[++i]); }
+      catch { console.error('⚠️ Invalid filters JSON, using defaults'); }
+    }
   }
 
   const auto = new ToidispyAutomation();
+  const context = { section, query: keyword, filters, outputMode: output, cdpUrl };
 
   try {
-    const connected = await auto.connect();
+    const connected = await auto.connect(cdpUrl);
     if (!connected) {
-      console.log('\n💡 Run `npm run start:cdp` or start Chrome with CDP at ' + (process.env.CDP_URL || 'http://localhost:9222'));
-      process.exit(1);
+      throw new Error('Run `npm run start:cdp` or start Chrome with CDP at ' + cdpUrl);
     }
 
-    const result = await auto.run(keyword, { section, filters });
+    const saveToDb = (output === 'import');
+    const result = await auto.run(keyword, { section, filters, saveToDb, importUrl });
 
-    console.log('\n📊 Summary:');
-    console.log(`- Total items: ${result.items.length}`);
+    if (output === 'stdout') {
+      process.stdout.write(JSON.stringify({ items: result.items, meta: { platform: 'toidispy', status: 'ok', query: keyword, section, filters: result.filters } }) + '\n');
+    } else {
+      console.error('\n📊 Summary:');
+      console.error(`- Total items: ${result.items.length}`);
 
-    if (result.items.length > 0) {
-      const sample = result.items[0];
-      console.log(`- Sample item:`, JSON.stringify(sample, null, 2));
+      if (result.items.length > 0) {
+        const sample = result.items[0];
+        console.error(`- Sample item:`, JSON.stringify(sample, null, 2));
 
-      if (section === 'posts') {
-        const totalReactions = result.items.reduce((s, i) => s + (i.reactions || 0), 0);
-        const totalComments = result.items.reduce((s, i) => s + (i.comments || 0), 0);
-        const totalShares = result.items.reduce((s, i) => s + (i.shares || 0), 0);
-        console.log(`- Total reactions: ${totalReactions}`);
-        console.log(`- Total comments: ${totalComments}`);
-        console.log(`- Total shares: ${totalShares}`);
-      } else {
-        const totalAds = result.items.reduce((s, i) => s + (i.adCount || 0), 0);
-        console.log(`- Total ads across pages: ${totalAds}`);
+        if (section === 'posts') {
+          const totalReactions = result.items.reduce((s, i) => s + (i.reactions || 0), 0);
+          const totalComments = result.items.reduce((s, i) => s + (i.comments || 0), 0);
+          const totalShares = result.items.reduce((s, i) => s + (i.shares || 0), 0);
+          console.error(`- Total reactions: ${totalReactions}`);
+          console.error(`- Total comments: ${totalComments}`);
+          console.error(`- Total shares: ${totalShares}`);
+        } else {
+          const totalAds = result.items.reduce((s, i) => s + (i.adCount || 0), 0);
+          console.error(`- Total ads across pages: ${totalAds}`);
+        }
       }
     }
   } catch (err) {
-    console.error('❌ Error:', err.message);
-  } finally {
+    await fatal(err, context, auto.page);
+
+    if (output === 'stdout') {
+      const errorPayload = {
+        items: [],
+        meta: {
+          platform: 'toidispy',
+          status: 'failed',
+          query: keyword,
+          section,
+          filters
+        },
+        error: {
+          message: err.message,
+          code: err.code,
+          type: err.name,
+          currentUrl: auto.page ? auto.page.url() : null,
+          title: auto.page ? await auto.page.title().catch(() => null) : null
+        }
+      };
+      process.stdout.write(JSON.stringify(errorPayload) + '\n');
+    }
     await auto.close();
+    process.exit(1);
   }
 }
 
-module.exports = { ToidispyAutomation, DB };
+module.exports = { ToidispyAutomation, DB, fatal };
 
 if (require.main === module) {
   main();

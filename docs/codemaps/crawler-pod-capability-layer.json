@@ -1,0 +1,176 @@
+{
+  "name": "crawler-pod-capability-layer",
+  "version": "1.0.0",
+  "createdAt": "2026-06-24",
+  "updatedAt": "2026-06-24",
+  "scope": {
+    "goal": "Add channel registry, backend routing, doctor, run backend metadata, normalizers, and agent skill.",
+    "nonGoals": [
+      "Do not rewrite the whole dashboard.",
+      "Do not remove Apify integration.",
+      "Do not implement stealth bypass logic beyond existing compliant integrations."
+    ]
+  },
+  "layers": {
+    "channels": {
+      "path": "src/channels",
+      "responsibility": "Define platform capabilities, metadata, and backend priority."
+    },
+    "backends": {
+      "path": "src/backends",
+      "responsibility": "Implement backend probe/run/normalize adapters."
+    },
+    "router": {
+      "path": "src/router",
+      "responsibility": "Choose active backend based on health and priority."
+    },
+    "doctor": {
+      "path": "src/doctor",
+      "responsibility": "Check system readiness and return actionable diagnostics."
+    },
+    "normalize": {
+      "path": "src/normalize",
+      "responsibility": "Convert raw backend data into POD intelligence schemas."
+    },
+    "agent": {
+      "path": "skills/crawler-pod",
+      "responsibility": "Teach AI agents how to use crawler-POD safely and effectively."
+    }
+  },
+  "files": [
+    {
+      "path": "src/channels/amazon.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/ebay.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/etsy.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/facebook_ads.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/facebook_posts.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/google_shopping.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/instagram.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/pinterest.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/reddit.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/registry.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/schema.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/shopify.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/tiktok_shop.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/toidispy.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/channels/twitter.channel.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/backends/apify.backend.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/backends/base.backend.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/backends/cdp.backend.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/backends/local-scraper.backend.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/backends/mock.backend.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/router/backend-router.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/doctor/index.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/normalize/ad-creative.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/normalize/index.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/normalize/product-listing.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/normalize/social-post.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "src/normalize/trend-signal.js",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "skills/crawler-pod/SKILL.md",
+      "description": "Auto-added file for Phase 2-10."
+    },
+    {
+      "path": "scripts/e2e-test.js",
+      "description": "Release E2E test script."
+    },
+    {
+      "path": "src/runs.service.js",
+      "description": "Implementation note: The run service was implemented at src/runs.service.js instead of src/services/run-service.js. Reason: Preserve current project structure / minimize import churn. Impact: No API behavior change."
+    }
+  ],
+  "apiChanges": [],
+  "databaseChanges": [],
+  "behaviorChanges": [
+    "Legacy Architectural Exception: POST /api/toidispy/run currently remains outside the generic runs.service / BackendRouter path because it has a browser-login/CDP lifecycle that was preserved to avoid breaking existing released behavior."
+  ],
+  "migrationNotes": [
+    "Future migration: Move /api/toidispy/run through cdp.backend.js and runs.service after CDP lifecycle requirements are fully normalized."
+  ],
+  "acceptanceChecks": [
+    "npm run doctor -- --json",
+    "npm run validate:codemap",
+    "npm test",
+    "npm run e2e:release"
+  ]
+}

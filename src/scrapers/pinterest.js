@@ -79,6 +79,7 @@ async function scrapePublic(query, options = {}) {
   const limit = options.limit || 50;
   const browser = await launchStealth({
     proxyUrl: options.proxyUrl || process.env.PINTEREST_PROXY || null,
+    cdpUrl: options.cdpUrl || null,
     headless: options.headless !== false,
   });
 

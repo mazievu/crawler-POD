@@ -11,8 +11,11 @@ function assertSupportedMarketplace(platform) {
 function assertMarketplaceUrl(platform, value) {
   assertSupportedMarketplace(platform);
   let url;
+  const input = String(value || '').trim();
   try {
-    url = new URL(value);
+    url = new URL(input.startsWith('//')
+      ? `https:${input}`
+      : /^[a-z][a-z\d+.-]*:/i.test(input) ? input : `https://${input}`);
   } catch {
     throw new Error('A valid HTTP(S) URL is required');
   }
@@ -26,4 +29,26 @@ function assertMarketplaceUrl(platform, value) {
   return url.toString();
 }
 
-module.exports = { assertMarketplaceUrl, assertSupportedMarketplace, MARKETPLACE_HOSTS };
+function normalizeMarketplaceCaptureUrl(platform, value) {
+  const url = new URL(assertMarketplaceUrl(platform, value));
+  url.protocol = 'https:';
+  url.hash = '';
+
+  if (platform === 'etsy') {
+    const listing = url.pathname.match(/^\/listing\/(\d+)/i);
+    if (listing) {
+      url.pathname = `/listing/${listing[1]}`;
+      url.search = '';
+      return url.toString();
+    }
+  }
+
+  for (const key of [...url.searchParams.keys()]) {
+    if (/^(utm_|fbclid$|gclid$|ref$|ref_|sr_prefetch$|content_source$|logging_key$|dd_referrer$)/i.test(key)) {
+      url.searchParams.delete(key);
+    }
+  }
+  return url.toString();
+}
+
+module.exports = { assertMarketplaceUrl, normalizeMarketplaceCaptureUrl, assertSupportedMarketplace, MARKETPLACE_HOSTS };

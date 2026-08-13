@@ -45,6 +45,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .filter-select { padding: 7px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; outline: none; background: #f8f9fc; cursor: pointer; }
 .filter-select:focus { border-color: var(--primary); }
 .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-3); margin-bottom: 6px; display: block; }
+.item-img-placeholder { width: 100%; height: 100%; display: grid; place-items: center; background: linear-gradient(135deg, #eef2ff, #f8fafc); color: var(--text-3); font-size: 12px; }
 .filter-pills { display: flex; gap: 4px; flex: 1; overflow-x: auto; padding: 2px 0; }
 .filter-pills::-webkit-scrollbar { height: 0; }
 
@@ -158,6 +159,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   font-weight: 400;
   margin-left: 6px;
 }
+.item-product-metrics { display: flex; gap: 6px; align-items: center; margin-top: 5px; color: var(--text-2); font-size: 11px; font-weight: 600; }
+.item-product-metrics span:first-child { color: #e3a008; }
+.item-product-metrics .metric-separator { color: var(--text-3); font-weight: 400; }
 
 /* ===== Engagement Stats (KEY) ===== */
 .item-engagement {
@@ -210,6 +214,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .platform-option .po-icon { font-size: 14px; }
 .form-control, .form-select { border-radius: 8px; font-size: 13px; border-color: var(--border); }
 .form-control:focus, .form-select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79,110,247,0.1); }
+
+/* EverBee's browser extension injects this floating widget into arbitrary pages
+   with a z-index above Bootstrap modals. Keep it available on the dashboard,
+   but hide it while a modal (Jobs History, Capture HTML, etc.) is active. */
+body.modal-open #__everbee_ai_bee {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
 
 /* ===== Empty State ===== */
 .empty-state { text-align: center; padding: 60px 20px; color: var(--text-3); grid-column: 1 / -1; }

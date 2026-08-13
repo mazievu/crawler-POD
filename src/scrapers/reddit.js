@@ -10,6 +10,7 @@ const https = require('https');
 const { launchStealth } = require('../../anti-bot/stealth-launcher');
 
 const BASE = 'https://www.reddit.com/search.json';
+const OLD_REDDIT_BASE = 'https://old.reddit.com/search.json';
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -51,7 +52,7 @@ function proxiedFetch(url, options, proxyUrl) {
   });
 }
 
-async function scrapeApi(query, options) {
+async function scrapeApi(query, options, baseUrl = BASE) {
   options = options || {};
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   const proxyUrl = options.proxyUrl || process.env.REDDIT_PROXY || null;
@@ -63,7 +64,7 @@ async function scrapeApi(query, options) {
     raw_json: '1',
   });
 
-  const url = BASE + '?' + params.toString();
+  const url = baseUrl + '?' + params.toString();
   const headers = {
     'User-Agent': ua,
     'Accept': 'application/json',
@@ -115,6 +116,7 @@ async function scrapePublic(query, options) {
   const browser = await launchStealth({
     proxyUrl: options.proxyUrl || process.env.REDDIT_PROXY || null,
     headless: options.headless !== false,
+    cdpUrl: options.cdpUrl || null,
   });
 
   try {
@@ -142,11 +144,27 @@ async function scrapePublic(query, options) {
         const title = (a.textContent || '').replace(/\s+/g, ' ').trim();
         if (!title) continue;
 
+        const container = a.closest('article, shreddit-post, [data-testid="post-container"]') || a.parentElement;
+        const postImage = Array.from(container?.querySelectorAll('img') || [])
+          .map((img) => img.currentSrc || img.src || '')
+          .find((src) => /^https?:/i.test(src) && !/avatar|icon/i.test(src)) || '';
+        const postText = container?.textContent || '';
+        const parseMetric = (pattern) => {
+          const metric = postText.match(pattern)?.[1] || '';
+          const suffix = postText.match(pattern)?.[2] || '';
+          const value = Number(metric.replace(/,/g, ''));
+          return Number.isFinite(value) ? value * (suffix.toLowerCase() === 'k' ? 1000 : suffix.toLowerCase() === 'm' ? 1000000 : 1) : 0;
+        };
+        const attributeMetric = (name) => Number(container?.getAttribute(name) || 0) || 0;
+
         out.push({
           title,
           url: href,
           subreddit: match[1],
           id: match[2],
+          image: postImage,
+          likes: attributeMetric('score') || attributeMetric('upvotes') || parseMetric(/([\d,.]+)\s*([km]?)\s*(?:upvotes?|votes?)/i),
+          comments: attributeMetric('comment-count') || parseMetric(/([\d,.]+)\s*([km]?)\s*comments?/i),
         });
 
         if (out.length >= max) break;
@@ -160,11 +178,11 @@ async function scrapePublic(query, options) {
       title: cleanText(d.title, 220),
       url: d.url,
       author: '',
-      likes: 0,
-      comments: 0,
+      likes: d.likes || 0,
+      comments: d.comments || 0,
       shares: 0,
       views: 0,
-      image: '',
+      image: d.image || '',
       created_utc: '',
       subreddit: d.subreddit || '',
       domain: 'reddit.com',
@@ -188,6 +206,13 @@ async function scrape(query, options) {
     return await scrapeApi(query, options);
   } catch (err) {
     if (!/BLOCKED_IP|HTTP 403|403|Please wait for verification/i.test(err.message || '')) throw err;
+    try {
+      // This endpoint is often accessible when the main Reddit host returns a
+      // Cloudflare challenge, and does not require a browser process.
+      return await scrapeApi(query, options, OLD_REDDIT_BASE);
+    } catch (legacyError) {
+      if (!/BLOCKED_IP|HTTP 403|403|Please wait for verification/i.test(legacyError.message || '')) throw legacyError;
+    }
     return scrapePublic(query, {
       ...options,
       proxyUrl: options.proxyUrl || process.env.REDDIT_PROXY || null,
