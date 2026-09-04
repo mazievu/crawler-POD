@@ -67,10 +67,10 @@ class BackendRouter {
       try {
         const probeResult = await adapter.probe(channel, bConf, options);
         if (probeResult && probeResult.status === 'ok') {
-          return { adapter, config: bConf, version: probeResult.version };
+          return { adapter, config: bConf, version: probeResult.version, executionMode: probeResult.executionMode || null, probeStatus: 'ok' };
         } else if (probeResult && probeResult.status === 'warn') {
           if (!warnBackend) {
-            warnBackend = { adapter, config: bConf, version: probeResult.version };
+            warnBackend = { adapter, config: bConf, version: probeResult.version, executionMode: probeResult.executionMode || null, probeStatus: 'warn' };
           }
         }
       } catch (e) {
@@ -102,22 +102,62 @@ class BackendRouter {
 
   async run(channelName, query, options = {}) {
     const channel = this.registry.getChannel(channelName);
-    const { adapter, config, version } = await this.selectBackend(channelName, options);
+    if (!channel) throw new Error(`Unknown channel: ${channelName}`);
 
-    const result = await adapter.run(channel, config, query, options);
+    // If a specific backend was requested, execute it directly
+    if (options.backend) {
+      const { adapter, config, version } = await this.selectBackend(channelName, options);
+      const result = await adapter.run(channel, config, query, options);
+      return {
+        channel: channelName,
+        activeBackend: config.name,
+        backendKind: config.kind,
+        backendStatus: 'ok',
+        backendVersion: version,
+        backendRunId: result.backendRunId,
+        datasetId: result.datasetId,
+        healthSnapshot: result.healthSnapshot,
+        items: result.items,
+        raw: result
+      };
+    }
 
-    return {
-      channel: channelName,
-      activeBackend: config.name,
-      backendKind: config.kind,
-      backendStatus: 'ok',
-      backendVersion: version,
-      backendRunId: result.backendRunId,
-      datasetId: result.datasetId,
-      healthSnapshot: result.healthSnapshot,
-      items: result.items,
-      raw: result
-    };
+    // Otherwise, iterate through candidate backends in priority order with fallback
+    let candidateBackends = channel.backends.filter(b => b.enabled !== false);
+    candidateBackends.sort((a, b) => (a.priority || 100) - (b.priority || 100));
+
+    let lastError = null;
+    for (const bConf of candidateBackends) {
+      const adapter = this.adapters[bConf.kind];
+      if (!adapter) continue;
+
+      try {
+        const probeResult = await adapter.probe(channel, bConf, options);
+        if (probeResult && (probeResult.status === 'ok' || probeResult.status === 'warn')) {
+          const result = await adapter.run(channel, bConf, query, options);
+          return {
+            channel: channelName,
+            activeBackend: bConf.name,
+            backendKind: bConf.kind,
+            backendStatus: 'ok',
+            backendVersion: probeResult.version,
+            backendRunId: result.backendRunId,
+            datasetId: result.datasetId,
+            healthSnapshot: result.healthSnapshot,
+            items: result.items,
+            raw: result
+          };
+        }
+      } catch (err) {
+        lastError = err;
+        console.warn(`[BackendRouter] Backend ${bConf.name} failed for ${channelName}: ${err.message}. Trying next available backend...`);
+      }
+    }
+
+    throw lastError || new NoHealthyBackendError(
+      `No usable backend found for ${channelName}.`,
+      channelName
+    );
   }
 }
 

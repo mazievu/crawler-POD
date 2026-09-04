@@ -27,7 +27,12 @@ module.exports = {
   },
 
   backends: [
-    
+    {
+      name: 'local',
+      kind: BACKEND_KIND.LOCAL,
+      priority: 10,
+      enabled: true
+    },
     {
       name: 'apify',
       kind: BACKEND_KIND.APIFY,

@@ -1,113 +1,140 @@
 /**
- * Proxy Pool Manager
- * Quản lý và rotation proxy IPs
- *
- * Usage:
- *   const pool = new ProxyPool(['http://user:pass@ip1:port', ...]);
- *   const proxy = pool.next();        // Get next proxy
- *   pool.markBad(proxy);              // Mark as failed (skip for a while)
- *   pool.markGood(proxy);             // Mark as successful
+ * Proxy Pool Bridge
+ * Bridges legacy anti-bot ProxyPool with unified ProxyPoolManager in src/proxy
  */
 
+const { ProxyPoolManager, getProxyPool } = require('../src/proxy/proxy-pool');
+const { buildProxyUrl } = require('../src/marketplaces/proxy');
+
 class ProxyPool {
-  /**
-   * @param {string[]} proxies - Array of proxy URLs
-   * @param {object} options
-   */
   constructor(proxies = [], options = {}) {
-    this.proxies = proxies.map(url => ({
-      url,
-      fails: 0,
-      successes: 0,
-      lastUsed: 0,
-      cooldownUntil: 0,
-    }));
+    this.rawList = Array.isArray(proxies) ? proxies : [];
     this.options = {
       maxFailsBeforeCooldown: 3,
-      cooldownMs: 60000,          // 1 min cooldown after max fails
-      maxFailsBeforeRemove: 10,   // Remove from pool if fails too many times
-      ...options,
+      cooldownMs: 60000,
+      maxFailsBeforeRemove: 10,
+      ...options
     };
-    this._index = 0;
+
+    const proxyList = this.rawList.map((p, idx) => {
+      if (typeof p === 'string') {
+        let protocol = 'http';
+        let host = p;
+        let port = 80;
+        let username = '';
+        let password = '';
+        try {
+          if (p.includes('://')) {
+            const parsed = new URL(p);
+            protocol = parsed.protocol.replace(':', '');
+            host = parsed.hostname;
+            port = parseInt(parsed.port, 10) || 80;
+            username = parsed.username || '';
+            password = parsed.password || '';
+          }
+        } catch {
+          // Keep fallback defaults
+        }
+
+        return {
+          id: p,
+          label: p,
+          protocol,
+          host,
+          port,
+          username,
+          password,
+          rawUrl: p,
+          enabled: true
+        };
+      }
+      return p;
+    });
+
+    this.manager = new ProxyPoolManager({
+      enabled: proxyList.length > 0,
+      proxies: proxyList,
+      failureThreshold: this.options.maxFailsBeforeCooldown,
+      cooldownMs: this.options.cooldownMs,
+      maxProxyRotations: options.maxProxyRotations || 3,
+      ...options
+    });
   }
 
-  /**
-   * Add proxy to pool
-   */
-  add(proxyUrl) {
-    this.proxies.push({ url: proxyUrl, fails: 0, successes: 0, lastUsed: 0, cooldownUntil: 0 });
-  }
+  add(proxyInput) {
+    if (typeof proxyInput === 'string') {
+      let protocol = 'http';
+      let host = proxyInput;
+      let port = 80;
+      let username = '';
+      let password = '';
+      try {
+        if (proxyInput.includes('://')) {
+          const parsed = new URL(proxyInput);
+          protocol = parsed.protocol.replace(':', '');
+          host = parsed.hostname;
+          port = parseInt(parsed.port, 10) || 80;
+          username = parsed.username || '';
+          password = parsed.password || '';
+        }
+      } catch {}
 
-  /**
-   * Get next available proxy (round-robin, skip cooled-down)
-   * Returns null if all proxies are dead
-   */
-  next() {
-    const now = Date.now();
-    const available = this.proxies.filter(p =>
-      p.cooldownUntil <= now && p.fails < this.options.maxFailsBeforeRemove
-    );
-
-    if (available.length === 0) {
-      // Reset all cooldowns if everything is dead
-      this.proxies.forEach(p => p.cooldownUntil = 0);
-      console.warn('[ProxyPool] All proxies in cooldown — resetting');
-      return this.proxies.length > 0 ? this.proxies[0].url : null;
+      this.manager.addProxy({
+        id: proxyInput,
+        label: proxyInput,
+        protocol,
+        host,
+        port,
+        username,
+        password,
+        rawUrl: proxyInput,
+        enabled: true
+      });
+    } else {
+      this.manager.addProxy(proxyInput);
     }
-
-    // Round-robin through available
-    this._index = this._index % available.length;
-    const proxy = available[this._index];
-    this._index = (this._index + 1) % available.length;
-    proxy.lastUsed = now;
-    return proxy.url;
   }
 
-  /**
-   * Mark a proxy as failed
-   */
-  markBad(proxyUrl) {
-    const p = this.proxies.find(x => x.url === proxyUrl);
-    if (p) {
-      p.fails++;
-      p.successes = 0;
-      if (p.fails >= this.options.maxFailsBeforeCooldown) {
-        p.cooldownUntil = Date.now() + this.options.cooldownMs;
-        console.warn(`[ProxyPool] ${proxyUrl} cooled down for ${this.options.cooldownMs}ms (fails: ${p.fails})`);
+  next(executionToken = null) {
+    const admission = this.manager.acquire(executionToken);
+    if (!admission.allowed || !admission.proxy) return null;
+    return admission.proxy.rawUrl || admission.proxyUrl || admission.proxy.id;
+  }
+
+  markBad(proxyIdentifier) {
+    for (const p of this.manager.proxies.values()) {
+      if (p.id === proxyIdentifier || p.rawUrl === proxyIdentifier || p.host === proxyIdentifier || buildProxyUrl(p) === proxyIdentifier) {
+        this.manager.markFailure(p.id, 'LEGACY_MARK_BAD');
+        break;
       }
     }
   }
 
-  /**
-   * Mark a proxy as successful
-   */
-  markGood(proxyUrl) {
-    const p = this.proxies.find(x => x.url === proxyUrl);
-    if (p) {
-      p.successes++;
-      p.fails = 0;  // Reset fail count on success
+  markGood(proxyIdentifier) {
+    for (const p of this.manager.proxies.values()) {
+      if (p.id === proxyIdentifier || p.rawUrl === proxyIdentifier || p.host === proxyIdentifier || buildProxyUrl(p) === proxyIdentifier) {
+        this.manager.markSuccess(p.id);
+        break;
+      }
     }
   }
 
-  /**
-   * Get stats about pool health
-   */
   stats() {
-    const total = this.proxies.length;
-    const alive = this.proxies.filter(p =>
-      p.cooldownUntil <= Date.now() && p.fails < this.options.maxFailsBeforeRemove
-    ).length;
-    return { total, alive, dead: total - alive };
+    const status = this.manager.getStatus();
+    return {
+      total: status.total,
+      alive: status.healthyCount,
+      dead: status.cooldownCount + status.disabledCount
+    };
   }
 
-  /**
-   * Check if pool is usable
-   */
   isUsable() {
-    return this.proxies.length > 0 && this.proxies.some(p =>
-      p.fails < this.options.maxFailsBeforeRemove
-    );
+    return this.manager.getAvailable().length > 0;
   }
 }
 
-module.exports = { ProxyPool };
+module.exports = {
+  ProxyPool,
+  ProxyPoolManager,
+  getProxyPool
+};

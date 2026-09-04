@@ -34,7 +34,9 @@ test('CDP reachable probe', async () => {
 });
 
 test('SearXNG 8080 default', async () => {
-  // Test local scraper probe with Etsy which requires SearXNG
+  // Test local scraper probe with Google Shopping, which has no non-SearXNG
+  // discovery path (unlike Etsy since its CloakBrowser-primary round —
+  // requires SearXNG)
   const backend = new LocalScraperBackend();
   delete process.env.SEARXNG_URL; // Force default
   const originalFetch = global.fetch;
@@ -45,7 +47,7 @@ test('SearXNG 8080 default', async () => {
     throw new Error('Network error'); // Simulate unreachable
   };
 
-  const result = await backend.probe({ name: 'etsy' }, {});
+  const result = await backend.probe({ name: 'google_shopping' }, {});
   assert.strictEqual(result.status, 'failed');
   assert.ok(result.checkedUrl.includes('8080'));
   assert.strictEqual(fetchedUrl, 'http://localhost:8080');
@@ -60,7 +62,7 @@ test('SearXNG required channel unreachable', async () => {
   const originalFetch = global.fetch;
   global.fetch = async () => { throw new Error('Network error'); };
 
-  const result = await backend.probe({ name: 'etsy' }, {});
+  const result = await backend.probe({ name: 'google_shopping' }, {});
   assert.strictEqual(result.status, 'failed');
   assert.ok(result.missing.includes('SEARXNG'));
   assert.ok(result.checkedUrl.includes('33333'));

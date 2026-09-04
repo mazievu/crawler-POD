@@ -66,14 +66,23 @@ class AmazonJourneyHandler {
     await this.page.evaluate(() => window.scrollBy(0, 800));
     await this.page.waitForTimeout(1000);
 
+    // BUG-11: dedupe by ASIN (Amazon's real product identity), not by raw
+    // href — the same product commonly appears multiple times on a results
+    // page with different SEO slug text or tracking suffixes ahead of the
+    // same /dp/<ASIN>, which a plain URL-string Set treats as distinct items.
     const urls = await this.page.$$eval('a.a-link-normal[href*="/dp/"]', (links) => {
-      const set = new Set();
+      const asinPattern = /\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i;
+      const seen = new Set();
+      const result = [];
       for (const a of links) {
-        if (a.href && !a.href.includes('#customerReviews')) {
-          set.add(a.href.split('?')[0]);
-        }
+        if (!a.href || a.href.includes('#customerReviews')) continue;
+        const match = asinPattern.exec(a.href);
+        const dedupeKey = match ? match[1].toUpperCase() : a.href.split('?')[0];
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
+        result.push(a.href.split('?')[0]);
       }
-      return Array.from(set);
+      return result;
     });
 
     console.log(`[AmazonJourney] Found ${urls.length} Amazon ASIN URLs.`);

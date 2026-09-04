@@ -10,7 +10,8 @@ async function search(query, options = {}) {
     engines = 'google,bing,duckduckgo',
     categories = 'general',
     pageno = 1,
-    time_range = ''
+    time_range = '',
+    signal = null
   } = options;
 
   const params = new URLSearchParams({
@@ -23,7 +24,7 @@ async function search(query, options = {}) {
 
   if (time_range) params.set('time_range', time_range);
 
-  const response = await fetch(`${SEARXNG_URL}/search?${params}`);
+  const response = await fetch(`${SEARXNG_URL}/search?${params}`, { signal });
   if (!response.ok) throw new Error(`SearXNG error: ${response.status}`);
 
   const data = await response.json();

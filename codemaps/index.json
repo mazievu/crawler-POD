@@ -13,7 +13,13 @@
     "codemaps/phases/phase-09-ui-additions.md",
     "codemaps/phases/phase-10-agent-skill.md",
     "codemaps/phases/phase-11-tests.md",
-    "codemaps/phases/phase-12-release-e2e-regression.md"
+    "codemaps/phases/phase-12-release-e2e-regression.md",
+    "codemaps/phases/phase-13-resource-scheduler.md",
+    "codemaps/phases/phase-14-database-scale-v2.md",
+    "codemaps/phases/phase-15-social-listening-bots.md",
+    "codemaps/phases/phase-16-reliability-and-recovery.md",
+    "codemaps/phases/phase-17-fix-round-2.md",
+    "codemaps/phases/phase-18-simplification-round.md"
   ],
   "moduleMaps": [
     "codemaps/modules/channels.md",
@@ -26,7 +32,12 @@
     "codemaps/modules/run-service.md",
     "codemaps/modules/ui.md",
     "codemaps/modules/agent-skill.md",
-    "codemaps/modules/e2e.md"
+    "codemaps/modules/e2e.md",
+    "codemaps/modules/scheduler.md",
+    "codemaps/modules/database-v2.md",
+    "codemaps/modules/ranking.md",
+    "codemaps/modules/social-bots.md",
+    "codemaps/modules/reliability.md"
   ],
   "apiMaps": [
     "codemaps/api/api-changes.md"
@@ -68,7 +79,31 @@
     "src/normalize/trend-signal.js",
     "src/runs.service.js",
     "skills/crawler-pod/SKILL.md",
-    "scripts/e2e-test.js"
+    "scripts/e2e-test.js",
+    "src/scheduler/resource-monitor.js",
+    "src/scheduler/resource-profile.js",
+    "src/scheduler/run-queue.js",
+    "src/scheduler/worker-pool.js",
+    "src/scheduler/scheduler.js",
+    "src/database/schema-v2.js",
+    "src/database/product-current.js",
+    "src/database/daily-history.js",
+    "src/database/weekly-summary.js",
+    "src/ranking/product-ranker.js",
+    "src/social-bots/bot-config.js",
+    "src/social-bots/social-scheduler.js",
+    "src/social-bots/index.js",
+    "src/reliability/retry-policy.js",
+    "src/reliability/heartbeat.js",
+    "src/reliability/stuck-detector.js",
+    "src/reliability/restart-recovery.js",
+    "src/scheduler/execution-planner.js",
+    "src/reliability/execution-lease.js",
+    "scripts/stress-test-scheduler.js",
+    "scripts/social-bot-integration-test.js",
+    "src/scheduler/job-sharder.js",
+    "src/backends/local-capabilities.js",
+    "src/reliability/managed-execution.js"
   ],
   "acceptanceCommands": [
     "npm run validate:codemap",

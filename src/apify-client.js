@@ -6,9 +6,23 @@
 const { ApifyClient } = require('apify-client');
 const { getPlatform } = require('./platform-config');
 
+const { getApifyTokenPool } = require('./apify-token-pool');
+
 const TOKEN = process.env.APIFY_TOKEN;
 
 // ==================== Client ====================
+
+function getClient(overrideClient = null) {
+  if (overrideClient) return overrideClient;
+  try {
+    const pool = getApifyTokenPool();
+    const admission = pool.acquire();
+    if (admission.allowed && admission.client) {
+      return admission.client;
+    }
+  } catch {}
+  return TOKEN ? new ApifyClient({ token: TOKEN }) : null;
+}
 
 const client = TOKEN ? new ApifyClient({ token: TOKEN }) : null;
 
@@ -32,12 +46,18 @@ const INPUT_BUILDERS = {
     search_type: 'groups',
   }),
 
-  // Facebook Ads — curious_coder (needs `urls`)
-  facebook_ads: ({ query, maxItems, country }) => ({
-    urls: [`https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country || 'ALL'}&q=${encodeURIComponent(query)}`],
-    maxResults: maxItems,
-    maxItems: maxItems,
-  }),
+  // Facebook Ads — apify/facebook-ads-scraper (requires search_type=keyword_unordered & startUrls: [{ url }])
+  facebook_ads: ({ query, maxItems, country }) => {
+    const targetUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=${country || 'ALL'}&media_type=all&q=${encodeURIComponent(query)}&search_type=keyword_unordered`;
+    return {
+      startUrls: [{ url: targetUrl }],
+      urls: [targetUrl],
+      resultsLimit: maxItems,
+      maxResults: maxItems,
+      maxItems,
+      maxChargedResults: maxItems
+    };
+  },
 
   // TikTok Ads — silva95gustavo (needs valid startUrls)
   tiktok_ads: ({ query, maxItems }) => ({
@@ -47,8 +67,8 @@ const INPUT_BUILDERS = {
 
   // TikTok Shop — clockworks/tiktok-scraper
   tiktok_shop: ({ query, maxItems }) => ({
-    searchTerms: [query],
-    maxItems,
+    searchQueries: [query],
+    resultsPerPage: maxItems,
   }),
 
   // Pinterest — automation-lab/pinterest-scraper
@@ -118,14 +138,18 @@ const INPUT_BUILDERS = {
     itemCondition: 'any',
   }),
 
-  // Instagram Search — apify/instagram-search-scraper (keyword search)
-  instagram: ({ query, maxItems }) => ({
-    // The actor expects a singular `search` string and `hashtag` (not
-    // `hashtags`) as the search type.
-    search: query,
-    searchType: 'hashtag',
-    searchLimit: maxItems,
-  }),
+  // Instagram — apify/instagram-scraper
+  instagram: ({ query, maxItems }) => {
+    const cleanTag = String(query || '').replace(/^#+/, '').trim();
+    return {
+      search: cleanTag,
+      searchType: 'hashtag',
+      searchLimit: maxItems,
+      directUrls: [`https://www.instagram.com/explore/tags/${encodeURIComponent(cleanTag)}/`],
+      resultsLimit: maxItems,
+      resultsType: 'posts',
+    };
+  },
 };
 
 // ==================== API Functions ====================
@@ -137,8 +161,9 @@ const INPUT_BUILDERS = {
  * @param {{ query: string, maxItems: number, country?: string }} input
  * @returns {{ runId: string, datasetId: string }}
  */
-async function startActor(actorId, platform, input, apiClient = client) {
-  if (!apiClient) {
+async function startActor(actorId, platform, input, apiClient = null) {
+  const effectiveClient = getClient(apiClient);
+  if (!effectiveClient) {
     throw new Error('Apify client not initialized. Set APIFY_TOKEN in .env');
   }
 
@@ -154,7 +179,7 @@ async function startActor(actorId, platform, input, apiClient = client) {
   const actorInput = buildInput(input);
   console.log(`[Apify] Starting ${actorId}...`);
 
-  const run = await apiClient.actor(actorId).call(actorInput, {
+  const run = await effectiveClient.actor(actorId).call(actorInput, {
     waitSecs: 0, // Don't wait, we'll poll
   });
 
@@ -171,12 +196,13 @@ async function startActor(actorId, platform, input, apiClient = client) {
  * @param {string} runId
  * @returns {string} - 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'ABORTED'
  */
-async function getRunStatus(runId, apiClient = client) {
-  if (!apiClient) {
+async function getRunStatus(runId, apiClient = null) {
+  const effectiveClient = getClient(apiClient);
+  if (!effectiveClient) {
     throw new Error('Apify client not initialized');
   }
 
-  const run = await apiClient.run(runId).get();
+  const run = await effectiveClient.run(runId).get();
   return run.status;
 }
 
@@ -213,12 +239,13 @@ async function paginateDatasetItems(dataset, limit = 100, { pageSize = 1000 } = 
  * @param {number} limit
  * @returns {Promise<object[]>}
  */
-async function fetchDatasetItems(datasetId, limit = 100, apiClient = client) {
-  if (!apiClient) {
+async function fetchDatasetItems(datasetId, limit = 100, apiClient = null) {
+  const effectiveClient = getClient(apiClient);
+  if (!effectiveClient) {
     throw new Error('Apify client not initialized');
   }
 
-  return paginateDatasetItems(apiClient.dataset(datasetId), limit);
+  return paginateDatasetItems(effectiveClient.dataset(datasetId), limit);
 }
 
 // ==================== Exports ====================

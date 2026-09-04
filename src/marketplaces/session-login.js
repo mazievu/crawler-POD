@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { assertSupportedMarketplace } = require('./validation');
 const { createEverbeeContextSession } = require('./everbee-executor');
 
@@ -12,10 +13,15 @@ async function openInteractiveLogin({
   browserFactory = defaultBrowserFactory,
 }) {
   assertSupportedMarketplace(platform);
+  // UI-BUG-06: without a unique per-attempt profile, this defaulted to the
+  // shared 'public' Chromium profile dir (see everbee-executor.js) — a
+  // second concurrent/overlapping login attempt for the same platform then
+  // collided on Chromium's own ProcessSingleton lock and failed to launch.
+  const sessionKey = `login-${platform}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   let session;
   let browser;
   try {
-    const resource = await browserFactory({ platform, headless: false });
+    const resource = await browserFactory({ platform, headless: false, sessionKey });
     session = resource?.context || resource?.browser
       ? resource
       : { browser: resource, context: null, ownsBrowser: true, ownsContext: true };

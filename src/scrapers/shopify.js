@@ -11,9 +11,10 @@ function normalizeHost(input) {
   return u.hostname.replace(/^www\./, '');
 }
 
-async function fetchProductsJson(host, limit) {
+async function fetchProductsJson(host, limit, signal = null) {
   const url = 'https://' + host + '/products.json?limit=' + limit;
   const resp = await fetch(url, {
+    signal,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
       'Accept': 'application/json,text/html;q=0.9,*/*;q=0.8',
@@ -30,7 +31,7 @@ async function scrape(query, options) {
   options = options || {};
   const limit = options.limit || 50;
   const host = normalizeHost(query);
-  const data = await fetchProductsJson(host, limit);
+  const data = await fetchProductsJson(host, limit, options.signal);
   const products = data.products || [];
   if (!products.length) throw new Error('EMPTY_RESULT: no Shopify products found for ' + host);
 

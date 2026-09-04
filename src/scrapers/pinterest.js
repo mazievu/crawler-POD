@@ -38,6 +38,7 @@ async function scrapeApi(query, options = {}) {
   const url = `${BASE}/search/pins?${params}`;
 
   const resp = await fetch(url, {
+    signal: options.signal,
     headers: {
       'Authorization': `Bearer ${token}`,
       'Accept': 'application/json',
@@ -72,8 +73,58 @@ async function scrapeApi(query, options = {}) {
 }
 
 /**
+ * Fast pin details enricher. Fetches raw pin HTML and parses GraphQL payload.
+ */
+async function enrichPinMetrics(pinId, signal) {
+  if (!pinId) return null;
+  try {
+    const url = 'https://www.pinterest.com/pin/' + pinId + '/';
+    const resp = await fetch(url, {
+      signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    const regex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let match;
+    let best = null;
+    while ((match = regex.exec(html)) !== null) {
+      const content = match[1];
+      if (content.includes('v3GetPinQuery') || content.includes('PinResponse') || content.includes('repinCount')) {
+        const jsonStart = content.indexOf('{"data":');
+        if (jsonStart !== -1) {
+          try {
+            const cleanJson = content.slice(jsonStart, content.lastIndexOf('}') + 1);
+            const parsed = JSON.parse(cleanJson);
+            const d = parsed.data?.v3GetPinQueryv2?.data || parsed.data?.v3GetPinQuery?.data;
+            if (d) {
+              const shares = Number(d.repinCount || d.aggregatedPinData?.aggregatedStats?.saves || 0);
+              const comments = Number(d.aggregatedPinData?.commentCount || d.commentCount || 0);
+              const likes = Number(d.totalReactionCount || d.reactionCounts || (d.reaction_counts ? Object.values(d.reaction_counts).reduce((a, b) => a + b, 0) : 0) || 0);
+              const views = Number(d.viewCount || d.views || d.impressions || 0);
+              const author = d.nativeCreator?.fullName || d.closeupUnifiedAttribution?.fullName || d.pinner?.username || d.closeupAttribution?.fullName || '';
+              const title = d.title || d.seoTitle || d.unauthOnPageTitle || '';
+              const image = d.images_orig?.url || d.imageLargeUrl || d.images_736x?.url || '';
+              const description = d.description || d.seoDescription || '';
+              best = { shares, comments, likes, views, author, title, image, description };
+            }
+          } catch {}
+        }
+      }
+    }
+    return best;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
  * Scrape public Pinterest search results without API credentials.
- * This is intentionally small: it reads rendered pin links, images, and alt text.
+ * This reads rendered pin links, images, and enriches them with real engagement metrics.
  */
 async function scrapePublic(query, options = {}) {
   const limit = options.limit || 50;
@@ -82,6 +133,17 @@ async function scrapePublic(query, options = {}) {
     cdpUrl: options.cdpUrl || null,
     headless: options.headless !== false,
   });
+
+  const onAbort = () => {
+    browser.close().catch(() => {});
+  };
+  if (options.signal) {
+    if (options.signal.aborted) {
+      await browser.close();
+      throw new Error('ABORTED: execution cancelled');
+    }
+    options.signal.addEventListener('abort', onAbort, { once: true });
+  }
 
   try {
     const page = browser.page;
@@ -105,14 +167,15 @@ async function scrapePublic(query, options = {}) {
         if (!match || seen.has(match[1])) continue;
         seen.add(match[1]);
 
-        const card = a.closest('[data-test-id="pin"], div[role="listitem"]') || a.parentElement || a;
-        const img = card.querySelector('img') || a.querySelector('img');
-        const text = img?.alt || a.getAttribute('aria-label') || '';
-        const image = img?.src || '';
+        const img = a.querySelector('img');
+        const image = img ? img.src : '';
+        const text = a.textContent || '';
+        const title = titleFromText(text) || cleanText(img?.alt || '', 120);
 
         pins.push({
           id: match[1],
-          url: href,
+          url: 'https://www.pinterest.com/pin/' + match[1] + '/',
+          title,
           image,
           text,
         });
@@ -126,7 +189,7 @@ async function scrapePublic(query, options = {}) {
     const mapped = items
       .map(d => ({
         platform: 'pinterest',
-        title: titleFromText(d.text) || 'Pinterest pin ' + d.id,
+        title: d.title || 'Pinterest Pin ' + d.id,
         url: d.url,
         image: d.image,
         description: cleanText(d.text, 500),
@@ -142,9 +205,33 @@ async function scrapePublic(query, options = {}) {
       .filter(i => i.url && i.image);
 
     if (!mapped.length) throw new Error('EMPTY_RESULT: no Pinterest pins parsed');
-    return { items: mapped };
+
+    // Enrich pins with real metrics (likes, comments, repins/shares, views, real author)
+    const enrichedResults = await Promise.allSettled(
+      mapped.map(async (item) => {
+        const meta = await enrichPinMetrics(item.pinId, options.signal);
+        if (meta) {
+          return {
+            ...item,
+            title: meta.title || item.title,
+            author: meta.author || item.author,
+            image: meta.image || item.image,
+            description: meta.description || item.description,
+            likes: meta.likes !== undefined ? meta.likes : item.likes,
+            comments: meta.comments !== undefined ? meta.comments : item.comments,
+            shares: meta.shares !== undefined ? meta.shares : item.shares,
+            views: meta.views !== undefined ? meta.views : item.views,
+          };
+        }
+        return item;
+      })
+    );
+
+    const finalItems = enrichedResults.map(r => r.status === 'fulfilled' ? r.value : null).filter(Boolean);
+    return { items: finalItems.length ? finalItems : mapped };
   } finally {
-    await browser.close();
+    if (options.signal) options.signal.removeEventListener('abort', onAbort);
+    await browser.close().catch(() => {});
   }
 }
 
@@ -154,4 +241,4 @@ async function scrape(query, options = {}) {
   return scrapePublic(query, options);
 }
 
-module.exports = { scrape };
+module.exports = { scrape, enrichPinMetrics };

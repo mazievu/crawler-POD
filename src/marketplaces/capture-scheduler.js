@@ -14,8 +14,8 @@ function vietnamDateTimeToUtc(value) {
 }
 
 function normalizeScheduleInput(input = {}) {
-  const platform = String(input.platform || '').toLowerCase();
-  if (platform !== 'etsy') throw new Error('Scheduled keyword capture currently supports Etsy only');
+  const platform = String(input.platform == null ? 'etsy' : input.platform).trim().toLowerCase();
+  if (!platform) throw new Error('Platform is required');
   const keyword = String(input.keyword || '').trim();
   if (!keyword || keyword.length > 200) throw new Error('Keyword must be between 1 and 200 characters');
   const everyHours = Math.min(Math.max(Number(input.everyHours) || 24, 1), 168);
@@ -27,10 +27,11 @@ function normalizeScheduleInput(input = {}) {
   const runAt = scheduleType === 'once' ? String(input.runAt || '') : null;
   if (runAt) vietnamDateTimeToUtc(runAt);
   if (scheduleType === 'once' && !runAt) throw new Error('Choose a valid date and time');
+  const maxListings = Math.min(Math.max(Number(input.maxListings || input.maxItems) || 30, 1), 100);
   return {
     platform, keyword, accountId, everyMinutes: everyHours * 60,
     variantMode, maxVariants: variantMode === 'all' ? normalizeMaxVariants(input.maxVariants) : 0,
-    maxListings: Math.min(Math.max(Number(input.maxListings) || 30, 1), 30),
+    maxListings,
     scheduleType, dailyTime, runAt,
   };
 }
@@ -45,9 +46,34 @@ function nextScheduleRunAt(schedule, now = new Date()) {
   return next;
 }
 
-function createMarketplaceCaptureScheduler({ discover, capture, markComplete = async () => {} }) {
+/**
+ * §2 (Final Blocker Fix Round): every renewal must be ASSERTED, not just
+ * awaited. renewClaim() returning false means a stale attempt is still
+ * running this function after its claim was already lost/reclaimed —
+ * previously the loop below kept capturing regardless. Throwing here stops
+ * the work immediately, exactly at the point ownership was confirmed lost.
+ */
+async function assertClaimOwnership(scheduleId, claimToken, renewClaim) {
+  const ok = await renewClaim(scheduleId, claimToken);
+  if (!ok) {
+    const err = new Error('MARKETPLACE_CLAIM_LOST');
+    err.code = 'MARKETPLACE_CLAIM_LOST';
+    throw err;
+  }
+}
+
+// A caller that supplies no renewClaim isn't using the claim system at all —
+// that must never be indistinguishable from "claim lost" (assertClaimOwnership
+// treats any falsy result as loss; `async () => {}` would resolve `undefined`).
+function createMarketplaceCaptureScheduler({ discover, capture, markComplete = async () => {}, renewClaim = async () => true }) {
   if (typeof discover !== 'function' || typeof capture !== 'function') throw new Error('Scheduler requires discovery and capture functions');
-  async function run(schedule) {
+  // §4: claimToken must be threaded through the ENTIRE scheduled execution —
+  // renewClaim(scheduleId, claimToken) is called with the SAME token this
+  // specific run() call was handed, never a dropped/omitted one. If a stale
+  // Attempt A (holding an old/superseded token) is still running this
+  // function, its renewClaim calls below will correctly no-op (the DB's
+  // claim_token no longer matches A's), never stealing B's claim.
+  async function run(schedule, claimToken = null) {
     let result;
     try {
       result = await discover(schedule.keyword, {
@@ -56,22 +82,71 @@ function createMarketplaceCaptureScheduler({ discover, capture, markComplete = a
       });
     } catch (error) {
       const summary = { discovered: 0, captured: 0, blocked: 0, failed: 1, error: `Discovery failed: ${error.message}` };
-      await markComplete(schedule.id, summary);
+      // §3: claim_token-protected — a stale attempt cannot mark this
+      // complete or clear a newer claim even on this early-exit path.
+      await markComplete(schedule.id, summary, claimToken);
       return summary;
     }
+
+    // §2: discovery alone can take a while (now routed through the Resource
+    // Scheduler, §13 of the prior round); confirm the claim is still ours
+    // before starting the capture loop — if it isn't, STOP immediately, do
+    // not spend a single browser capture under a lease that's already gone.
+    try {
+      await assertClaimOwnership(schedule.id, claimToken, renewClaim);
+    } catch (claimErr) {
+      console.warn(`[MarketplaceCaptureScheduler] Schedule #${schedule.id}: ${claimErr.message} after discovery — stopping before any capture.`);
+      return { discovered: (result.items || []).length, captured: 0, blocked: 0, failed: 0, error: claimErr.message, claimLost: true };
+    }
+
     const items = (result.items || []).filter((item) => item?.url).slice(0, Math.min(Number(schedule.max_listings) || 30, 30));
     const summary = { discovered: items.length, captured: 0, blocked: 0, failed: 0 };
-    for (const item of items) {
-      try {
-        const captured = await capture({ platform: 'etsy', url: item.url, accountId: schedule.account_id, variantMode: schedule.variant_mode, maxVariants: schedule.max_variants });
-        if (captured.captureStatus?.status === 'blocked') summary.blocked++;
-        else summary.captured++;
-      } catch { summary.failed++; }
+
+    // Parallel capture: each capture() submits through the scheduler (BROWSER
+    // pool), so actual browser concurrency is still governed by pool capacity.
+    // InternalTaskPool controls how many we SUBMIT concurrently.
+    const { InternalTaskPool } = require('../scheduler/internal-task-pool');
+    const concurrency = Math.min(4, items.length); // bounded: capture submits are lightweight
+    const taskPool = new InternalTaskPool({ concurrency });
+
+    await taskPool.run(items, async (item) => {
+      // §2: assert BEFORE starting each item
+      await assertClaimOwnership(schedule.id, claimToken, renewClaim);
+      const captured = await capture({ platform: 'etsy', url: item.url, accountId: schedule.account_id, variantMode: schedule.variant_mode, maxVariants: schedule.max_variants });
+      if (captured.captureStatus?.status === 'blocked') summary.blocked++;
+      else summary.captured++;
+    });
+
+    // Count failures from settled results
+    // (taskPool.run uses allSettled — failed tasks don't throw)
+    summary.failed = items.length - summary.captured - summary.blocked;
+
+    // Final assertion before completion, so a slow markComplete()/summary
+    // write below still runs under a claim we've just confirmed is ours.
+    try {
+      await assertClaimOwnership(schedule.id, claimToken, renewClaim);
+    } catch (claimErr) {
+      console.warn(`[MarketplaceCaptureScheduler] Schedule #${schedule.id}: ${claimErr.message} before completion — not marking complete.`);
+      summary.error = claimErr.message;
+      summary.claimLost = true;
+      return summary;
     }
-    await markComplete(schedule.id, summary);
+    // §3: claim_token-protected at the DB layer too — belt and suspenders.
+    // Gap #5 closure (Final Gap Closure Round): the DB write itself was
+    // already safe (a stale claim_token makes it a no-op), but this return
+    // value was never inspected — a caller whose ownership was stolen in the
+    // narrow window between the assertClaimOwnership() check above and this
+    // exact write would silently receive a summary indistinguishable from a
+    // real, current-owner success. No fake success, no schedule mutation.
+    const completed = await markComplete(schedule.id, summary, claimToken);
+    if (completed === false) {
+      console.warn(`[MarketplaceCaptureScheduler] Schedule #${schedule.id}: MARKETPLACE_CLAIM_LOST at final completion — ownership was lost between the last renewal and this write; not reporting success.`);
+      summary.error = 'MARKETPLACE_CLAIM_LOST';
+      summary.claimLost = true;
+    }
     return summary;
   }
   return { run };
 }
 
-module.exports = { createMarketplaceCaptureScheduler, normalizeScheduleInput, nextScheduleRunAt, vietnamDateTimeToUtc };
+module.exports = { createMarketplaceCaptureScheduler, normalizeScheduleInput, nextScheduleRunAt, vietnamDateTimeToUtc, assertClaimOwnership };

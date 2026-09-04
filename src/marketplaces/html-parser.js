@@ -10,19 +10,109 @@ function parseMarketplaceHtml({ platform, url, html }) {
   const rating = product.aggregateRating || {};
   const image = Array.isArray(product.image) ? product.image[0] : product.image;
 
+  // UI-BUG-07: Amazon product pages do not reliably emit schema.org Product
+  // JSON-LD or product:price/rating meta tags, so every generic fallback
+  // above resolves to nothing — and the last-resort `findFirstTag(html,'h1')`
+  // title fallback then grabs Amazon's accessibility-only skip-navigation
+  // <h1> (e.g. "Amazon.com"), never the real product title (which lives in
+  // <span id="productTitle">, not an <h1> at all). Give Amazon its own
+  // targeted fallback tier, consulted only to fill gaps the generic
+  // extraction above left empty — not a replacement for it.
+  const amazonFallback = platform === 'amazon' ? extractAmazonFallback(html) : {};
+
   return {
     platform,
-    title: cleanText(product.name || findMeta(html, 'og:title') || findFirstTag(html, 'h1')),
+    title: cleanText(product.name || findMeta(html, 'og:title') || amazonFallback.title || findFirstTag(html, 'h1')),
     url,
     listingId: product.sku || product.mpn || listingIdFromUrl(platform, url),
-    image: imageUrl(image) || findMeta(html, 'og:image'),
-    price: pricing.price,
-    currency: pricing.currency,
-    rating: decimal(rating.ratingValue || findItemprop(html, 'ratingValue')),
-    reviewCount: number(rating.reviewCount || rating.ratingCount || findItemprop(html, 'reviewCount')),
+    image: imageUrl(image) || findMeta(html, 'og:image') || amazonFallback.image || '',
+    price: pricing.price || amazonFallback.price || 0,
+    currency: pricing.currency || amazonFallback.currency || '',
+    rating: decimal(rating.ratingValue || findItemprop(html, 'ratingValue')) || amazonFallback.rating || 0,
+    reviewCount: number(rating.reviewCount || rating.ratingCount || findItemprop(html, 'reviewCount')) || amazonFallback.reviewCount || 0,
     availability: normalizeAvailability(offer.availability || findMeta(html, 'product:availability')),
     brand: cleanText(typeof product.brand === 'object' ? product.brand?.name : product.brand),
   };
+}
+
+// UI-BUG-07 closure: Amazon-specific extraction tier, using the real DOM
+// anchors Amazon product pages actually use (#productTitle, .a-offscreen
+// price, the "X out of 5 stars" rating text, #acrCustomerReviewText,
+// #landingImage) instead of the generic schema.org/meta-tag assumptions the
+// rest of this file relies on for other marketplaces.
+function extractAmazonFallback(html) {
+  const titleMatch = /<span[^>]+id\s*=\s*["']productTitle["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
+  const priceMatch = /<span[^>]+class\s*=\s*["'][^"']*\ba-offscreen\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
+  const ratingMatch = /([\d.]+)\s+out of\s+5\s+stars/i.exec(html);
+  const reviewMatch = /id\s*=\s*["'](?:acrCustomerReviewText|acrCustomerReviewCount)["'][^>]*>([\s\S]*?)<\/span>/i.exec(html);
+
+  const priceText = priceMatch ? cleanText(priceMatch[1]) : '';
+  const currencyMatch = priceText.match(/^[^\d]+/);
+
+  return {
+    title: titleMatch ? cleanText(titleMatch[1]) : '',
+    price: priceText ? decimal(priceText) : 0,
+    currency: currencyMatch ? cleanText(currencyMatch[0]) : '',
+    rating: ratingMatch ? decimal(ratingMatch[1]) : 0,
+    reviewCount: reviewMatch ? number(reviewMatch[1]) : 0,
+    image: extractAmazonLandingImage(html),
+  };
+}
+
+// BUG-AMZ-01: find the #landingImage element itself first (attribute-order
+// independent), then read its image source with a fixed priority —
+// data-old-hires (highest resolution, when present) > data-a-dynamic-image
+// (a JSON map of {url: [width,height]}, pick the largest) > src (last
+// resort, often a low-res placeholder). Real Amazon product pages commonly
+// carry ONLY data-a-dynamic-image, which the previous version of this
+// function never checked at all.
+function extractAmazonLandingImage(html) {
+  const tagMatch = /<img\b[^>]*\bid\s*=\s*["']landingImage["'][^>]*>/i.exec(html);
+  if (!tagMatch) return '';
+  const tag = tagMatch[0];
+
+  const attr = (name) => {
+    const m = new RegExp(`\\b${name}\\s*=\\s*["']([^"']*)["']`, 'i').exec(tag);
+    return m ? decodeEntities(m[1]) : '';
+  };
+
+  const oldHires = attr('data-old-hires');
+  if (oldHires) return oldHires;
+
+  const dynamicImageRaw = attr('data-a-dynamic-image');
+  if (dynamicImageRaw) {
+    const largest = largestImageFromDynamicImageJson(dynamicImageRaw);
+    if (largest) return largest;
+  }
+
+  return attr('src');
+}
+
+// data-a-dynamic-image is a JSON object: {"<url>": [width, height], ...}.
+// Malformed/unparseable JSON must fall through (return '') rather than
+// throw — a single bad product page must never crash the whole parser.
+function largestImageFromDynamicImageJson(jsonText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return '';
+  }
+  if (!parsed || typeof parsed !== 'object') return '';
+
+  let bestUrl = '';
+  let bestArea = -1;
+  for (const [url, dims] of Object.entries(parsed)) {
+    if (typeof url !== 'string' || !url) continue;
+    const width = Array.isArray(dims) ? Number(dims[0]) : 0;
+    const height = Array.isArray(dims) ? Number(dims[1]) : 0;
+    const area = (Number.isFinite(width) ? width : 0) * (Number.isFinite(height) ? height : 0);
+    if (area > bestArea) {
+      bestArea = area;
+      bestUrl = url;
+    }
+  }
+  return bestUrl;
 }
 
 function findPricePair(product, html) {

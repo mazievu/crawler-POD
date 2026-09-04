@@ -12,14 +12,41 @@ const path = require('path');
 const fs = require('fs');
 const { PLATFORMS } = require('./platform-config');
 const { cleanImageUrl, extractImage, sanitizeForStorage } = require('./image-utils');
+const { initSchemaV2, migrateDeltaColumnsNullable, migrateWeeklySummaryColumns, migrateRatingDeltaColumns } = require('./database/schema-v2');
+const { createProductCurrentOps } = require('./database/product-current');
+const { createDailyHistoryOps, normalizeLegacyUtcTimestamp } = require('./database/daily-history');
+const { createWeeklySummaryOps, recomputeWeeklySummaryFromHistory } = require('./database/weekly-summary');
 
 const DB_PATH = path.join(__dirname, '..', 'data', 'collector.db');
 const dataDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
+// §14/§16 DB Cutover flags — controlled via .env, default keeps legacy behavior.
+const LEGACY_SNAPSHOT_WRITE = (process.env.LEGACY_SNAPSHOT_WRITE || 'true').toLowerCase() !== 'false';
+const READ_MODEL_V2 = (process.env.READ_MODEL_V2 || 'false').toLowerCase() === 'true';
+
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// Real concurrent-writer contention (multiple Scheduler executions writing
+// at once, or multiple processes opening this same file) previously failed
+// immediately with SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT instead of waiting
+// briefly for the other writer's transaction to finish. Found via a real
+// SQLITE_BUSY_SNAPSHOT failure during a concurrent test run this round.
+db.pragma('busy_timeout = 5000');
+
+initSchemaV2(db);
+migrateDeltaColumnsNullable(db);
+migrateRatingDeltaColumns(db);
+const weeklyMigration = migrateWeeklySummaryColumns(db);
+if (weeklyMigration.migrated) {
+  // Old rows used the wrong (avg+new)/2 running-average formula; rebuild every
+  // week from Tier 2 (daily_packed_history), which is untouched and authoritative.
+  recomputeWeeklySummaryFromHistory(db);
+}
+const dailyHistoryOps = createDailyHistoryOps(db);
+const productCurrentOps = createProductCurrentOps(db, dailyHistoryOps);
+const weeklySummaryOps = createWeeklySummaryOps(db);
 
 // ==================== Schema ====================
 
@@ -153,6 +180,20 @@ db.exec(`
     FOREIGN KEY (schedule_id) REFERENCES marketplace_capture_schedules(id) ON DELETE CASCADE
   );
   CREATE INDEX IF NOT EXISTS idx_marketplace_capture_schedule_runs_schedule ON marketplace_capture_schedule_runs(schedule_id, id DESC);
+
+  CREATE TABLE IF NOT EXISTS social_bot_state (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_key           TEXT NOT NULL,
+    scheduled_window  INTEGER NOT NULL,
+    query_key         TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    run_id            INTEGER,
+    error_message     TEXT,
+    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(bot_key, scheduled_window, query_key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_social_bot_state_bot ON social_bot_state(bot_key, scheduled_window DESC);
 `);
 
 const marketplaceCaptureColumns = db.prepare('PRAGMA table_info(marketplace_captures)').all();
@@ -167,6 +208,8 @@ const marketplaceScheduleColumns = db.prepare('PRAGMA table_info(marketplace_cap
 if (!marketplaceScheduleColumns.some((column) => column.name === 'schedule_type')) db.exec("ALTER TABLE marketplace_capture_schedules ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'interval'");
 if (!marketplaceScheduleColumns.some((column) => column.name === 'daily_time')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN daily_time TEXT');
 if (!marketplaceScheduleColumns.some((column) => column.name === 'run_at')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN run_at TEXT');
+if (!marketplaceScheduleColumns.some((column) => column.name === 'claimed_until')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN claimed_until TEXT');
+if (!marketplaceScheduleColumns.some((column) => column.name === 'claim_token')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN claim_token TEXT');
 try {
   const { normalizeMarketplaceCaptureUrl } = require('./marketplaces/validation');
   const normalizeCaptureUrl = db.prepare('UPDATE marketplace_captures SET url = ? WHERE id = ?');
@@ -206,6 +249,24 @@ for (const [name, definition] of Object.entries({
 
 const runColumns = new Set(db.prepare('PRAGMA table_info(runs)').all().map((column) => column.name));
 if (!runColumns.has('input_options')) db.exec("ALTER TABLE runs ADD COLUMN input_options TEXT DEFAULT '{}'");
+if (!runColumns.has('parent_run_id')) db.exec('ALTER TABLE runs ADD COLUMN parent_run_id INTEGER');
+// §6.1 (Final Blocker Fix Round): a Run's own packed result array, for
+// run-detail/export/debug reads that must work regardless of
+// LEGACY_SNAPSHOT_WRITE. A normal Run is <=20-30 items, so this is a small
+// JSON column on the existing runs row — not a new one-row-per-item table
+// (explicitly avoided per this round's "no row explosion" instruction).
+// History (trends over time) is never sourced from this column — that
+// remains daily_packed_history exclusively.
+if (!runColumns.has('result_items_json')) db.exec('ALTER TABLE runs ADD COLUMN result_items_json TEXT');
+// Gap #4 closure (Final Gap Closure Round): minimum metadata to identify
+// external work that can outlive this Node process (Toidispy/CDP child
+// process, Apify actor run) — {executionClass, externalExecutionId,
+// startedAt}. RestartRecovery reads this on boot to avoid blindly
+// duplicating a still-running external execution. Kept separate from
+// health_snapshot (which heartbeat.js overwrites on its own throttled
+// schedule) so neither write path clobbers the other.
+if (!runColumns.has('external_execution_json')) db.exec('ALTER TABLE runs ADD COLUMN external_execution_json TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id)');
 
 const marketplaceAccountColumns = new Set(db.prepare('PRAGMA table_info(marketplace_accounts)').all().map((column) => column.name));
 if (!marketplaceAccountColumns.has('proxy_id')) db.exec('ALTER TABLE marketplace_accounts ADD COLUMN proxy_id INTEGER');
@@ -230,14 +291,22 @@ const stmt = {
     VALUES (@platform, @query, @maxItems, @country, @requestedBackend, @inputOptions)
   `),
   findRunById: db.prepare('SELECT * FROM runs WHERE id = ?'),
+  findQueuedRuns: db.prepare("SELECT * FROM runs WHERE status IN ('queued', 'pending') ORDER BY id ASC LIMIT ?"),
   findAllRuns: db.prepare('SELECT * FROM runs ORDER BY created_at DESC LIMIT ?'),
+  findRunsByStatus: db.prepare('SELECT * FROM runs WHERE status = ? ORDER BY id ASC'),
+  // Final Implementation Closure §2: completed_at must only be stamped on a
+  // terminal transition, never on a routine heartbeat/progress update — those
+  // call updateRun() too (via HeartbeatTracker.persist()) while the Run is
+  // still legitimately running.
   updateRun: db.prepare(`
     UPDATE runs SET status=@status, apify_run_id=@apifyRunId, apify_dataset_id=@apifyDatasetId,
       items_count=@itemsCount, new_count=@newCount, active_count=@activeCount,
       dropped_count=@droppedCount, error_message=@errorMessage,
       active_backend=@activeBackend, backend_kind=@backendKind, backend_status=@backendStatus,
       backend_version=@backendVersion, backend_run_id=@backendRunId, health_snapshot=@healthSnapshot,
-      cost_estimate=@costEstimate, completed_at=CURRENT_TIMESTAMP
+      cost_estimate=@costEstimate, input_options=@inputOptions,
+      external_execution_json=@externalExecutionJson,
+      completed_at=CASE WHEN @isTerminal = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END
     WHERE id=@id
   `),
   deleteRun: db.prepare('DELETE FROM runs WHERE id = ?'),
@@ -257,6 +326,10 @@ const stmt = {
     SELECT * FROM snapshots WHERE platform = ? AND query = ? AND item_uid = ? AND run_id < ?
     ORDER BY run_id DESC LIMIT 1
   `),
+  // §12: marks a V2 product_current row dropped — used by insertSnapshots()
+  // for dropped-item detection that no longer depends on the legacy
+  // snapshots table.
+  markProductCurrentDropped: db.prepare(`UPDATE product_current SET status = 'dropped' WHERE item_uid = ?`),
   getSnapshotHistory: db.prepare(`
     SELECT s.*, r.created_at as run_date FROM snapshots s
     JOIN runs r ON s.run_id = r.id
@@ -354,13 +427,42 @@ const stmt = {
   `),
   findDueMarketplaceCaptureSchedules: db.prepare(`
     SELECT id, platform, keyword, account_id, every_minutes, schedule_type, daily_time, run_at, variant_mode, max_variants, max_listings
-    FROM marketplace_capture_schedules WHERE enabled = 1 AND next_run_at <= @now ORDER BY next_run_at ASC LIMIT 5
+    FROM marketplace_capture_schedules
+    WHERE enabled = 1 AND next_run_at <= @now AND (claimed_until IS NULL OR claimed_until < @now)
+    ORDER BY next_run_at ASC LIMIT 5
   `),
+  claimMarketplaceCaptureSchedule: db.prepare(`
+    UPDATE marketplace_capture_schedules SET claimed_until = @claimedUntil, claim_token = @claimToken
+    WHERE id = @id AND (claimed_until IS NULL OR claimed_until < @now)
+  `),
+  // Final Stabilization Round #12: opposite guard from the initial claim above
+  // — only extends a claim that is CURRENTLY still held (claimed_until in the
+  // future), never one that has already expired (a second tick may have
+  // claimed it in the meantime; renewal must not steal it back).
+  // §6: claim_token must match — a second process that claimed between
+  // renewals gets a different token and this renewal correctly no-ops.
+  renewMarketplaceCaptureScheduleClaim: db.prepare(`
+    UPDATE marketplace_capture_schedules SET claimed_until = @claimedUntil
+    WHERE id = @id AND claimed_until IS NOT NULL AND claimed_until >= @now AND claim_token = @claimToken
+  `),
+  releaseMarketplaceCaptureScheduleClaim: db.prepare(`
+    UPDATE marketplace_capture_schedules SET claimed_until = NULL, claim_token = NULL
+    WHERE id = @id AND (claim_token IS NULL OR claim_token = @claimToken)
+  `),
+  // §3 (Final Blocker Fix Round): completion is claim_token-protected exactly
+  // like renew/release — a stale attempt whose claim was already lost cannot
+  // mark the schedule complete, clear a newer claim, or advance next_run_at.
+  // `IS` (not `=`) is required for NULL-safe comparison: a never-claimed
+  // schedule has claim_token IS NULL, and completing it with no claimToken
+  // supplied (claimToken=NULL) must still match — `NULL = NULL` is NULL
+  // (never true) in SQL, but `NULL IS NULL` is true.
   completeMarketplaceCaptureSchedule: db.prepare(`
-    UPDATE marketplace_capture_schedules SET last_run_at = @now, next_run_at = @nextRunAt, last_summary = @summary WHERE id = @id
+    UPDATE marketplace_capture_schedules SET last_run_at = @now, next_run_at = @nextRunAt, last_summary = @summary, claimed_until = NULL, claim_token = NULL
+    WHERE id = @id AND claim_token IS @claimToken
   `),
   completeOneTimeMarketplaceCaptureSchedule: db.prepare(`
-    UPDATE marketplace_capture_schedules SET enabled = 0, last_run_at = @now, last_summary = @summary WHERE id = @id
+    UPDATE marketplace_capture_schedules SET enabled = 0, last_run_at = @now, last_summary = @summary, claimed_until = NULL, claim_token = NULL
+    WHERE id = @id AND claim_token IS @claimToken
   `),
   createMarketplaceCaptureScheduleRun: db.prepare(`
     INSERT INTO marketplace_capture_schedule_runs (schedule_id, summary, completed_at)
@@ -374,6 +476,11 @@ const stmt = {
     LIMIT @limit
   `),
   deleteMarketplaceCaptureSchedule: db.prepare('DELETE FROM marketplace_capture_schedules WHERE id = ?'),
+  toggleMarketplaceCaptureSchedule: db.prepare(`
+    UPDATE marketplace_capture_schedules
+    SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END
+    WHERE id = ?
+  `),
 };
 
 // Existing records keep their history, but recover images that were already
@@ -422,20 +529,70 @@ backfillSnapshotProductMetrics();
 
 function getAllPlatforms() { return stmt.findAllPlatforms.all(); }
 
-function createRun({ platform, query, maxItems = 100, country = null, requestedBackend = null, options = {} }) {
+function createRun({ platform, query, maxItems = 100, country = null, requestedBackend = null, options = {}, parentRunId = null }) {
   const r = stmt.createRun.run({ platform, query, maxItems, country, requestedBackend, inputOptions: JSON.stringify(options || {}) });
+  if (parentRunId) {
+    db.prepare('UPDATE runs SET parent_run_id = ? WHERE id = ?').run(parentRunId, r.lastInsertRowid);
+  }
   return stmt.findRunById.get(r.lastInsertRowid);
 }
 
+function getChildRuns(parentRunId) {
+  return db.prepare('SELECT * FROM runs WHERE parent_run_id = ? ORDER BY id ASC').all(parentRunId);
+}
+
 function getRunById(id) { return stmt.findRunById.get(id); }
+function getQueuedRuns(limit = 10) { return stmt.findQueuedRuns.all(limit); }
 function getAllRuns(limit = 100) { return stmt.findAllRuns.all(limit); }
+function getRunsByStatus(status) { return stmt.findRunsByStatus.all(status); }
 function deleteRun(id) { stmt.deleteRun.run(id); }
+
+function deleteItem(itemUid) {
+  if (!itemUid) return { changes: 0 };
+  const tx = db.transaction((uid) => {
+    const snapResult = db.prepare('DELETE FROM snapshots WHERE item_uid = ?').run(uid);
+    try { db.prepare('DELETE FROM product_current WHERE item_uid = ?').run(uid); } catch (_) {}
+    try { db.prepare('DELETE FROM daily_packed_history WHERE item_uid = ?').run(uid); } catch (_) {}
+    try { db.prepare('DELETE FROM weekly_product_summary WHERE item_uid = ?').run(uid); } catch (_) {}
+    return { changes: snapResult.changes };
+  });
+  return tx(itemUid);
+}
+
+function deleteAllItems({ platform = null, query = null } = {}) {
+  const tx = db.transaction(() => {
+    let snapResult;
+    if (platform && query) {
+      snapResult = db.prepare('DELETE FROM snapshots WHERE platform = ? AND query = ?').run(platform, query);
+      try { db.prepare('DELETE FROM product_current WHERE platform = ? AND query = ?').run(platform, query); } catch (_) {}
+      try { db.prepare('DELETE FROM daily_packed_history WHERE platform = ? AND query = ?').run(platform, query); } catch (_) {}
+    } else if (platform) {
+      snapResult = db.prepare('DELETE FROM snapshots WHERE platform = ?').run(platform);
+      try { db.prepare('DELETE FROM product_current WHERE platform = ?').run(platform); } catch (_) {}
+      try { db.prepare('DELETE FROM daily_packed_history WHERE platform = ?').run(platform); } catch (_) {}
+    } else {
+      snapResult = db.prepare('DELETE FROM snapshots').run();
+      try { db.prepare('DELETE FROM product_current').run(); } catch (_) {}
+      try { db.prepare('DELETE FROM daily_packed_history').run(); } catch (_) {}
+    }
+    return { changes: snapResult.changes };
+  });
+  return tx();
+}
+
+const TERMINAL_RUN_STATUSES = new Set(['done', 'failed', 'stuck', 'cancelled', 'timeout']);
 
 function updateRun(id, updates) {
   const run = stmt.findRunById.get(id);
   if (!run) return;
+  const nextStatus = updates.status ?? run.status;
+  // Only a terminal status stamps completed_at — a heartbeat/progress update
+  // (which calls updateRun() with the SAME non-terminal status, e.g. 'running')
+  // must leave completed_at untouched.
+  const isTerminal = TERMINAL_RUN_STATUSES.has(nextStatus) ? 1 : 0;
   stmt.updateRun.run({
     id,
+    isTerminal,
     status: updates.status ?? run.status,
     apifyRunId: updates.apifyRunId ?? run.apify_run_id,
     apifyDatasetId: updates.apifyDatasetId ?? run.apify_dataset_id,
@@ -451,6 +608,12 @@ function updateRun(id, updates) {
     backendRunId: updates.backendRunId ?? updates.backend_run_id ?? run.backend_run_id,
     healthSnapshot: updates.healthSnapshot ?? updates.health_snapshot ?? run.health_snapshot,
     costEstimate: updates.costEstimate ?? updates.cost_estimate ?? run.cost_estimate,
+    inputOptions: updates.inputOptions ?? updates.input_options ?? run.input_options,
+    // Gap #4 closure: `externalExecution: null` explicitly clears it (e.g. once
+    // no longer relevant); omitted entirely leaves the existing value untouched.
+    externalExecutionJson: 'externalExecution' in updates
+      ? (updates.externalExecution == null ? null : JSON.stringify(updates.externalExecution))
+      : run.external_execution_json,
   });
 }
 
@@ -472,6 +635,7 @@ function insertSnapshots(runId, platform, query, items) {
 
   let newCount = 0, activeCount = 0, droppedCount = 0;
   const currentUids = new Set();
+  const resultItems = []; // §6.1: this Run's own packed result array
 
   const insertMany = db.transaction((txItems) => {
     for (const item of txItems) {
@@ -479,29 +643,14 @@ function insertSnapshots(runId, platform, query, items) {
       const itemUid = generateUid(platform, query, parsed);
       currentUids.add(itemUid);
 
-      // Find previous snapshot for this item
-      let prevSnapshot = null;
-      if (prevRunId > 0) {
-        prevSnapshot = stmt.findPreviousSnapshot.get(platform, query, itemUid, runId + 1);
-      }
-
-      let status = 'new';
-      let prevSnapshotId = null;
-
-      if (prevSnapshot) {
-        status = 'active';
-        activeCount++;
-        prevSnapshotId = prevSnapshot.id;
-      } else {
-        newCount++;
-      }
-
-      stmt.insertSnapshot.run({
-        runId,
+      // §12: new/active must be derived from V2 (product_current), which is
+      // authoritative regardless of LEGACY_SNAPSHOT_WRITE — the legacy
+      // snapshots table stops growing once legacy writes are disabled, which
+      // would otherwise make every item look "new" forever from that point on.
+      const v2Payload = {
+        item_uid: itemUid,
         platform,
         query,
-        itemUid,
-        rawData: serializeItemForStorage(item),
         title: parsed.title,
         url: parsed.url,
         image: parsed.image,
@@ -509,43 +658,147 @@ function insertSnapshots(runId, platform, query, items) {
         price: parsed.price,
         rating: parsed.rating,
         reviews: parsed.reviews,
-        soldCount: parsed.soldCount,
+        sold_count: parsed.soldCount,
         likes: parsed.likes,
+        comments: parsed.comments,
+        shares: parsed.shares,
+        views: parsed.views
+      };
+
+      let v2Result = null;
+      try {
+        v2Result = productCurrentOps.upsertItem(v2Payload, runId);
+        // §4: runId gives this observation a stable identity (run:<runId>:<itemUid>)
+        // so a retried insertSnapshots() call for the same run never duplicates it.
+        dailyHistoryOps.appendObservation(v2Payload, new Date(), { runId });
+        // weekly_summary is deprecated from the core write path (Simplification
+        // Round #13/#14): the table and its historical rows are preserved for
+        // read/rollback, but nothing writes to it anymore. Core data model is
+        // now exactly product_current + daily_packed_history.
+      } catch (v2Err) {
+        // Simplification Round #17: a V2 write failure must never be a silent
+        // divergence between legacy snapshots (already committed above) and
+        // V2 Current/History. Record a durable repair task instead of only
+        // logging — recordV2WriteFailure() below.
+        recordV2WriteFailure(runId, itemUid, v2Err.message);
+      }
+
+      // Legacy status field kept for the optional legacy row below; falls
+      // back to the pre-V2 legacy-snapshot lookup only in the degraded case
+      // where the V2 write itself failed (v2Result is null).
+      let prevSnapshotId = null;
+      let status;
+      if (v2Result) {
+        status = v2Result.isNew ? 'new' : 'active';
+      } else {
+        const prevSnapshot = prevRunId > 0 ? stmt.findPreviousSnapshot.get(platform, query, itemUid, runId + 1) : null;
+        status = prevSnapshot ? 'active' : 'new';
+        if (prevSnapshot) prevSnapshotId = prevSnapshot.id;
+      }
+      if (status === 'new') newCount++; else activeCount++;
+
+      // §6.1: this Run's own packed result array — populated unconditionally
+      // (not gated by LEGACY_SNAPSHOT_WRITE), so /api/runs/:id and
+      // /api/export/:runId never depend on legacy `snapshots` rows existing.
+      resultItems.push({
+        item_uid: itemUid,
+        platform,
+        title: parsed.title,
+        url: parsed.url,
+        landingUrl: parsed.landingUrl,
+        image: parsed.image,
+        author: parsed.author,
+        price: parsed.price,
+        currency: parsed.currency,
+        source_price: parsed.source_price,
+        source_currency: parsed.source_currency,
+        fx_rate: parsed.fx_rate,
+        fx_at: parsed.fx_at,
+        rating: parsed.rating,
+        reviews: parsed.reviews,
+        sold_count: parsed.soldCount,
+        likes: parsed.likes,
+        fanpageLikes: parsed.fanpageLikes,
+        startDate: parsed.startDate,
+        endDate: parsed.endDate,
+        isActive: parsed.isActive,
+        publisherPlatforms: parsed.publisherPlatforms,
+        cta: parsed.cta,
+        subreddit: parsed.subreddit,
         comments: parsed.comments,
         shares: parsed.shares,
         views: parsed.views,
         status,
-        prevSnapshotId,
+        observed_at: new Date().toISOString()
       });
+
+      // §14/§16: Gate legacy snapshot writes. When LEGACY_SNAPSHOT_WRITE=false,
+      // the snapshots table stops growing (no new rows). V2 dual-write continues.
+      if (LEGACY_SNAPSHOT_WRITE) {
+        stmt.insertSnapshot.run({
+          runId,
+          platform,
+          query,
+          itemUid,
+          rawData: serializeItemForStorage(item),
+          title: parsed.title,
+          url: parsed.url,
+          image: parsed.image,
+          author: parsed.author,
+          price: parsed.price,
+          rating: parsed.rating,
+          reviews: parsed.reviews,
+          soldCount: parsed.soldCount,
+          likes: parsed.likes,
+          comments: parsed.comments,
+          shares: parsed.shares,
+          views: parsed.views,
+          status,
+          prevSnapshotId,
+        });
+      }
     }
 
-    // Find dropped items (in previous run but not in current)
+    // §12: dropped items — sourced from product_current (V2), never the
+    // legacy snapshots table. An item counts as dropped for this run when it
+    // was last touched by the immediately-preceding run for this
+    // platform+query (product_current.last_run_id = prevRunId) but is absent
+    // from this run's item set. This stays correct with LEGACY_SNAPSHOT_WRITE
+    // off, across arbitrarily many subsequent runs, using only columns
+    // product_current already has (no new metadata table).
     if (prevRunId > 0) {
-      const prevSnapshots = stmt.findSnapshotsByRunId.all(prevRunId);
-      for (const prev of prevSnapshots) {
-        if (!currentUids.has(prev.item_uid)) {
-          droppedCount++;
-          // Insert a "dropped" snapshot
+      const staleCandidates = db.prepare(
+        "SELECT * FROM product_current WHERE platform = ? AND query = ? AND last_run_id = ? AND status != 'dropped'"
+      ).all(platform, query, prevRunId);
+      for (const cand of staleCandidates) {
+        if (currentUids.has(cand.item_uid)) continue;
+        droppedCount++;
+        stmt.markProductCurrentDropped.run(cand.item_uid);
+        // §16: Only insert legacy dropped snapshots if flag is on. Sourced
+        // from product_current's own fields, not a legacy-table read, so
+        // this still works correctly even if legacy writes were already off
+        // during the run that most recently touched this item.
+        if (LEGACY_SNAPSHOT_WRITE) {
           stmt.insertSnapshot.run({
             runId,
             platform,
             query,
-            itemUid: prev.item_uid,
-            rawData: prev.raw_data,
-            title: prev.title,
-            url: prev.url,
-            image: prev.image,
-            author: prev.author,
-            price: prev.price,
-            rating: prev.rating,
-            reviews: prev.reviews,
-            soldCount: prev.sold_count,
-            likes: prev.likes,
-            comments: prev.comments,
-            shares: prev.shares,
-            views: prev.views,
+            itemUid: cand.item_uid,
+            rawData: JSON.stringify(cand),
+            title: cand.title,
+            url: cand.url,
+            image: cand.image,
+            author: cand.author,
+            price: cand.current_price,
+            rating: cand.current_rating,
+            reviews: cand.current_reviews,
+            soldCount: cand.current_sold,
+            likes: cand.current_likes,
+            comments: cand.current_comments,
+            shares: cand.current_shares,
+            views: cand.current_views,
             status: 'dropped',
-            prevSnapshotId: prev.id,
+            prevSnapshotId: null,
           });
         }
       }
@@ -553,6 +806,9 @@ function insertSnapshots(runId, platform, query, items) {
   });
 
   insertMany(items);
+
+  // §6.1: written unconditionally, independent of LEGACY_SNAPSHOT_WRITE.
+  db.prepare('UPDATE runs SET result_items_json = ? WHERE id = ?').run(JSON.stringify(resultItems), runId);
 
   // Update run counts
   updateRun(runId, {
@@ -563,6 +819,49 @@ function insertSnapshots(runId, platform, query, items) {
   });
 
   return { newItems: newCount, activeItems: activeCount, droppedItems: droppedCount };
+}
+
+/**
+ * §6.2: single helper for "what items did this Run produce" — used by both
+ * /api/runs/:id and /api/export/:runId so neither route hand-rolls its own
+ * legacy-vs-V2 branching. READ_MODEL_V2=false reads legacy `snapshots`
+ * (unchanged behavior); READ_MODEL_V2=true reads runs.result_items_json,
+ * which is populated on every insertSnapshots() call regardless of
+ * LEGACY_SNAPSHOT_WRITE — so this never returns empty for a post-cutover Run.
+ */
+function getRunItems(runId) {
+  if (!READ_MODEL_V2) {
+    return getSnapshotsByRunId(runId);
+  }
+  const run = stmt.findRunById.get(runId);
+  if (!run || !run.result_items_json) return [];
+  try {
+    return JSON.parse(run.result_items_json);
+  } catch (_e) {
+    return [];
+  }
+}
+
+/**
+ * §6.3: idempotent backfill — only processes runs whose result_items_json is
+ * still NULL, from their existing legacy `snapshots` rows. Running this
+ * twice processes zero additional rows the second time. Never deletes or
+ * modifies legacy data.
+ */
+function backfillRunResultItems() {
+  const targets = db.prepare('SELECT id FROM runs WHERE result_items_json IS NULL').all();
+  let migrated = 0;
+  for (const { id } of targets) {
+    const snapshots = getSnapshotsByRunId(id);
+    const resultItems = snapshots.map((s) => ({
+      item_uid: s.item_uid, platform: s.platform, title: s.title, url: s.url, image: s.image, author: s.author,
+      price: s.price, rating: s.rating, reviews: s.reviews, sold_count: s.sold_count, likes: s.likes,
+      comments: s.comments, shares: s.shares, views: s.views, status: s.status, observed_at: s.created_at
+    }));
+    db.prepare('UPDATE runs SET result_items_json = ? WHERE id = ?').run(JSON.stringify(resultItems), id);
+    migrated++;
+  }
+  return { migrated, totalCandidates: targets.length };
 }
 
 function getLatestSnapshots({ search = '', platform = '', limit = 200 } = {}) {
@@ -589,6 +888,9 @@ function getLatestSnapshots({ search = '', platform = '', limit = 200 } = {}) {
   `).all(params);
 }
 function getSnapshotHistory(itemUid) { return stmt.getSnapshotHistory.all(itemUid); }
+function getLatestSnapshotByUid(itemUid) {
+  return db.prepare('SELECT * FROM snapshots WHERE item_uid = ? ORDER BY id DESC LIMIT 1').get(itemUid);
+}
 function getSnapshotsByRunId(runId) { return stmt.findSnapshotsByRunId.all(runId); }
 function getSnapshotsMissingEtsyImages(limit = 50) {
   const normalizedLimit = Math.min(500, Math.max(1, Number.parseInt(limit, 10) || 50));
@@ -602,8 +904,29 @@ function updateSnapshotImage(id, image) {
 
 function getStats() {
   const totalRuns = stmt.countRuns.get().total;
-  const totalSnapshots = stmt.countSnapshots.get().total;
-  return { totalRuns, totalSnapshots };
+  let totalSnapshots = 0;
+  const platformCounts = {};
+
+  try {
+    if (READ_MODEL_V2) {
+      const totalRow = db.prepare("SELECT COUNT(*) as total FROM product_current WHERE status != 'dropped'").get();
+      totalSnapshots = totalRow?.total || 0;
+      const rows = db.prepare("SELECT platform, COUNT(*) as count FROM product_current WHERE status != 'dropped' GROUP BY platform").all();
+      for (const r of rows) {
+        platformCounts[r.platform] = r.count;
+      }
+    } else {
+      totalSnapshots = stmt.countSnapshots.get().total;
+      const rows = db.prepare("SELECT platform, COUNT(DISTINCT item_uid) as count FROM snapshots WHERE status != 'dropped' GROUP BY platform").all();
+      for (const r of rows) {
+        platformCounts[r.platform] = r.count;
+      }
+    }
+  } catch (_e) {
+    totalSnapshots = stmt.countSnapshots.get().total;
+  }
+
+  return { totalRuns, totalSnapshots, platformCounts };
 }
 
 function getRunStats() {
@@ -790,17 +1113,67 @@ function getDueMarketplaceCaptureSchedules(now = new Date()) {
   return stmt.findDueMarketplaceCaptureSchedules.all({ now: now.toISOString() });
 }
 
-function completeMarketplaceCaptureSchedule(id, summary, now = new Date()) {
+/**
+ * Atomic claim (Live-Readiness Round #12): the UPDATE's WHERE clause re-checks
+ * claimed_until at the moment of the write, so two ticks racing to claim the
+ * same schedule cannot both succeed — only one UPDATE actually changes a row.
+ * A crash mid-capture leaves claimed_until in the past once the lease expires,
+ * so the schedule becomes claimable again automatically (no manual recovery needed).
+ */
+function claimMarketplaceCaptureSchedule(id, leaseMs = 5 * 60 * 1000) {
+  const crypto = require('crypto');
+  const now = new Date();
+  const claimedUntil = new Date(now.getTime() + leaseMs).toISOString();
+  const claimToken = crypto.randomBytes(12).toString('hex');
+  const info = stmt.claimMarketplaceCaptureSchedule.run({ id: Number(id), claimedUntil, claimToken, now: now.toISOString() });
+  // Return the claim_token on success so callers can use it for renew/release.
+  // Existing callers that check `=== true` will still be truthy with a string.
+  return info.changes > 0 ? claimToken : false;
+}
+
+function releaseMarketplaceCaptureScheduleClaim(id, claimToken = null) {
+  stmt.releaseMarketplaceCaptureScheduleClaim.run({ id: Number(id), claimToken });
+}
+
+/**
+ * Final Stabilization Round #12: a fixed claim TTL is not sufficient for a
+ * schedule whose real work (discovery + N sequential captures) can outlive
+ * the original lease window. Extends claimed_until only while the caller
+ * still holds an unexpired claim (see renewMarketplaceCaptureScheduleClaim
+ * statement) — a process that already lost its lease cannot resurrect a claim
+ * a second tick has since taken over.
+ * §6: claim_token must match for renewal to succeed.
+ */
+function renewMarketplaceCaptureScheduleClaim(id, leaseMs = 5 * 60 * 1000, claimToken = null) {
+  const now = new Date();
+  const claimedUntil = new Date(now.getTime() + leaseMs).toISOString();
+  const info = stmt.renewMarketplaceCaptureScheduleClaim.run({ id: Number(id), claimedUntil, claimToken, now: now.toISOString() });
+  return info.changes > 0;
+}
+
+// §3: claimToken is a 4th, optional param (kept after `now` for backward
+// compatibility with existing callers that pass `now` positionally without a
+// claim in play, e.g. test schedules that were never claimed).
+function completeMarketplaceCaptureSchedule(id, summary, now = new Date(), claimToken = null) {
   const schedule = getMarketplaceCaptureSchedules().find((candidate) => candidate.id === Number(id));
   if (!schedule) return false;
   const summaryJson = JSON.stringify(summary);
   return db.transaction(() => {
-    stmt.createMarketplaceCaptureScheduleRun.run({ scheduleId: Number(id), summary: summaryJson, completedAt: now.toISOString() });
+    // §3: the schedule-row UPDATE is claim_token-protected FIRST. If a stale
+    // attempt's token no longer matches the current claim (or no claim
+    // exists but one was expected), 0 rows change — do NOT insert a
+    // completion history row or touch next_run_at for whoever actually owns
+    // the schedule now.
+    let changes;
     if (schedule.schedule_type === 'once') {
-      return stmt.completeOneTimeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), summary: summaryJson }).changes > 0;
+      changes = stmt.completeOneTimeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), summary: summaryJson, claimToken }).changes;
+    } else {
+      const { nextScheduleRunAt } = require('./marketplaces/capture-scheduler');
+      changes = stmt.completeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), nextRunAt: nextScheduleRunAt(schedule, now).toISOString(), summary: summaryJson, claimToken }).changes;
     }
-    const { nextScheduleRunAt } = require('./marketplaces/capture-scheduler');
-    return stmt.completeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), nextRunAt: nextScheduleRunAt(schedule, now).toISOString(), summary: summaryJson }).changes > 0;
+    if (changes === 0) return false; // MARKETPLACE_CLAIM_LOST
+    stmt.createMarketplaceCaptureScheduleRun.run({ scheduleId: Number(id), summary: summaryJson, completedAt: now.toISOString() });
+    return true;
   })();
 }
 
@@ -815,6 +1188,12 @@ function deleteMarketplaceCaptureSchedule(id) {
   return stmt.deleteMarketplaceCaptureSchedule.run(Number(id)).changes > 0;
 }
 
+function toggleMarketplaceCaptureSchedule(id) {
+  const info = stmt.toggleMarketplaceCaptureSchedule.run(Number(id));
+  if (info.changes === 0) return null;
+  return getMarketplaceCaptureSchedules().find((c) => c.id === Number(id)) || null;
+}
+
 // ==================== Helpers ====================
 
 function parseItemData(item) {
@@ -822,23 +1201,55 @@ function parseItemData(item) {
   try { d = typeof item === 'string' ? JSON.parse(item) : item; } catch { d = {}; }
 
   const title = d.title || d.adTitle || d.productTitle || d.name || d.text || '';
-  const image = extractImage(d);
-  const url = d.url || d.permalink || d.adUrl || d.link || d.productUrl || '';
-  const author = typeof (d.author || d.advertiserName || d.username || '') === 'object'
+  const image = d.image || extractImage(d);
+  const archiveId = d.adArchiveId || d.adArchiveID || '';
+  const adLibraryUrl = archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : '';
+  const url = d.url || adLibraryUrl || d.permalink || d.adUrl || d.link || d.productUrl || '';
+  const author = typeof (d.author || d.advertiserName || d.advertiser || d.pageName || d.snapshot?.pageName || d.username || '') === 'object'
     ? (d.author?.name || d.author?.username || '')
-    : (d.author || d.advertiserName || d.username || '');
+    : (d.author || d.advertiserName || d.advertiser || d.pageName || d.snapshot?.pageName || d.username || '');
 
   const price = parseDecimal(d.price || d.adSpend || d.product_price || d.currentPrice || 0);
-  const rating = parseDecimal(d.rating || d.averageRating || d.average_rating || d.stars || d.productRating || 0);
-  const reviews = parseNum(d.reviewCount || d.review_count || d.reviews || d.ratingsCount || d.ratingCount || 0);
-  const soldCount = parseNum(d.soldCount || d.sold_count || d.sales || d.orders || d.orderCount || 0);
-  const likes = parseNum(d.likes || d.likeCount || d.like_count || d.upvotes || d.score || d.favouritesCount || d.reactions_count || 0);
-  const comments = parseNum(d.comments || d.commentCount || d.replyCount || d.num_comments || d.numComments || d.comments_count || 0);
-  const shares = parseNum(d.shares || d.shareCount || d.retweetCount || d.reposts || d.reshare_count || 0);
-  const views = parseNum(d.views || d.viewCount || d.view_count || d.video_view_count || d.impressions || 0);
+  const currency = d.currency || 'USD';
+  const sourcePrice = d.source_price !== undefined ? parseDecimal(d.source_price) : price;
+  const sourceCurrency = d.source_currency || currency;
+  const fxRate = d.fx_rate !== undefined ? d.fx_rate : (currency === 'USD' ? 1.0 : null);
+  const fxAt = d.fx_at || null;
+
+  const rating = parseDecimal(d.rating || d.averageRating || d.average_rating || d.stars || d.productRating || d.score || d.review_score || 0);
+  const reviews = parseNum(d.reviewCount || d.review_count || d.reviews || d.reviewsCount || d.ratingsCount || d.ratingCount || d.total_reviews || 0);
+  const soldCount = parseNum(d.soldCount || d.sold_count || d.sold || d.sales || d.orders || d.orderCount || d.total_sold || d.item_sold || d.volume || 0);
+  const likes = parseNum(d.likes || d.likeCount || d.like_count || d.favorite_count || d.favoriteCount || d.favorites || d.upvotes || d.score || d.favouritesCount || d.reactions_count || 0);
+  const comments = parseNum(d.comments || d.commentCount || d.commentsCount || d.replyCount || d.reply_count || d.replies || d.conversation_count || d.num_comments || d.numComments || d.comments_count || 0);
+  const shares = parseNum(d.shares || d.shareCount || d.sharesCount || d.retweetCount || d.retweet_count || d.retweets || d.reposts || d.repostCount || d.reshare_count || 0);
+  const views = parseNum(d.views || d.viewCount || d.viewsCount || d.impressions || d.impression_count || d.view_count || d.video_view_count || 0);
+
+  const parseSafeDate = (val) => {
+    if (!val) return '';
+    if (typeof val === 'number') {
+      const dt = new Date(val > 1e11 ? val : val * 1000);
+      return isNaN(dt.getTime()) ? '' : dt.toISOString();
+    }
+    const dt = new Date(val);
+    return isNaN(dt.getTime()) ? String(val) : dt.toISOString();
+  };
+  const startDate = d.startDateFormatted || parseSafeDate(d.startDate) || d.firstSeenAt || '';
+  const endDate = d.endDateFormatted || parseSafeDate(d.endDate) || '';
+  const isActive = d.isActive !== undefined ? d.isActive : true;
+  const publisherPlatforms = d.publisherPlatforms || d.publisherPlatform || d.snapshot?.publisherPlatform || [];
+  const fanpageLikes = parseNum(d.fanpageLikes || d.snapshot?.pageLikeCount || d.pageLikeCount || likes || 0);
+  const cta = d.cta || d.ctaText || d.snapshot?.ctaText || '';
+  const landingUrl = d.landingUrl || d.snapshot?.linkUrl || '';
+  // Reddit-specific: subreddit name for UI display (r/xxx). `likes` already
+  // carries Reddit's upvote score (reddit.js sets likes:d.ups) and `comments`
+  // already carries the real total comment count — both reused as-is, only
+  // the subreddit label itself was missing from persisted metadata.
+  const subreddit = d.subreddit || '';
 
   return { title: String(title).substring(0, 200), image, url, author: String(author).substring(0, 100),
-    price, rating, reviews, soldCount, likes, comments, shares, views };
+    price, currency, source_price: sourcePrice, source_currency: sourceCurrency, fx_rate: fxRate, fx_at: fxAt,
+    rating, reviews, soldCount, likes, comments, shares, views,
+    startDate, endDate, isActive, publisherPlatforms, fanpageLikes, cta, landingUrl, subreddit };
 }
 
 function serializeItemForStorage(item) {
@@ -870,13 +1281,627 @@ function generateUid(platform, query, parsed) {
   return `${platform}:${query}:${parsed.title}:${parsed.author}`.toLowerCase().replace(/[^a-z0-9:]/g, '');
 }
 
+// ==================== V2 3-Tier Storage Accessors & Backfill ====================
+
+function getProductCurrent(options = {}) {
+  return productCurrentOps.listCurrent(options);
+}
+
+/**
+ * §11 (Final Architecture Closure Round): single-row V2 lookup so callers
+ * (export growth) can read this item's already-computed delta_* fields
+ * instead of falling back to legacy getSnapshotHistory().
+ */
+function getProductCurrentByUid(itemUid) {
+  return productCurrentOps.findByUid(itemUid);
+}
+
+function getProductHistory(itemUid, limitDays = 30) {
+  return dailyHistoryOps.getHistory(itemUid, limitDays);
+}
+
+// UI-BUG-04: SQLite's default CURRENT_TIMESTAMP format is naive
+// "YYYY-MM-DD HH:MM:SS" UTC, with no timezone marker — writing it straight
+// into a CSV export reads as if it were already local time to anyone opening
+// the file, a ~7h (UTC+7) gap from the real Vietnam-local time it
+// represents. Convert explicitly and label it, matching the "(Vietnam)"
+// convention already used elsewhere in this app.
+function formatVietnamTime(utcString) {
+  if (!utcString) return '';
+  const date = new Date(String(utcString).replace(' ', 'T') + 'Z');
+  if (Number.isNaN(date.getTime())) return String(utcString);
+  return date.toLocaleString('en-GB', { timeZone: 'Asia/Ho_Chi_Minh', hour12: false }).replace(',', '') + ' (Vietnam)';
+}
+
+// UI-BUG-01: daily_packed_history observations only ever carry the metric
+// fields (price/likes/comments/shares/views/sold/rating/reviews) — never the
+// item's static metadata (title/platform/url/image/author/status), which
+// lives in product_current instead. The Product Detail modal renders
+// `history[history.length-1].title/platform/url`, so every point was
+// rendering "Untitled", platform `undefined`, and no URL even though
+// product_current itself has correct data. Look the item's metadata up once
+// and denormalize it onto every point, matching what the legacy
+// `snapshots`-backed history path already returns per-row.
+function getProductHistoryWithMetadata(itemUid, limitDays = 365) {
+  const currentItem = getProductCurrentByUid(itemUid);
+  let richMeta = {};
+  if (currentItem?.last_run_id) {
+    try {
+      const run = stmt.findRunById.get(currentItem.last_run_id);
+      if (run?.result_items_json) {
+        const items = JSON.parse(run.result_items_json);
+        const match = items.find(it => it.item_uid === itemUid);
+        if (match) {
+          richMeta = {
+            startDate: match.startDate || '',
+            endDate: match.endDate || '',
+            isActive: match.isActive !== undefined ? match.isActive : true,
+            publisherPlatforms: match.publisherPlatforms || [],
+            fanpageLikes: match.fanpageLikes || currentItem.current_likes || 0,
+            cta: match.cta || '',
+            landingUrl: match.landingUrl || '',
+            subreddit: match.subreddit || ''
+          };
+        }
+      }
+    } catch {}
+  }
+
+  const metadata = currentItem
+    ? {
+        platform: currentItem.platform,
+        title: currentItem.title,
+        url: currentItem.url,
+        image: currentItem.image,
+        author: currentItem.author,
+        status: currentItem.status,
+        ...richMeta
+      }
+    : {};
+
+  const dailyRows = getProductHistory(itemUid, limitDays);
+  const points = [];
+  for (const day of dailyRows) {
+    for (const obs of day.observations || []) {
+      points.push({
+        item_uid: itemUid,
+        ...metadata,
+        created_at: `${day.date} ${obs.time}`,
+        price: obs.price, likes: obs.likes, comments: obs.comments,
+        shares: obs.shares, views: obs.views, sold_count: obs.sold,
+        rating: obs.rating, reviews: obs.reviews
+      });
+    }
+  }
+  points.sort((a, b) => a.created_at.localeCompare(b.created_at));
+  return points;
+}
+
+/**
+ * @deprecated weekly_summary is no longer part of the core data path
+ * (Simplification Round #13/#14). Nothing writes to it anymore; this reads
+ * whatever historical rows already exist for rollback/archival purposes only.
+ * No API route in server.js calls this.
+ */
+function getProductWeekly(itemUid, limitWeeks = 12) {
+  return weeklySummaryOps.getWeekly(itemUid, limitWeeks);
+}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS v2_write_failures (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER,
+    item_uid      TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending', -- pending | repaired
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+/**
+ * Durable repair task (Simplification Round #17) — a V2 (Current/History)
+ * write failure is recorded here instead of only console.warn'd, so a
+ * legacy-write-succeeded-but-V2-write-failed divergence is discoverable and
+ * repairable, not silently lost. repairPendingV2WriteFailures() replays these
+ * against the same snapshot data already safely stored in `snapshots`.
+ */
+function recordV2WriteFailure(runId, itemUid, errorMessage) {
+  console.warn('[DB V2 Dual-Write Error]:', errorMessage);
+  db.prepare('INSERT INTO v2_write_failures (run_id, item_uid, error_message) VALUES (?, ?, ?)').run(runId, itemUid, String(errorMessage || ''));
+}
+
+function getPendingV2WriteFailures() {
+  return db.prepare("SELECT * FROM v2_write_failures WHERE status = 'pending' ORDER BY id ASC").all();
+}
+
+/** Re-attempts each pending V2 write failure from its original snapshot row. Marks repaired on success. */
+function repairPendingV2WriteFailures() {
+  const pending = getPendingV2WriteFailures();
+  let repaired = 0;
+  for (const failure of pending) {
+    const snap = db.prepare('SELECT * FROM snapshots WHERE run_id = ? AND item_uid = ? ORDER BY id DESC LIMIT 1').get(failure.run_id, failure.item_uid);
+    if (!snap) continue;
+    try {
+      const v2Item = {
+        item_uid: snap.item_uid, platform: snap.platform, query: snap.query, title: snap.title, url: snap.url,
+        image: snap.image, author: snap.author, price: snap.price, rating: snap.rating, reviews: snap.reviews,
+        sold_count: snap.sold_count, likes: snap.likes, comments: snap.comments, shares: snap.shares, views: snap.views
+      };
+      productCurrentOps.upsertItem(v2Item, snap.run_id, snap.created_at);
+      // §4.1: migrated observations use legacy:<snapshot_id> identity — a
+      // re-run of this migration for the same legacy row replaces its own
+      // prior entry instead of duplicating it (§4.2 idempotency).
+      dailyHistoryOps.appendObservation(v2Item, snap.created_at, { legacySnapshotId: snap.id });
+      db.prepare("UPDATE v2_write_failures SET status = 'repaired' WHERE id = ?").run(failure.id);
+      repaired++;
+    } catch (_err) {
+      // Still pending; will be retried on the next repair pass.
+    }
+  }
+  return { attempted: pending.length, repaired };
+}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS migration_checkpoints (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+const BACKFILL_CHECKPOINT_KEY = 'backfill_v2_last_snapshot_id';
+
+/**
+ * Idempotent (Simplification Round #18): only processes snapshots newer than
+ * the last recorded checkpoint. Running this twice in a row processes zero
+ * new rows the second time — it cannot append duplicate observations to
+ * daily_packed_history or re-count deltas in product_current.
+ */
+function backfillSnapshotsToV2() {
+  const checkpointRow = db.prepare('SELECT value FROM migration_checkpoints WHERE key = ?').get(BACKFILL_CHECKPOINT_KEY);
+  const lastId = checkpointRow ? Number(checkpointRow.value) : 0;
+  const allSnapshots = db.prepare('SELECT * FROM snapshots WHERE id > ? ORDER BY created_at ASC, id ASC').all(lastId);
+  let migrated = 0;
+  let maxId = lastId;
+
+  const tx = db.transaction((rows) => {
+    for (const snap of rows) {
+      const v2Item = {
+        item_uid: snap.item_uid,
+        platform: snap.platform,
+        query: snap.query,
+        title: snap.title,
+        url: snap.url,
+        image: snap.image,
+        author: snap.author,
+        price: snap.price,
+        rating: snap.rating,
+        reviews: snap.reviews,
+        sold_count: snap.sold_count,
+        likes: snap.likes,
+        comments: snap.comments,
+        shares: snap.shares,
+        views: snap.views
+      };
+      const normalizedTs = normalizeLegacyUtcTimestamp(snap.created_at);
+      productCurrentOps.upsertItem(v2Item, snap.run_id, normalizedTs);
+      // §4.1: migrated observations use legacy:<snapshot_id> identity — a
+      // re-run of this migration for the same legacy row replaces its own
+      // prior entry instead of duplicating it (§4.2 idempotency).
+      dailyHistoryOps.appendObservation(v2Item, normalizedTs, { legacySnapshotId: snap.id });
+      // weekly_summary deprecated from backfill too — see note in insertSnapshots.
+      maxId = Math.max(maxId, snap.id);
+      migrated++;
+    }
+    db.prepare('INSERT INTO migration_checkpoints (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP')
+      .run(BACKFILL_CHECKPOINT_KEY, String(maxId));
+  });
+
+  tx(allSnapshots);
+  return { migrated, totalSnapshots: allSnapshots.length };
+}
+
+// §13: fields checked for semantic current-state parity — price/likes alone
+// (the pre-§13 check) is not enough to gate a real cutover.
+const V2_PARITY_METRIC_FIELDS = [
+  { legacy: 'price', v2: 'current_price' },
+  { legacy: 'views', v2: 'current_views' },
+  { legacy: 'likes', v2: 'current_likes' },
+  { legacy: 'comments', v2: 'current_comments' },
+  { legacy: 'shares', v2: 'current_shares' },
+  { legacy: 'sold_count', v2: 'current_sold' },
+  { legacy: 'rating', v2: 'current_rating' },
+  { legacy: 'reviews', v2: 'current_reviews' }
+];
+
+// Gap #3 closure (Final Gap Closure Round): maps a legacy `snapshots` column
+// to its corresponding field inside a daily_packed_history observation, for
+// exact per-observation (not just per-count) history parity.
+const HISTORY_OBSERVATION_METRIC_FIELDS = [
+  { legacy: 'price', obs: 'price' },
+  { legacy: 'views', obs: 'views' },
+  { legacy: 'likes', obs: 'likes' },
+  { legacy: 'comments', obs: 'comments' },
+  { legacy: 'shares', obs: 'shares' },
+  { legacy: 'sold_count', obs: 'sold' },
+  { legacy: 'rating', obs: 'rating' },
+  { legacy: 'reviews', obs: 'reviews' }
+];
+
+/**
+ * V2 Read/Write Parity Check (Live-Readiness Round #14, extended §13) —
+ * this is the gate for safely flipping READ_MODEL_V2=true and disabling
+ * LEGACY_SNAPSHOT_WRITE; it never modifies data. Two independent checks:
+ *
+ *  current: every item_uid in legacy `snapshots` must exist in
+ *    `product_current` with agreeing price/views/likes/comments/shares/
+ *    sold/rating/reviews/platform (a field null on either side is treated as
+ *    "unknown", not a mismatch — a platform that never populated a metric on
+ *    one side isn't a parity failure).
+ *
+ *  history: legacy stores one row per crawl per item_uid; V2 packs same-day
+ *    observations into daily_packed_history's observation_count. The summed
+ *    packed count per item_uid must not be LESS than the legacy count (V2
+ *    capturing MORE granularity than legacy is fine, losing observations is
+ *    not). Also scans for genuine duplicate observations (same item_uid+date
+ *    +time recorded twice) within packed rows.
+ */
+function checkV2Parity() {
+  const snapshotUids = db.prepare('SELECT DISTINCT item_uid FROM snapshots').all().map(r => r.item_uid);
+  const productCurrentUids = new Set(db.prepare('SELECT item_uid FROM product_current').all().map(r => r.item_uid));
+
+  const missingCurrent = [];
+  const metricMismatches = [];
+  const findLatestSnapshot = db.prepare('SELECT * FROM snapshots WHERE item_uid = ? ORDER BY id DESC LIMIT 1');
+  const findCurrent = db.prepare('SELECT * FROM product_current WHERE item_uid = ?');
+
+  let checked = 0;
+  for (const uid of snapshotUids) {
+    if (!productCurrentUids.has(uid)) { missingCurrent.push(uid); continue; }
+    checked++;
+    const latestSnap = findLatestSnapshot.get(uid);
+    const current = findCurrent.get(uid);
+
+    if (latestSnap.platform && current.platform && latestSnap.platform !== current.platform) {
+      metricMismatches.push({ itemUid: uid, field: 'platform', legacyValue: latestSnap.platform, v2Value: current.platform });
+    }
+
+    for (const { legacy, v2 } of V2_PARITY_METRIC_FIELDS) {
+      const legacyValue = latestSnap[legacy];
+      const v2Value = current[v2];
+      if (legacyValue == null && v2Value == null) continue; // both unpopulated — equal
+      if (legacyValue == null || v2Value == null || Number(legacyValue) !== Number(v2Value)) {
+        metricMismatches.push({ itemUid: uid, field: legacy, legacyValue, v2Value });
+      }
+    }
+  }
+
+  const legacyObsCountByUid = new Map(
+    db.prepare('SELECT item_uid, COUNT(*) c FROM snapshots GROUP BY item_uid').all().map(r => [r.item_uid, r.c])
+  );
+  const packedObsCountByUid = new Map(
+    db.prepare('SELECT item_uid, SUM(observation_count) c FROM daily_packed_history GROUP BY item_uid').all().map(r => [r.item_uid, r.c])
+  );
+
+  let missingHistoricalObservations = 0;
+  const missingHistoricalObservationUids = [];
+  for (const [uid, legacyCount] of legacyObsCountByUid.entries()) {
+    const packedCount = packedObsCountByUid.get(uid) || 0;
+    if (packedCount < legacyCount) {
+      missingHistoricalObservations += (legacyCount - packedCount);
+      missingHistoricalObservationUids.push(uid);
+    }
+  }
+
+  // §4/§16.E: prefer the stable observationId identity (present on every
+  // observation written by the current appendObservation()) when available —
+  // it correctly distinguishes two real observations that legitimately land
+  // in the same second from an actual duplicate. Rows written before this
+  // round have no observationId; those fall back to the weaker time-based
+  // check, which is still a real (if less precise) duplicate signal.
+  let duplicateHistoricalObservations = 0;
+  const duplicateHistoricalObservationUids = [];
+  const globalObservationIds = new Set();
+  let malformedObservations = 0;
+  const malformedObservationUids = [];
+  const malformedObservationSamples = [];
+  const REQUIRED_OBSERVATION_FIELDS = [
+    'observationId', 'runId', 'time', 'price', 'views',
+    'likes', 'comments', 'shares', 'sold', 'rating', 'reviews'
+  ];
+  // Gap #3/#5 closure: item_uid -> Map<observationId, observation> and global
+  // observationId set to detect duplicates across ALL rows in daily_packed_history.
+  const observationIndex = new Map();
+  const obsRowDateMap = new Map(); // observationId -> date
+
+  for (const row of db.prepare('SELECT * FROM daily_packed_history').iterate()) {
+    let observations = [];
+    try {
+      observations = JSON.parse(row.observations_json || '[]');
+      if (!Array.isArray(observations)) observations = [];
+    } catch (_e) {
+      observations = [];
+    }
+
+    const seenTimesThisRow = new Set();
+    for (const o of observations) {
+      if (o && o.observationId != null) {
+        if (globalObservationIds.has(o.observationId)) {
+          duplicateHistoricalObservations += 1;
+          if (duplicateHistoricalObservationUids.length < 20) duplicateHistoricalObservationUids.push(row.item_uid);
+        } else {
+          globalObservationIds.add(o.observationId);
+        }
+      } else if (o && o.time) {
+        if (seenTimesThisRow.has(o.time)) {
+          duplicateHistoricalObservations += 1;
+          if (duplicateHistoricalObservationUids.length < 20) duplicateHistoricalObservationUids.push(row.item_uid);
+        } else {
+          seenTimesThisRow.add(o.time);
+        }
+      }
+
+      // Gap #5 closure: Schema completeness validation on every packed observation
+      if (!o || typeof o !== 'object') {
+        malformedObservations += 1;
+        if (!malformedObservationUids.includes(row.item_uid) && malformedObservationUids.length < 20) {
+          malformedObservationUids.push(row.item_uid);
+        }
+        if (malformedObservationSamples.length < 20) malformedObservationSamples.push({ itemUid: row.item_uid, date: row.date, reason: 'non-object observation' });
+      } else {
+        const missingKeys = REQUIRED_OBSERVATION_FIELDS.filter(k => !(k in o));
+        if (missingKeys.length > 0) {
+          malformedObservations += 1;
+          if (!malformedObservationUids.includes(row.item_uid) && malformedObservationUids.length < 20) {
+            malformedObservationUids.push(row.item_uid);
+          }
+          if (malformedObservationSamples.length < 20) {
+            malformedObservationSamples.push({ itemUid: row.item_uid, date: row.date, missingKeys });
+          }
+        }
+      }
+    }
+
+    if (!observationIndex.has(row.item_uid)) observationIndex.set(row.item_uid, new Map());
+    const byId = observationIndex.get(row.item_uid);
+    for (const o of observations) {
+      if (o && o.observationId != null) {
+        byId.set(o.observationId, o);
+        obsRowDateMap.set(o.observationId, row.date);
+      }
+    }
+  }
+
+  // Gap #3/#5 / Patch 2: exact per-observation identity + per-metric and timestamp comparison
+  // against the legacy source-of-truth.
+  let historyMissingByIdentity = 0;
+  const historyMissingByIdentityUids = [];
+  let historyMetricMismatches = 0;
+  const historyMetricMismatchSamples = [];
+  let historyTimestampMismatches = 0;
+  const historyTimestampMismatchSamples = [];
+
+  for (const snap of db.prepare('SELECT * FROM snapshots').iterate()) {
+    const expectedObservationId = `legacy:${snap.id}`;
+    const byId = observationIndex.get(snap.item_uid);
+    const obs = byId ? byId.get(expectedObservationId) : null;
+    if (!obs) {
+      historyMissingByIdentity += 1;
+      if (historyMissingByIdentityUids.length < 20) historyMissingByIdentityUids.push(snap.item_uid);
+      continue;
+    }
+    for (const { legacy, obs: obsField } of HISTORY_OBSERVATION_METRIC_FIELDS) {
+      const legacyValue = snap[legacy];
+      const obsValue = obs[obsField];
+      if (legacyValue == null && obsValue == null) continue; // both unpopulated — equal
+      if (legacyValue == null || obsValue == null || Number(legacyValue) !== Number(obsValue)) {
+        historyMetricMismatches += 1;
+        if (historyMetricMismatchSamples.length < 20) {
+          historyMetricMismatchSamples.push({ itemUid: snap.item_uid, observationId: expectedObservationId, field: legacy, legacyValue, obsValue });
+        }
+      }
+    }
+
+    // Gap #5 / Patch 2B: Timestamp Parity — compare legacy snapshot timestamp
+    // with the exact V2 observation timestamp (normalized to canonical UTC representation).
+    if (snap.created_at && obs.time) {
+      const snapIso = normalizeLegacyUtcTimestamp(snap.created_at);
+      if (snapIso) {
+        const snapDate = snapIso.slice(0, 10);
+        const snapTime = snapIso.slice(11, 19);
+        const obsDate = obsRowDateMap.get(expectedObservationId);
+        const obsTime = obs.time;
+        if (obsDate && (snapDate !== obsDate || snapTime !== obsTime)) {
+          historyTimestampMismatches += 1;
+          if (historyTimestampMismatchSamples.length < 20) {
+            historyTimestampMismatchSamples.push({
+              itemUid: snap.item_uid,
+              observationId: expectedObservationId,
+              legacyTimestamp: snap.created_at,
+              v2Date: obsDate,
+              v2Time: obsTime
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Gap #3 closure: a packed observation claiming a `legacy:<id>` identity
+  // that no real legacy snapshot row backs is an extra/orphaned observation
+  // (e.g. a corrupted or duplicated migration write).
+  const allLegacySnapshotIds = new Set(db.prepare('SELECT id FROM snapshots').all().map((r) => String(r.id)));
+  let historyExtraObservations = 0;
+  const historyExtraObservationUids = [];
+  for (const [uid, byId] of observationIndex.entries()) {
+    for (const obsId of byId.keys()) {
+      if (typeof obsId === 'string' && obsId.startsWith('legacy:') && !allLegacySnapshotIds.has(obsId.slice('legacy:'.length))) {
+        historyExtraObservations += 1;
+        if (historyExtraObservationUids.length < 20) historyExtraObservationUids.push(uid);
+      }
+    }
+  }
+
+  const legacyObservations = Array.from(legacyObsCountByUid.values()).reduce((a, b) => a + b, 0);
+  const packedObservations = Array.from(packedObsCountByUid.values()).reduce((a, b) => a + b, 0);
+
+  // §5/Gap #5: every history failure mode gates parityOk — duplicates/malformed
+  // observations, metric mismatches, and timestamp mismatches all gate parityOk.
+  const parityOk = missingCurrent.length === 0
+    && metricMismatches.length === 0
+    && missingHistoricalObservations === 0
+    && duplicateHistoricalObservations === 0
+    && malformedObservations === 0
+    && historyMissingByIdentity === 0
+    && historyExtraObservations === 0
+    && historyMetricMismatches === 0
+    && historyTimestampMismatches === 0;
+
+  return {
+    parityOk,
+    current: {
+      checked,
+      totalSnapshotItemUids: snapshotUids.length,
+      productCurrentItemUidCount: productCurrentUids.size,
+      missingCurrentCount: missingCurrent.length,
+      missingCurrent: missingCurrent.slice(0, 20), // capped sample, not a full dump
+      metricMismatchCount: metricMismatches.length,
+      metricMismatches: metricMismatches.slice(0, 20)
+    },
+    history: {
+      legacyObservations,
+      packedObservations,
+      missingHistoricalObservations,
+      missingHistoricalObservationUids: missingHistoricalObservationUids.slice(0, 20),
+      duplicateHistoricalObservations,
+      duplicateHistoricalObservationUids: duplicateHistoricalObservationUids.slice(0, 20),
+      malformedObservations,
+      malformedObservationUids: malformedObservationUids.slice(0, 20),
+      // Gap #3/#5 closure: exact per-observation identity + per-metric and timestamp comparison.
+      historyMissingByIdentity,
+      historyMissingByIdentityUids: historyMissingByIdentityUids.slice(0, 20),
+      historyExtraObservations,
+      historyExtraObservationUids: historyExtraObservationUids.slice(0, 20),
+      historyMetricMismatches,
+      historyMetricMismatchSamples: historyMetricMismatchSamples.slice(0, 20),
+      historyTimestampMismatches,
+      historyTimestampMismatchSamples: historyTimestampMismatchSamples.slice(0, 20)
+    },
+    checkedAt: new Date().toISOString()
+  };
+}
+
+/**
+ * DB Health Monitor (Simplification Round #16) — replaces the mandatory 10M
+ * synthetic benchmark as a release gate. Reports the metrics that actually
+ * matter for "is row growth under control", not a one-off performance claim.
+ */
+function getDatabaseHealth() {
+  const fs = require('fs');
+  const dbSizeBytes = fs.existsSync(DB_PATH) ? fs.statSync(DB_PATH).size : 0;
+
+  const productCurrentRows = db.prepare('SELECT COUNT(*) c FROM product_current').get().c;
+  const dailyHistoryStats = db.prepare('SELECT COUNT(*) c, AVG(observation_count) avgObs, MAX(observation_count) maxObs, SUM(observation_count) totalObs FROM daily_packed_history').get();
+  const legacySnapshotRows = db.prepare('SELECT COUNT(*) c FROM snapshots').get().c;
+  const weeklySummaryRows = db.prepare('SELECT COUNT(*) c FROM weekly_summary').get().c;
+  // §15: pending V2 repair count — dual-write failures recorded by
+  // recordV2WriteFailure() that repairPendingV2WriteFailures() hasn't
+  // resolved yet. A non-zero count here means product_current/daily_packed_history
+  // is currently missing data that legacy `snapshots` has, independent of the
+  // full checkV2Parity() scan.
+  const pendingV2RepairCount = db.prepare("SELECT COUNT(*) c FROM v2_write_failures WHERE status = 'pending'").get().c;
+
+  const t0 = process.hrtime.bigint();
+  db.prepare('SELECT * FROM product_current ORDER BY rank_score DESC LIMIT 1').get();
+  const representativeQueryLatencyMs = Number((Number(process.hrtime.bigint() - t0) / 1e6).toFixed(3));
+
+  return {
+    dbSizeMB: Number((dbSizeBytes / (1024 * 1024)).toFixed(2)),
+    productCurrentRowCount: productCurrentRows,
+    dailyPackedHistoryRowCount: dailyHistoryStats.c,
+    packedObservationCount: dailyHistoryStats.totalObs || 0,
+    avgObservationsPerDailyRow: Number((dailyHistoryStats.avgObs || 0).toFixed(2)),
+    maxObservationsInDailyRow: dailyHistoryStats.maxObs || 0,
+    legacySnapshotRowCount: legacySnapshotRows,
+    weeklySummaryRowCount: weeklySummaryRows, // deprecated table, reported for visibility only
+    pendingV2RepairCount,
+    representativeIndexedQueryLatencyMs: representativeQueryLatencyMs,
+    checkedAt: new Date().toISOString()
+  };
+}
+
+// ==================== Social Bot Persistent Scheduling State (P0-7) ====================
+
+const socialBotStmt = {
+  reserveWindow: db.prepare(`
+    INSERT INTO social_bot_state (bot_key, scheduled_window, query_key, status)
+    VALUES (@botKey, @scheduledWindow, @queryKey, 'pending')
+  `),
+  markDispatched: db.prepare(`UPDATE social_bot_state SET status='dispatched', run_id=@runId, updated_at=CURRENT_TIMESTAMP WHERE id=@id`),
+  markFailed: db.prepare(`UPDATE social_bot_state SET status='failed', error_message=@errorMessage, updated_at=CURRENT_TIMESTAMP WHERE id=@id`),
+  deleteById: db.prepare('DELETE FROM social_bot_state WHERE id = ?'),
+  findLastDispatched: db.prepare(`
+    SELECT * FROM social_bot_state WHERE bot_key = ? AND status = 'dispatched' ORDER BY scheduled_window DESC LIMIT 1
+  `),
+  countDispatched: db.prepare(`SELECT COUNT(*) c FROM social_bot_state WHERE bot_key = ? AND status = 'dispatched'`)
+};
+
+/**
+ * Atomically reserves a (bot_key, scheduled_window, query_key) slot. Returns the
+ * new row id, or null if this window/query was already reserved/dispatched by a
+ * prior tick (before or after a restart — this table is the persistent source of
+ * truth, unlike the old in-memory Map/Set). The UNIQUE constraint is what makes
+ * this safe under concurrent ticks.
+ */
+function reserveSocialBotWindow(botKey, scheduledWindow, queryKey) {
+  try {
+    const info = socialBotStmt.reserveWindow.run({ botKey, scheduledWindow, queryKey });
+    return info.lastInsertRowid;
+  } catch (err) {
+    if (String(err.code || '').startsWith('SQLITE_CONSTRAINT')) return null; // Already reserved.
+    throw err;
+  }
+}
+
+function markSocialBotDispatched(id, runId) { socialBotStmt.markDispatched.run({ id, runId }); }
+function markSocialBotFailed(id, errorMessage) { socialBotStmt.markFailed.run({ id, errorMessage: String(errorMessage || '') }); }
+function releaseSocialBotWindow(id) { socialBotStmt.deleteById.run(id); }
+
+/**
+ * Crash-safety sweep (Simplification Round #20): if the process crashed after
+ * reserveSocialBotWindow() inserted a 'pending' row but before markSocialBot
+ * Dispatched()/releaseSocialBotWindow() ran, that row would otherwise block
+ * the UNIQUE(bot_key, scheduled_window, query_key) constraint forever — the
+ * window could never be retried. Any 'pending' row older than thresholdMs is
+ * assumed abandoned and deleted so the next tick can legitimately re-reserve
+ * and re-enqueue it exactly once.
+ */
+function recoverStalePendingSocialBotWindows(thresholdMs = 5 * 60 * 1000) {
+  // SQLite's CURRENT_TIMESTAMP formats as 'YYYY-MM-DD HH:MM:SS' (UTC, no 'T'/'Z'/ms);
+  // the cutoff must match exactly or the string comparison sorts incorrectly.
+  const cutoff = new Date(Date.now() - thresholdMs).toISOString().replace('T', ' ').slice(0, 19);
+  const info = db.prepare("DELETE FROM social_bot_state WHERE status = 'pending' AND created_at < ?").run(cutoff);
+  if (info.changes > 0) {
+    console.warn(`[SocialBotRecovery] Cleared ${info.changes} stale pending window(s) older than ${thresholdMs}ms so they can be retried.`);
+  }
+  return { cleared: info.changes };
+}
+function getLastDispatchedSocialBotWindow(botKey) { return socialBotStmt.findLastDispatched.get(botKey); }
+function countDispatchedSocialBotRuns(botKey) { return socialBotStmt.countDispatched.get(botKey).c; }
+
 module.exports = {
-  getAllPlatforms, createRun, getRunById, getAllRuns, updateRun, deleteRun,
-  insertSnapshots, getLatestSnapshots, getSnapshotHistory, getSnapshotsByRunId,
+  getAllPlatforms, createRun, getRunById, getQueuedRuns, getAllRuns, getRunsByStatus, getChildRuns, updateRun, deleteRun,
+  deleteItem, deleteAllItems,
+  reserveSocialBotWindow, markSocialBotDispatched, markSocialBotFailed, releaseSocialBotWindow,
+  getLastDispatchedSocialBotWindow, countDispatchedSocialBotRuns, recoverStalePendingSocialBotWindows,
+  insertSnapshots, getLatestSnapshots, getLatestSnapshotByUid, getSnapshotHistory, getSnapshotsByRunId, getRunItems, backfillRunResultItems,
+  getProductCurrent, getProductCurrentByUid, getProductHistory, getProductHistoryWithMetadata, getProductWeekly, backfillSnapshotsToV2, getDatabaseHealth, formatVietnamTime,
+  getPendingV2WriteFailures, repairPendingV2WriteFailures, checkV2Parity, normalizeLegacyUtcTimestamp,
   getSnapshotsMissingEtsyImages, updateSnapshotImage,
   getStats, getRunStats,
   createMarketplaceAccount, getMarketplaceAccounts, getMarketplaceStorageState, deleteMarketplaceAccount,
   createMarketplaceProxy, getMarketplaceProxies, getMarketplaceProxyUrl, assignMarketplaceAccountProxy, deleteMarketplaceProxy,
   createMarketplaceCapture, getCachedMarketplaceCapture, getMarketplaceCapture, getMarketplaceCaptures,
-  createMarketplaceCaptureSchedule, getMarketplaceCaptureSchedules, getDueMarketplaceCaptureSchedules, completeMarketplaceCaptureSchedule, getMarketplaceCaptureScheduleRuns, deleteMarketplaceCaptureSchedule,
+  createMarketplaceCaptureSchedule, getMarketplaceCaptureSchedules, getDueMarketplaceCaptureSchedules, completeMarketplaceCaptureSchedule, getMarketplaceCaptureScheduleRuns, deleteMarketplaceCaptureSchedule, toggleMarketplaceCaptureSchedule,
+  claimMarketplaceCaptureSchedule, releaseMarketplaceCaptureScheduleClaim, renewMarketplaceCaptureScheduleClaim,
 };

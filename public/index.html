@@ -3,10 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
   <title>Apify Collector — Product Intelligence</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=2.2.0">
 </head>
 <body>
 
@@ -22,10 +23,10 @@
         <button class="btn-topbar" onclick="showMarketplaceAccountsModal()">
           <i data-feather="key"></i> Marketplace Accounts
         </button>
-        <button class="btn-topbar" onclick="showCaptureHtmlModal()">
+        <button class="btn-topbar d-none" id="btn-capture-html" onclick="showCaptureHtmlModal()">
           <i data-feather="code"></i> Capture HTML
         </button>
-        <button class="btn-topbar" onclick="showSavedCapturesModal()">
+        <button class="btn-topbar d-none" id="btn-saved-captures" onclick="showSavedCapturesModal()">
           <i data-feather="archive"></i> Saved Captures
         </button>
         <button class="btn-topbar" onclick="showMarketplaceSchedulesModal()">
@@ -47,30 +48,35 @@
   <!-- ===== Filters Bar ===== -->
   <div class="filters-bar">
     <div class="filters-inner">
-      <!-- Search -->
-      <div class="filter-search">
-        <i data-feather="search" class="filter-icon"></i>
-        <input type="text" id="search-input" placeholder="Search products, brands, keywords..." class="filter-input">
+      <!-- Row 1: Search & Controls -->
+      <div class="filters-row-top">
+        <div class="filter-search">
+          <i data-feather="search" class="filter-icon"></i>
+          <input type="text" id="search-input" placeholder="Search products, brands, keywords..." class="filter-input">
+        </div>
+        <div class="filter-sort d-flex align-items-center gap-2">
+          <select id="sort-select" class="filter-select" onchange="applyFilters()">
+            <option value="recent">Most Recent</option>
+            <option value="likes-desc">Most Liked</option>
+            <option value="comments-desc">Most Commented</option>
+            <option value="shares-desc">Most Shared</option>
+            <option value="price-asc">Price: Low → High</option>
+            <option value="price-desc">Price: High → Low</option>
+            <option value="growth">Most Growth</option>
+          </select>
+          <button class="btn btn-outline-danger btn-sm px-2 d-flex align-items-center gap-1" onclick="deleteAllProducts()" title="Xóa toàn bộ sản phẩm đã cào trong danh sách">
+            <i data-feather="trash-2" style="width:14px;height:14px"></i> <span>Xóa Sản Phẩm</span>
+          </button>
+        </div>
       </div>
 
-      <!-- Platform pills -->
-      <div class="filter-pills" id="filter-pills">
-        <button class="pill active" data-filter="all" onclick="filterByPlatform('all', this)">
-          <span class="pill-dot" style="background:#666"></span> All
-        </button>
-      </div>
-
-      <!-- Sort -->
-      <div class="filter-sort">
-        <select id="sort-select" class="filter-select" onchange="applyFilters()">
-          <option value="recent">Most Recent</option>
-          <option value="likes-desc">Most Liked</option>
-          <option value="comments-desc">Most Commented</option>
-          <option value="shares-desc">Most Shared</option>
-          <option value="price-asc">Price: Low → High</option>
-          <option value="price-desc">Price: High → Low</option>
-          <option value="growth">Most Growth</option>
-        </select>
+      <!-- Row 2: Platform pills (full width wrap, no horizontal scroll) -->
+      <div class="filter-pills-row">
+        <div class="filter-pills" id="filter-pills">
+          <button class="pill active" data-filter="all" onclick="filterByPlatform('all', this)">
+            <span class="pill-dot" style="background:#666"></span> All
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -170,7 +176,7 @@
             <div class="col-md-8"><label class="filter-label">Account label</label><input id="marketplace-account-label" class="form-control" maxlength="100" placeholder="e.g. US research account"></div>
           </div>
           <div class="mb-3"><label class="filter-label">SOCKS5 proxy (optional)</label><select id="marketplace-account-proxy" class="form-select"><option value="">No proxy</option></select><small class="text-muted">Assign one stable proxy profile to this account.</small></div>
-          <div class="mb-3"><label class="filter-label">Cookie hoặc browser storage state</label><textarea id="marketplace-account-state" class="form-control font-monospace" rows="6" placeholder='Dán một cookie: sessionid=...  hoặc JSON cookie / Playwright storage state'></textarea><small class="text-muted">Một cookie Etsy được tự gán domain <code>.etsy.com</code>; không cần dán cả storage state.</small></div>
+          <div class="mb-3"><label class="filter-label">Cookie hoặc browser storage state</label><textarea id="marketplace-account-state" class="form-control font-monospace" rows="6" placeholder='Dán một cookie: sessionid=...  hoặc JSON cookie / Playwright storage state'></textarea><small id="marketplace-account-cookie-hint" class="text-muted"></small></div>
           <div class="d-flex gap-2 align-items-center mb-2">
             <button class="btn btn-outline-primary btn-sm" onclick="startMarketplaceBrowserLogin()"><i data-feather="log-in" style="width:14px"></i> Sign in with browser</button>
             <button id="marketplace-login-confirm" class="btn btn-success btn-sm d-none" onclick="confirmMarketplaceBrowserLogin()"><i data-feather="check" style="width:14px"></i> I have signed in</button>
@@ -289,7 +295,7 @@
     </div>
   </div>
 
-  <!-- ===== Saved HTML Captures Modal ===== -->
+<!-- ===== Saved HTML Captures Modal ===== -->
   <div class="modal fade" id="saved-captures-modal" tabindex="-1">
     <div class="modal-dialog modal-xl modal-dialog-scrollable">
       <div class="modal-content border-0 shadow-lg">
@@ -305,16 +311,99 @@
     </div>
   </div>
 
+  <!-- ===== Automated Schedules Modal ===== -->
   <div class="modal fade" id="marketplace-schedules-modal" tabindex="-1">
-    <div class="modal-dialog modal-lg modal-dialog-scrollable"><div class="modal-content border-0 shadow-lg">
-      <div class="modal-header border-0 pb-0"><h5 class="modal-title fw-bold"><i data-feather="clock" class="me-2 text-primary"></i>Scheduled Etsy Captures</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-      <div class="modal-body">
-        <p class="small text-muted">Each run discovers up to 30 Etsy listings for the keyword, then captures them sequentially on the server.</p>
-        <div class="row g-2 mb-2"><div class="col-md-7"><label class="filter-label">Keyword</label><input id="marketplace-schedule-keyword" class="form-control" maxlength="200" placeholder="e.g. lavender press on nails"></div><div class="col-md-5"><label class="filter-label">Saved Etsy account (optional)</label><select id="marketplace-schedule-account" class="form-select"><option value="">Public / no login</option></select></div></div>
-        <div class="row g-2 mb-2"><div class="col-md-4"><label class="filter-label">Schedule</label><select id="marketplace-schedule-type" class="form-select" onchange="updateMarketplaceScheduleTimeFields()"><option value="interval">Every X hours</option><option value="daily">Daily at a time</option><option value="once">One time at date &amp; time</option></select></div><div class="col-md-4" id="marketplace-schedule-hours-wrap"><label class="filter-label">Repeat every (hours)</label><input id="marketplace-schedule-every-hours" class="form-control" type="number" min="1" max="168" value="24"></div><div class="col-md-4 d-none" id="marketplace-schedule-time-wrap"><label class="filter-label">Daily time (Vietnam)</label><input id="marketplace-schedule-daily-time" class="form-control" type="time" value="09:00"></div><div class="col-md-4 d-none" id="marketplace-schedule-once-wrap"><label class="filter-label">Date &amp; time (Vietnam)</label><input id="marketplace-schedule-once-datetime" class="form-control" type="datetime-local"></div><div class="col-md-4"><label class="filter-label">Dropdown capture</label><select id="marketplace-schedule-variant-mode" class="form-select"><option value="base">Base product</option><option value="all">All dropdown variants</option></select></div><div class="col-md-4"><label class="filter-label">Max variants/listing</label><input id="marketplace-schedule-max-variants" class="form-control" type="number" min="1" max="250" value="150"></div></div>
-        <button class="btn btn-primary btn-sm" onclick="saveMarketplaceSchedule()"><i data-feather="calendar" style="width:14px"></i> Save schedule</button><div id="marketplace-schedule-status" class="small mt-2"></div><hr><div id="marketplace-schedules-list" class="small text-muted">Loading...</div>
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+      <div class="modal-content border-0 shadow-lg">
+        <div class="modal-header border-0 pb-0">
+          <h5 class="modal-title fw-bold"><i data-feather="clock" class="me-2 text-primary"></i>Lên Lịch Crawl Tự Động (Automated Schedules)</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-muted mb-3">Thiết lập lịch tự động cào theo chu kỳ cho bất kỳ nền tảng nào. Hệ thống sẽ tự động xếp hàng và điều phối tài nguyên an toàn qua Resource Scheduler.</p>
+          
+          <div class="bg-light p-3 rounded border mb-3">
+            <div class="row g-2 mb-2">
+              <div class="col-md-4">
+                <label class="filter-label">Nền tảng (Platform)</label>
+                <select id="marketplace-schedule-platform" class="form-select" onchange="onSchedulePlatformChange()">
+                  <option value="amazon">📦 Amazon</option>
+                  <option value="ebay">🏷️ eBay Sold</option>
+                  <option value="etsy" selected>🧶 Etsy</option>
+                  <option value="shopify">🛍️ Shopify</option>
+                  <option value="tiktok_shop">🎵 TikTok Shop</option>
+                  <option value="google_shopping">🛒 Google Shopping</option>
+                  <option value="facebook_ads">📢 Facebook Ads</option>
+                  <option value="facebook_posts">👥 Facebook Posts</option>
+                  <option value="instagram">📷 Instagram</option>
+                  <option value="pinterest">📌 Pinterest</option>
+                  <option value="reddit">🔴 Reddit</option>
+                  <option value="twitter">🐦 X / Twitter</option>
+                </select>
+              </div>
+              <div class="col-md-5">
+                <label class="filter-label" id="marketplace-schedule-keyword-label">Từ khóa / Query</label>
+                <input id="marketplace-schedule-keyword" class="form-control" maxlength="200" placeholder="e.g. vintage hoodie, custom mug...">
+              </div>
+              <div class="col-md-3">
+                <label class="filter-label">Số lượng item (Max Items)</label>
+                <input id="marketplace-schedule-max-items" class="form-control" type="number" min="1" max="100" value="30">
+              </div>
+            </div>
+
+            <div class="row g-2 mb-2">
+              <div class="col-md-4">
+                <label class="filter-label">Loại lịch (Schedule Type)</label>
+                <select id="marketplace-schedule-type" class="form-select" onchange="updateMarketplaceScheduleTimeFields()">
+                  <option value="interval">Lặp lại mỗi X giờ</option>
+                  <option value="daily">Hàng ngày vào giờ cố định</option>
+                  <option value="once">Chạy 1 lần vào thời điểm</option>
+                </select>
+              </div>
+              <div class="col-md-4" id="marketplace-schedule-hours-wrap">
+                <label class="filter-label">Chu kỳ lặp lại (giờ)</label>
+                <input id="marketplace-schedule-every-hours" class="form-control" type="number" min="1" max="168" value="3">
+              </div>
+              <div class="col-md-4 d-none" id="marketplace-schedule-time-wrap">
+                <label class="filter-label">Giờ chạy hàng ngày (Giờ VN)</label>
+                <input id="marketplace-schedule-daily-time" class="form-control" type="time" value="09:00">
+              </div>
+              <div class="col-md-4 d-none" id="marketplace-schedule-once-wrap">
+                <label class="filter-label">Thời điểm chạy (Giờ VN)</label>
+                <input id="marketplace-schedule-once-datetime" class="form-control" type="datetime-local">
+              </div>
+
+              <!-- Etsy Specific Controls -->
+              <div class="col-md-4 d-none" id="marketplace-schedule-account-wrap">
+                <label class="filter-label">Tài khoản Etsy (Tùy chọn)</label>
+                <select id="marketplace-schedule-account" class="form-select"><option value="">Public / no login</option></select>
+              </div>
+              <div class="col-md-4 d-none" id="marketplace-schedule-variant-wrap">
+                <label class="filter-label">Dropdown Capture</label>
+                <select id="marketplace-schedule-variant-mode" class="form-select" onchange="updateScheduleVariantControls()">
+                  <option value="base">Base product</option>
+                  <option value="all">All dropdown variants</option>
+                </select>
+              </div>
+              <div class="col-md-4 d-none" id="marketplace-schedule-max-variants-wrap">
+                <label class="filter-label">Max variants/listing</label>
+                <input id="marketplace-schedule-max-variants" class="form-control" type="number" min="1" max="250" value="150">
+              </div>
+            </div>
+
+            <div class="d-flex justify-content-between align-items-center mt-3 pt-2 border-top">
+              <button class="btn btn-primary btn-sm px-3" onclick="saveMarketplaceSchedule()">
+                <i data-feather="plus" style="width:14px" class="me-1"></i> Lưu Lịch Crawl
+              </button>
+              <div id="marketplace-schedule-status" class="small"></div>
+            </div>
+          </div>
+
+          <h6 class="fw-bold mb-2 text-dark"><i data-feather="list" class="me-1 text-secondary" style="width:15px"></i> Danh Sách Lịch Đang Thiết Lập:</h6>
+          <div id="marketplace-schedules-list" class="small text-muted">Đang tải danh sách...</div>
+        </div>
       </div>
-    </div></div>
+    </div>
   </div>
 
   <!-- ===== Item Detail Modal ===== -->
@@ -360,6 +449,11 @@
               </tbody>
             </table>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ===== User Journey Modal ===== -->
   <div class="modal fade" id="user-journey-modal" tabindex="-1">
     <div class="modal-dialog modal-lg">
@@ -388,7 +482,7 @@
               <input id="uj-keyword" class="form-control" placeholder="e.g. press on nails, custom mug..." value="press on nails">
             </div>
             <div class="col-md-3">
-              <label class="filter-label fw-bold">Mã ZIP (Mỹ)</label>
+              <label class="filter-label fw-bold">Mã ZIP Mỹ (Location)</label>
               <input id="uj-zipcode" class="form-control" placeholder="90210" value="90210">
             </div>
           </div>
@@ -418,6 +512,6 @@
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
-  <script src="app.js"></script>
+  <script src="/app.js?v=3.5.0"></script>
 </body>
 </html>

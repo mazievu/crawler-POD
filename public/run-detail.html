@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Run Details — Crawler POD</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
+  <style>
+    :root {
+      --bg-surface: #f8fafc;
+      --bg-card: #ffffff;
+      --border-color: #e2e8f0;
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --color-primary: #2563eb;
+      --color-success: #16a34a;
+      --color-danger: #dc2626;
+      --color-warning: #d97706;
+    }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg-surface);
+      color: var(--text-main);
+      min-height: 100vh;
+    }
+    .card {
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      background: var(--bg-card);
+    }
+    .metric-card {
+      background: #f8fafc;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 14px 18px;
+    }
+    .metric-val {
+      font-size: 1.5rem;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+    .font-mono {
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .status-badge {
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 20px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-done { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .status-failed { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+    .status-running { background: #e0f2fe; color: #075985; border: 1px solid #bae6fd; }
+    .status-queued { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
+    .product-img {
+      width: 48px;
+      height: 48px;
+      object-fit: cover;
+      border-radius: 6px;
+      border: 1px solid #e2e8f0;
+      background: #f1f5f9;
+    }
+    .code-box {
+      background: #0f172a;
+      color: #f8fafc;
+      border-radius: 8px;
+      padding: 16px;
+      font-size: 0.85rem;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 1080;
+    }
+  </style>
+</head>
+<body class="py-4">
+  <div class="container-fluid px-lg-5">
+    
+    <!-- Top Header -->
+    <div class="d-flex flex-wrap justify-content-between align-items-center mb-4 pb-3 border-bottom gap-3">
+      <div>
+        <nav aria-label="breadcrumb">
+          <ol class="breadcrumb mb-1 fs-14">
+            <li class="breadcrumb-item"><a href="/" class="text-decoration-none text-muted">Dashboard</a></li>
+            <li class="breadcrumb-item"><a href="/#jobs" class="text-decoration-none text-muted">Jobs History</a></li>
+            <li class="breadcrumb-item active text-dark fw-semibold" id="breadcrumb-run">Run #...</li>
+          </ol>
+        </nav>
+        <h3 class="fw-bold mb-0 d-flex align-items-center gap-2" id="header-title">
+          <span>Chi Tiết Lượt Cào</span>
+          <span id="header-status-badge" class="status-badge status-queued">Loading...</span>
+        </h3>
+      </div>
+      <div class="d-flex gap-2 align-items-center">
+        <button class="btn btn-outline-secondary btn-sm px-3 d-flex align-items-center gap-1" id="btn-copy-raw" onclick="copyDiagnosticJson()">
+          <i data-feather="copy" style="width: 14px;"></i> Copy JSON Dữ Liệu
+        </button>
+        <a href="#" class="btn btn-outline-primary btn-sm px-3 d-flex align-items-center gap-1" id="btn-export-csv" target="_blank">
+          <i data-feather="download" style="width: 14px;"></i> Xuất File CSV
+        </a>
+        <button class="btn btn-outline-danger btn-sm px-3 d-flex align-items-center gap-1" onclick="deleteAllItemsInThisRun()">
+          <i data-feather="trash-2" style="width: 14px;"></i> Xóa Hết SP Của Run
+        </button>
+        <a href="/" class="btn btn-primary btn-sm px-3 d-flex align-items-center gap-1">
+          <i data-feather="arrow-left" style="width: 14px;"></i> Quay Lại Dashboard
+        </a>
+      </div>
+    </div>
+
+    <!-- Loading State -->
+    <div id="loading-spinner" class="text-center py-5">
+      <div class="spinner-border text-primary mb-3" role="status"></div>
+      <p class="text-muted">Đang tải thông tin lượt cào từ hệ thống...</p>
+    </div>
+
+    <!-- Error on Loading Run -->
+    <div id="loading-error" class="card p-4 text-center d-none">
+      <i data-feather="alert-circle" class="text-danger mx-auto mb-2" style="width: 48px; height: 48px;"></i>
+      <h5 class="text-danger fw-bold">Không tìm thấy thông tin lượt cào</h5>
+      <p class="text-muted mb-3" id="loading-error-msg">Lượt cào không tồn tại hoặc đã bị xóa.</p>
+      <div><a href="/" class="btn btn-outline-primary btn-sm">Về trang chủ</a></div>
+    </div>
+
+    <!-- Main Content Container -->
+    <div id="run-content" class="d-none">
+      
+      <!-- Meta Overview Card -->
+      <div class="card p-4 mb-4">
+        <div class="row g-3">
+          <div class="col-6 col-md-3">
+            <span class="text-muted fs-13 d-block">Nền tảng</span>
+            <span class="fw-semibold fs-15 d-flex align-items-center gap-1" id="meta-platform">-</span>
+          </div>
+          <div class="col-6 col-md-3">
+            <span class="text-muted fs-13 d-block">Từ khóa tìm kiếm (Query)</span>
+            <span class="fw-semibold fs-15 text-break" id="meta-query">-</span>
+          </div>
+          <div class="col-6 col-md-3">
+            <span class="text-muted fs-13 d-block">Backend thực thi</span>
+            <span class="fw-semibold fs-15" id="meta-backend">-</span>
+          </div>
+          <div class="col-6 col-md-3">
+            <span class="text-muted fs-13 d-block">Thời gian cào</span>
+            <span class="fw-semibold fs-15" id="meta-time">-</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- FAILED VIEW -->
+      <div id="view-failed" class="d-none">
+        <div class="card border-danger mb-4" style="border-left: 5px solid #dc2626 !important;">
+          <div class="card-body p-4">
+            <div class="d-flex align-items-start gap-3">
+              <div class="p-2 rounded-circle bg-danger-subtle text-danger">
+                <i data-feather="alert-octagon" style="width: 28px; height: 28px;"></i>
+              </div>
+              <div class="flex-grow-1">
+                <h5 class="fw-bold text-danger mb-1">Lượt cào thất bại (Execution Failed)</h5>
+                <p class="text-muted fs-14 mb-3">Hệ thống đã tự động ghi nhận nguyên nhân lỗi chi tiết bên dưới:</p>
+                
+                <div class="p-3 bg-light border rounded mb-3">
+                  <span class="text-muted fs-13 d-block mb-1">THÔNG BÁO LỖI (ERROR MESSAGE):</span>
+                  <div class="fw-bold text-danger fs-15 font-mono" id="failed-error-msg">-</div>
+                </div>
+
+                <div class="p-3 bg-light border rounded mb-3" id="failed-hint-box">
+                  <span class="fw-semibold text-dark fs-14 d-block mb-1">💡 Hướng Dẫn & Gợi Ý Khắc Phục:</span>
+                  <div class="text-secondary fs-14" id="failed-error-hint">-</div>
+                </div>
+
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                  <span class="fw-semibold fs-14">Toàn bộ dữ liệu chẩn đoán (Diagnostic Snapshot):</span>
+                  <button class="btn btn-outline-secondary btn-sm py-0 px-2 fs-12" onclick="copyDiagnosticJson()">
+                    <i data-feather="copy" style="width: 12px;"></i> Copy Snapshot
+                  </button>
+                </div>
+                <pre class="code-box font-mono mb-0" id="failed-raw-json">{}</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- DONE VIEW -->
+      <div id="view-done" class="d-none">
+        
+        <!-- Metrics Counters -->
+        <div class="row g-3 mb-4">
+          <div class="col-6 col-md-3">
+            <div class="metric-card">
+              <span class="text-muted fs-13 d-block">Tổng số sản phẩm</span>
+              <span class="metric-val text-primary" id="metric-total">0</span>
+            </div>
+          </div>
+          <div class="col-6 col-md-3">
+            <div class="metric-card">
+              <span class="text-muted fs-13 d-block">Sản phẩm mới</span>
+              <span class="metric-val text-success" id="metric-new">0</span>
+            </div>
+          </div>
+          <div class="col-6 col-md-3">
+            <div class="metric-card">
+              <span class="text-muted fs-13 d-block">Đang bán (Active)</span>
+              <span class="metric-val text-info" id="metric-active">0</span>
+            </div>
+          </div>
+          <div class="col-6 col-md-3">
+            <div class="metric-card">
+              <span class="text-muted fs-13 d-block">Ngừng bán (Dropped)</span>
+              <span class="metric-val text-secondary" id="metric-dropped">0</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Items Table Card -->
+        <div class="card mb-4">
+          <div class="card-header bg-white py-3 border-bottom d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <h6 class="fw-bold mb-0">Danh Sách Sản Phẩm Thu Thập Được (<span id="table-items-count">0</span> items)</h6>
+            <div class="d-flex gap-2">
+              <input type="text" id="filter-input" class="form-control form-control-sm" placeholder="Tìm theo tên sản phẩm / shop..." style="max-width: 260px;" oninput="filterItemsTable()">
+            </div>
+          </div>
+          <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0" id="items-table">
+              <thead class="table-light fs-13 text-muted">
+                <tr>
+                  <th style="width: 50px;" class="text-center">#</th>
+                  <th style="width: 60px;">Ảnh</th>
+                  <th>Tên sản phẩm (Title)</th>
+                  <th style="width: 140px;">Shop / Tác giả</th>
+                  <th style="width: 110px;">Giá bán</th>
+                  <th style="width: 110px;">Đánh giá</th>
+                  <th style="width: 120px;">Lượt bán / Tương tác</th>
+                  <th style="width: 90px;" class="text-center">Trạng thái</th>
+                  <th style="width: 60px;" class="text-center">Link</th>
+                  <th style="width: 60px;" class="text-center">Xóa</th>
+                </tr>
+              </thead>
+              <tbody id="items-tbody" class="fs-14">
+                <!-- Rendered dynamically -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- Copy Toast Notification -->
+  <div class="toast-container">
+    <div id="copyToast" class="toast align-items-center text-bg-dark border-0" role="alert" aria-live="assertive" aria-atomic="true">
+      <div class="d-flex">
+        <div class="toast-body">
+          ✅ Đã sao chép dữ liệu vào Clipboard!
+        </div>
+        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    let currentRun = null;
+    let currentItems = [];
+
+    function getRunIdFromUrl() {
+      const params = new URLSearchParams(window.location.search);
+      return params.get('id') || params.get('runId');
+    }
+
+    async function loadRunDetails() {
+      const runId = getRunIdFromUrl();
+      if (!runId) {
+        showError('Không có Run ID trong đường dẫn URL (ví dụ: ?id=1966)');
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/runs/${runId}`);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: Không tìm thấy lượt cào #${runId}`);
+        }
+        currentRun = await res.json();
+        renderRun(currentRun);
+      } catch (err) {
+        showError(err.message);
+      }
+    }
+
+    function showError(msg) {
+      document.getElementById('loading-spinner').classList.add('d-none');
+      document.getElementById('loading-error').classList.remove('d-none');
+      document.getElementById('loading-error-msg').textContent = msg;
+    }
+
+    function renderRun(run) {
+      document.getElementById('loading-spinner').classList.add('d-none');
+      document.getElementById('run-content').classList.remove('d-none');
+
+      // Breadcrumb & Title
+      document.getElementById('breadcrumb-run').textContent = `Run #${run.id}`;
+      document.getElementById('header-title').querySelector('span').textContent = `Lượt Cào #${run.id} — ${run.platform?.toUpperCase() || ''}`;
+
+      // Status Badge
+      const statusEl = document.getElementById('header-status-badge');
+      statusEl.className = 'status-badge';
+      if (run.status === 'done') {
+        statusEl.classList.add('status-done');
+        statusEl.innerHTML = `<i data-feather="check-circle" style="width: 14px;"></i> Hoàn Thành (Done)`;
+      } else if (run.status === 'failed') {
+        statusEl.classList.add('status-failed');
+        statusEl.innerHTML = `<i data-feather="alert-octagon" style="width: 14px;"></i> Thất Bại (Failed)`;
+      } else if (run.status === 'running') {
+        statusEl.classList.add('status-running');
+        statusEl.innerHTML = `<i data-feather="loader" style="width: 14px;"></i> Đang Chạy (Running)`;
+      } else {
+        statusEl.classList.add('status-queued');
+        statusEl.innerHTML = `<i data-feather="clock" style="width: 14px;"></i> Chờ Xử Lý (Queued)`;
+      }
+
+      // Meta Info
+      document.getElementById('meta-platform').textContent = run.platform || '-';
+      document.getElementById('meta-query').textContent = run.query || '-';
+      document.getElementById('meta-backend').innerHTML = `<span class="badge bg-secondary">${run.active_backend || run.backend_kind || 'system'}</span>`;
+      document.getElementById('meta-time').textContent = run.created_at ? new Date(run.created_at).toLocaleString() : '-';
+
+      // Export CSV Button
+      const exportBtn = document.getElementById('btn-export-csv');
+      exportBtn.href = `/api/export/${run.id}?format=csv`;
+
+      // Branch View
+      if (run.status === 'failed') {
+        renderFailedView(run);
+      } else {
+        renderDoneView(run);
+      }
+
+      feather.replace();
+    }
+
+    function renderFailedView(run) {
+      document.getElementById('view-failed').classList.remove('d-none');
+      document.getElementById('view-done').classList.add('d-none');
+
+      const errorMsg = run.error_message || 'Không có thông báo lỗi cụ thể.';
+      document.getElementById('failed-error-msg').textContent = errorMsg;
+
+      // Smart Root Cause Hints
+      const hintBox = document.getElementById('failed-error-hint');
+      if (/user-or-token-not-found|token is not valid|unauthorized/i.test(errorMsg)) {
+        hintBox.innerHTML = `🔑 <strong>Lỗi Xác Thực API:</strong> API Token trong file <code>.env</code> bị sai hoặc đã hết hạn. Hãy cập nhật lại APIFY_TOKEN hợp lệ và khởi động lại server.`;
+      } else if (/fetch failed|ECONNREFUSED/i.test(errorMsg)) {
+        hintBox.innerHTML = `🌐 <strong>Lỗi Kết Nối Mạng / DNS:</strong> Hệ thống không thể kết nối đến máy chủ mục tiêu (bị chặn IP, lỗi DNS localhost 127.0.0.1, hoặc rớt mạng).`;
+      } else if (/input\.search must match pattern/i.test(errorMsg)) {
+        hintBox.innerHTML = `⚙️ <strong>Lỗi Định Dạng Tham Số:</strong> Actor Apify cấm ký tự đặc biệt (như dấu thăng # trong hashtag). Cần bỏ dấu # trước từ khóa tìm kiếm.`;
+      } else if (/TOIDISPY_LOGIN_REQUIRED|login required/i.test(errorMsg)) {
+        hintBox.innerHTML = `🔒 <strong>Yêu Cầu Đăng Nhập:</strong> Phiên đăng nhập Toidispy trong trình duyệt CDP đã hết hạn. Hãy mở Chrome cổng 9222 và đăng nhập lại tài khoản còn hạn.`;
+      } else {
+        hintBox.innerHTML = `⚠️ <strong>Gợi ý:</strong> Kiểm tra log chi tiết trong Diagnostic Snapshot bên dưới hoặc kiểm tra lại đường truyền và tham số đầu vào.`;
+      }
+
+      // Raw Technical Snapshot
+      let snapshotObj = {
+        runId: run.id,
+        platform: run.platform,
+        query: run.query,
+        status: run.status,
+        errorMessage: run.error_message,
+        createdAt: run.created_at,
+        completedAt: run.completed_at,
+        inputOptions: run.input_options ? tryParseJson(run.input_options) : null,
+        healthSnapshot: run.health_snapshot ? tryParseJson(run.health_snapshot) : null
+      };
+      document.getElementById('failed-raw-json').textContent = JSON.stringify(snapshotObj, null, 2);
+    }
+
+    function renderDoneView(run) {
+      document.getElementById('view-done').classList.remove('d-none');
+      document.getElementById('view-failed').classList.add('d-none');
+
+      // Metric Counts
+      document.getElementById('metric-total').textContent = run.items_count || 0;
+      document.getElementById('metric-new').textContent = run.new_count || 0;
+      document.getElementById('metric-active').textContent = run.active_count || 0;
+      document.getElementById('metric-dropped').textContent = run.dropped_count || 0;
+
+      // Extract Items List
+      currentItems = [];
+      if (run.result_items_json) {
+        currentItems = tryParseJson(run.result_items_json) || [];
+      }
+      document.getElementById('table-items-count').textContent = currentItems.length;
+
+      renderItemsTable(currentItems);
+    }
+
+    function renderItemsTable(items) {
+      const tbody = document.getElementById('items-tbody');
+      if (!items || items.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="9" class="text-center py-5 text-muted">Không có sản phẩm nào được lưu cho lượt cào này.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = items.map((item, idx) => {
+        const img = item.image ? `<img src="${escapeAttr(item.image)}" class="product-img" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'48\' height=\'48\' fill=\'%23cbd5e1\'><rect width=\'100%\' height=\'100%\'/></svg>'">` : `<div class="product-img d-flex align-items-center justify-content-center text-muted fs-12">No img</div>`;
+        const price = item.price ? `$${Number(item.price).toFixed(2)}` : (item.price === 0 ? '$0.00' : '-');
+        const rating = item.rating ? `⭐ ${item.rating} <span class="text-muted fs-12">(${item.reviews || 0})</span>` : '-';
+        const soldOrEngage = item.sold_count ? `${item.sold_count} sold` : (item.likes ? `${item.likes} likes` : '-');
+        const statusBadge = item.status === 'new' ? `<span class="badge bg-success-subtle text-success border border-success-subtle">New</span>` : (item.status === 'active' ? `<span class="badge bg-primary-subtle text-primary border border-primary-subtle">Active</span>` : `<span class="badge bg-secondary-subtle text-secondary border">Observed</span>`);
+        const urlLink = item.url ? `<a href="${escapeAttr(item.url)}" target="_blank" class="btn btn-outline-secondary btn-sm py-0 px-2 fs-12" title="Mở link gốc"><i data-feather="external-link" style="width: 12px;"></i></a>` : '-';
+
+        return `<tr>
+          <td class="text-center text-muted fw-semibold">${idx + 1}</td>
+          <td>${img}</td>
+          <td>
+            <div class="fw-semibold text-dark text-break" style="max-width: 380px;">${escapeHtml(item.title || 'Untitled')}</div>
+            ${item.item_uid ? `<div class="text-muted fs-12 font-mono text-truncate" style="max-width: 380px;">${escapeHtml(item.item_uid)}</div>` : ''}
+          </td>
+          <td><span class="text-secondary">${escapeHtml(item.author || item.shop || '-')}</span></td>
+          <td><span class="fw-bold text-success font-mono">${price}</span></td>
+          <td>${rating}</td>
+          <td><span class="text-muted">${soldOrEngage}</span></td>
+          <td class="text-center">${statusBadge}</td>
+          <td class="text-center">${urlLink}</td>
+          <td class="text-center">
+            <button class="btn btn-outline-danger btn-sm py-0 px-2 fs-12" onclick="deleteItemInRun('${escapeAttr(item.item_uid)}', ${idx})" title="Xóa sản phẩm này">
+              <i data-feather="trash-2" style="width: 12px;"></i>
+            </button>
+          </td>
+        </tr>`;
+      }).join('');
+
+      feather.replace();
+    }
+
+    async function deleteItemInRun(itemUid, idx) {
+      if (!confirm('Bạn có chắc chắn muốn xóa sản phẩm này khỏi cơ sở dữ liệu?')) return;
+      try {
+        await fetch(`/api/items/${encodeURIComponent(itemUid)}`, { method: 'DELETE' });
+        currentItems.splice(idx, 1);
+        document.getElementById('table-items-count').textContent = currentItems.length;
+        document.getElementById('metric-total').textContent = currentItems.length;
+        renderItemsTable(currentItems);
+      } catch (err) {
+        alert('Xóa sản phẩm thất bại: ' + err.message);
+      }
+    }
+
+    async function deleteAllItemsInThisRun() {
+      if (!currentItems || currentItems.length === 0) {
+        alert('Không có sản phẩm nào để xóa.');
+        return;
+      }
+      if (!confirm(`Bạn có chắc chắn muốn xóa tất cả ${currentItems.length} sản phẩm của lượt cào #${currentRun?.id || ''}?`)) return;
+      try {
+        for (const item of currentItems) {
+          if (item.item_uid) {
+            await fetch(`/api/items/${encodeURIComponent(item.item_uid)}`, { method: 'DELETE' });
+          }
+        }
+        currentItems = [];
+        document.getElementById('table-items-count').textContent = '0';
+        document.getElementById('metric-total').textContent = '0';
+        renderItemsTable(currentItems);
+      } catch (err) {
+        alert('Xóa toàn bộ sản phẩm thất bại: ' + err.message);
+      }
+    }
+
+    function filterItemsTable() {
+      const q = document.getElementById('filter-input').value.toLowerCase().trim();
+      if (!q) {
+        renderItemsTable(currentItems);
+        return;
+      }
+      const filtered = currentItems.filter(item => 
+        (item.title || '').toLowerCase().includes(q) ||
+        (item.author || '').toLowerCase().includes(q) ||
+        (item.url || '').toLowerCase().includes(q)
+      );
+      renderItemsTable(filtered);
+    }
+
+    function copyDiagnosticJson() {
+      let dataToCopy = currentRun;
+      if (!dataToCopy) return;
+      navigator.clipboard.writeText(JSON.stringify(dataToCopy, null, 2)).then(() => {
+        const toast = new bootstrap.Toast(document.getElementById('copyToast'));
+        toast.show();
+      });
+    }
+
+    function tryParseJson(str) {
+      if (typeof str === 'object') return str;
+      try { return JSON.parse(str); } catch(e) { return str; }
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function escapeAttr(str) {
+      if (!str) return '';
+      return String(str).replace(/"/g, '&quot;');
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      loadRunDetails();
+    });
+  </script>
+</body>
+</html>
