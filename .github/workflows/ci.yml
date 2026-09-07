@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: crawler
+          POSTGRES_PASSWORD: crawler
+          POSTGRES_DB: crawler_pod
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U crawler"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: '5432'
+      PGUSER: crawler
+      PGPASSWORD: crawler
+      PGDATABASE: crawler_pod
+      CREDENTIAL_ENCRYPTION_KEY: g+lhSWcOGt2W+idgijBJl3OrnHgboxx37+YlWBZPgTw=
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
