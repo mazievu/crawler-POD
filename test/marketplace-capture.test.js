@@ -100,12 +100,12 @@ test('parser never combines a price from one source with a currency from another
   assert.equal(metrics.currency, '');
 });
 
-test('a marketplace account stores its session encrypted and never exposes it in account listings', () => {
+test('a marketplace account stores its session encrypted and never exposes it in account listings', async () => {
   const storageState = JSON.stringify({ cookies: [{ name: 'session-id', value: 'private-cookie' }], origins: [] });
   const label = `Research account ${Date.now()}`;
-  const account = db.createMarketplaceAccount({ platform: 'amazon', label, storageState });
+  const account = await db.createMarketplaceAccount({ platform: 'amazon', label, storageState });
 
-  const listedAccount = db.getMarketplaceAccounts('amazon').find((candidate) => candidate.id === account.id);
+  const listedAccount = (await db.getMarketplaceAccounts('amazon')).find((candidate) => candidate.id === account.id);
   assert.deepEqual(listedAccount, {
     id: account.id,
     platform: 'amazon',
@@ -115,11 +115,11 @@ test('a marketplace account stores its session encrypted and never exposes it in
     created_at: listedAccount.created_at,
     updated_at: listedAccount.updated_at,
   });
-  assert.deepEqual(JSON.parse(db.getMarketplaceStorageState(account.id)), {
+  assert.deepEqual(JSON.parse(await db.getMarketplaceStorageState(account.id)), {
     cookies: [{ name: 'session-id', value: 'private-cookie', domain: '.amazon.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: 'Lax' }],
     origins: [],
   });
-  db.deleteMarketplaceAccount(account.id);
+  await db.deleteMarketplaceAccount(account.id);
 });
 
 test('a rendered HTML capture uses the saved browser state and returns normalized metrics', async () => {

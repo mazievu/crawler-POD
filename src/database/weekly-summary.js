@@ -50,12 +50,17 @@ function createWeeklySummaryOps(db) {
       last_sold = @sold,
       last_comments = @comments,
       last_shares = @shares,
-      max_likes = MAX(max_likes, @likes),
-      max_views = MAX(max_views, @views),
+      -- GREATEST, not MAX: in PostgreSQL, MAX() is an aggregate only; the
+      -- two-argument scalar form is SQLite-specific.
+      max_likes = GREATEST(max_likes, @likes),
+      max_views = GREATEST(max_views, @views),
       delta_likes = @likes - first_likes,
       delta_views = @views - first_views,
       delta_sold = @sold - first_sold,
-      growth_rate = CASE WHEN first_views > 0 THEN ROUND((CAST(@views - first_views AS REAL) / first_views) * 100, 2) ELSE 0 END,
+      -- NUMERIC, not REAL: PostgreSQL only offers the two-argument ROUND() for
+      -- numeric, so rounding a double precision value raises
+      -- "function round(double precision, integer) does not exist".
+      growth_rate = CASE WHEN first_views > 0 THEN ROUND((CAST(@views - first_views AS NUMERIC) / first_views) * 100, 2) ELSE 0 END,
       updated_at = CURRENT_TIMESTAMP
     WHERE item_uid = @item_uid AND year_week = @year_week
   `);
@@ -67,7 +72,7 @@ function createWeeklySummaryOps(db) {
     LIMIT ?
   `);
 
-  function updateWeekly(item, timestamp = new Date()) {
+  async function updateWeekly(item, timestamp = new Date()) {
     const yearWeek = getYearWeek(new Date(timestamp));
     const price = Number(item.price || 0);
     const likes = Number(item.likes || 0);
@@ -76,10 +81,10 @@ function createWeeklySummaryOps(db) {
     const views = Number(item.views || 0);
     const sold = Number(item.sold_count || item.soldCount || 0);
 
-    const existing = findWeekly.get(item.item_uid, yearWeek);
+    const existing = await findWeekly.get(item.item_uid, yearWeek);
 
     if (!existing) {
-      insertWeekly.run({
+      await insertWeekly.run({
         item_uid: item.item_uid,
         platform: item.platform,
         year_week: yearWeek,
@@ -87,7 +92,7 @@ function createWeeklySummaryOps(db) {
       });
       return { yearWeek, isNew: true };
     } else {
-      updateWeeklyStmt.run({
+      await updateWeeklyStmt.run({
         item_uid: item.item_uid,
         year_week: yearWeek,
         price, likes, comments, shares, views, sold
@@ -96,8 +101,8 @@ function createWeeklySummaryOps(db) {
     }
   }
 
-  function getWeekly(itemUid, limitWeeks = 12) {
-    return listWeeklyByUid.all(itemUid, limitWeeks);
+  async function getWeekly(itemUid, limitWeeks = 12) {
+    return await listWeeklyByUid.all(itemUid, limitWeeks);
   }
 
   return {
@@ -113,18 +118,18 @@ function createWeeklySummaryOps(db) {
  * Safe to run multiple times (idempotent: wipes and rebuilds weekly_summary only,
  * never touches product_current or daily_packed_history).
  */
-function recomputeWeeklySummaryFromHistory(db) {
-  const dailyRows = db.prepare('SELECT item_uid, platform, date, observations_json FROM daily_packed_history ORDER BY item_uid, date ASC').all();
+async function recomputeWeeklySummaryFromHistory(db) {
+  const dailyRows = await db.prepare('SELECT item_uid, platform, date, observations_json FROM daily_packed_history ORDER BY item_uid, date ASC').all();
   const weeklyOps = createWeeklySummaryOps(db);
 
-  const tx = db.transaction(() => {
-    db.exec('DELETE FROM weekly_summary');
+  const tx = db.transaction(async () => {
+    await db.exec('DELETE FROM weekly_summary');
     for (const row of dailyRows) {
       let observations = [];
       try { observations = JSON.parse(row.observations_json || '[]'); } catch (_e) { observations = []; }
       for (const obs of observations) {
         const timestamp = `${row.date}T${obs.time}Z`;
-        weeklyOps.updateWeekly({
+        await weeklyOps.updateWeekly({
           item_uid: row.item_uid,
           platform: row.platform,
           price: obs.price,
@@ -137,9 +142,9 @@ function recomputeWeeklySummaryFromHistory(db) {
       }
     }
   });
-  tx();
+  await tx();
 
-  return { weeksRebuilt: db.prepare('SELECT COUNT(*) c FROM weekly_summary').get().c };
+  return { weeksRebuilt: (await db.prepare('SELECT COUNT(*) c FROM weekly_summary').get()).c };
 }
 
 module.exports = { createWeeklySummaryOps, getYearWeek, recomputeWeeklySummaryFromHistory };

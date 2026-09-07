@@ -20,15 +20,20 @@
     "test": "node --test --test-concurrency=1 \"test/**/*.js\"",
     "e2e:release": "node scripts/e2e-test.js",
     "import:etsy-analytics": "node scripts/import-etsy-analytics.js",
-    "enrich:etsy-images": "node scripts/enrich-etsy-images.js"
+    "enrich:etsy-images": "node scripts/enrich-etsy-images.js",
+    "mcp:stdio": "node mcp/crawler-pod-server.mjs",
+    "mcp:http": "node mcp/crawler-pod-http-server.mjs"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "apify-client": "^2.9.0",
     "better-sqlite3": "^13.0.3",
     "cloakbrowser": "0.4.8",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
     "express": "^4.18.0",
+    "pg": "^8.23.0",
     "playwright": "^1.61.0"
   },
   "devDependencies": {

@@ -27,22 +27,22 @@ const db = require('../src/database');
 // ever had metric fields; database.js's getProductHistoryWithMetadata()
 // now denormalizes product_current's static fields onto every point.
 // ============================================================
-test('getProductHistoryWithMetadata() returns real title/platform/url/image, not Untitled/undefined (UI-BUG-01)', () => {
+test('getProductHistoryWithMetadata() returns real title/platform/url/image, not Untitled/undefined (UI-BUG-01)', async () => {
   // A unique URL per run avoids colliding with product_current rows left
   // over from earlier test runs against this same persistent DB file — the
   // new/active status itself is a different, already-tested system; this
   // test is only about the title/platform/url/image/author metadata mapping.
   const uniqueUrl = `https://example.com/ui-bug-01-${Date.now()}`;
-  const run = db.createRun({ platform: 'shopify', query: 'ui-bug-01-test-' + Date.now(), maxItems: 5 });
-  db.insertSnapshots(run.id, 'shopify', run.query, [{
+  const run = await db.createRun({ platform: 'shopify', query: 'ui-bug-01-test-' + Date.now(), maxItems: 5 });
+  await db.insertSnapshots(run.id, 'shopify', run.query, [{
     title: 'Real Product Title', url: uniqueUrl, image: 'https://example.com/p1.jpg',
     author: 'ExampleShop', price: 19.99, rating: 4.5, reviews: 10, soldCount: 3,
     likes: 0, comments: 0, shares: 0, views: 0, status: 'new'
   }]);
   try {
-    const afterRun = db.getRunById(run.id);
+    const afterRun = await db.getRunById(run.id);
     const [firstItem] = JSON.parse(afterRun.result_items_json);
-    const history = db.getProductHistoryWithMetadata(firstItem.item_uid);
+    const history = await db.getProductHistoryWithMetadata(firstItem.item_uid);
     assert.ok(history.length >= 1, 'must have at least one observation point');
     const point = history[history.length - 1];
     assert.equal(point.title, 'Real Product Title', 'title must not fall back to Untitled');
@@ -51,7 +51,7 @@ test('getProductHistoryWithMetadata() returns real title/platform/url/image, not
     assert.equal(point.image, 'https://example.com/p1.jpg');
     assert.equal(point.author, 'ExampleShop');
   } finally {
-    db.deleteRun(run.id);
+    await db.deleteRun(run.id);
   }
 });
 
@@ -74,7 +74,7 @@ test('Shopify channel reports ok when local-scraper is the healthy active backen
 // to an explicit, labeled Vietnam-local time for CSV export, not written
 // verbatim (which reads ~7h off to anyone opening the file).
 // ============================================================
-test('formatVietnamTime() converts naive UTC timestamps to explicit Vietnam-local time (UI-BUG-04)', () => {
+test('formatVietnamTime() converts naive UTC timestamps to explicit Vietnam-local time (UI-BUG-04)', async () => {
   // 2026-08-27 03:58:39 UTC + 7h = 2026-08-27 10:58:39 Vietnam-local.
   const formatted = db.formatVietnamTime('2026-08-27 03:58:39');
   assert.match(formatted, /\(Vietnam\)$/, 'output must be explicitly labeled, not ambiguous');
@@ -181,7 +181,7 @@ test('User Journey accumulates ALL products into result_items_json, not just the
   db.insertSnapshots = (...args) => { insertSnapshotsCalls.push(args); return originalInsertSnapshots.apply(db, args); };
 
   const { runUserJourney } = require('../src/journey/user-journey-runner');
-  const outerRun = db.createRun({ platform: 'etsy', query: 'ui-bug-10-test-' + Date.now(), maxItems: 3 });
+  const outerRun = await db.createRun({ platform: 'etsy', query: 'ui-bug-10-test-' + Date.now(), maxItems: 3 });
 
   try {
     const fakePage = {
@@ -201,7 +201,7 @@ test('User Journey accumulates ALL products into result_items_json, not just the
     assert.equal(insertSnapshotsCalls.length, 1, 'exactly ONE batched insertSnapshots call, not one per item (the root cause of the overwrite bug)');
     assert.equal(insertSnapshotsCalls[0][3].length, 3, 'the single insertSnapshots call must carry the FULL batch of 3 items');
 
-    const afterRun = db.getRunById(outerRun.id);
+    const afterRun = await db.getRunById(outerRun.id);
     const resultItems = JSON.parse(afterRun.result_items_json || '[]');
     assert.equal(resultItems.length, 3, 'result_items_json must contain ALL 3 products, not just the last one');
     const titles = resultItems.map((i) => i.title).sort();
@@ -209,7 +209,7 @@ test('User Journey accumulates ALL products into result_items_json, not just the
   } finally {
     etsyScraperModule.scrape = originalScrape;
     db.insertSnapshots = originalInsertSnapshots;
-    db.deleteRun(outerRun.id);
+    await db.deleteRun(outerRun.id);
   }
 });
 

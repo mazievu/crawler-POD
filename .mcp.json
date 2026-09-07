@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "crawler-pod": {
+      "command": "node",
+      "args": ["mcp/crawler-pod-server.mjs"]
+    }
+  }
+}

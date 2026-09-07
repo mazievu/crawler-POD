@@ -139,7 +139,7 @@ test('SocialListeningScheduler skips automatic dispatch for a BLOCKED_CONFIGURAT
   await scheduler.tick();
   assert.ok(!submittedRuns.some(r => r.platform === 'facebook_posts'), 'Facebook must not be dispatched while its dependency is blocked');
 
-  const status = scheduler.getStatus().find(b => b.key === 'facebook');
+  const status = (await scheduler.getStatus()).find(b => b.key === 'facebook');
   assert.ok(status.blockedReason && status.blockedReason.startsWith('BLOCKED_CONFIGURATION'), `Expected BLOCKED_CONFIGURATION, got: ${status.blockedReason}`);
   assert.ok(status.lastDependencyCheckAt, 'lastDependencyCheckAt must be recorded');
 

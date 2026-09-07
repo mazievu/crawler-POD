@@ -8,7 +8,7 @@ test('long-running capture jobs acknowledge immediately and expose their final r
   const wait = new Promise((resolve) => { release = resolve; });
   const queue = createCaptureJobQueue({ runCapture: async () => { await wait; return { capture: { id: 42 }, metrics: { price: 826171 } }; } });
 
-  const job = queue.enqueue({ platform: 'etsy' });
+  const job = await queue.enqueue({ platform: 'etsy' });
   assert.deepEqual(queue.get(job.id), { id: job.id, status: 'running', result: null, error: null });
 
   release();
@@ -18,7 +18,7 @@ test('long-running capture jobs acknowledge immediately and expose their final r
 
 test('capture jobs expose safe failure state instead of leaving clients waiting', async () => {
   const queue = createCaptureJobQueue({ runCapture: async () => { throw new Error('host unavailable'); } });
-  const job = queue.enqueue({ platform: 'etsy' });
+  const job = await queue.enqueue({ platform: 'etsy' });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(queue.get(job.id), { id: job.id, status: 'failed', result: null, error: 'host unavailable' });
 });

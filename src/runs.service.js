@@ -19,8 +19,11 @@ const router = new BackendRouter({ registry, doctor: doctorModule });
  * Current State, Daily History, final status — must be refused, not just the
  * last one.
  */
-function assertStillOwner(db, runId, executionToken, stageLabel) {
-  if (!isCurrentOwner(db, runId, executionToken)) {
+// Async since the PostgreSQL cutover: isCurrentOwner() reads the run row, so
+// without the await `!Promise` is always false and this guard silently stops
+// refusing stale writes.
+async function assertStillOwner(db, runId, executionToken, stageLabel) {
+  if (!(await isCurrentOwner(db, runId, executionToken))) {
     console.warn(`Run ${runId}: stale execution (token ${executionToken}) attempted to write at stage "${stageLabel}" after being superseded; discarding.`);
     return false;
   }
@@ -46,7 +49,7 @@ async function executeRun(runId, platform, query, options = {}) {
 
   try {
     tracker.setStage(STAGES.INIT);
-    db.updateRun(runId, { status: 'running' });
+    await db.updateRun(runId, { status: 'running' });
 
     const channel = registry.getChannel(platform);
     if (!channel) throw new Error(`Unknown channel: ${platform}`);
@@ -62,8 +65,8 @@ async function executeRun(runId, platform, query, options = {}) {
     // an external execution (a spawned child process, a remote Apify actor
     // run) that can outlive THIS Node process, so RestartRecovery can
     // reconcile it on next boot instead of blindly dispatching a duplicate.
-    const reportExternalExecution = (info) => {
-      db.updateRun(runId, { externalExecution: { ...info, executionToken, startedAt: info.startedAt || Date.now() } });
+    const reportExternalExecution = async (info) => {
+      await db.updateRun(runId, { externalExecution: { ...info, executionToken, startedAt: info.startedAt || Date.now() } });
     };
     const result = await router.run(platform, query, { ...options, signal: abortController.signal, reportExternalExecution })
       .finally(() => {
@@ -78,13 +81,13 @@ async function executeRun(runId, platform, query, options = {}) {
 
     // router.run() can take minutes; re-check ownership before the FIRST write
     // that happens after it returns.
-    if (!assertStillOwner(db, runId, executionToken, 'POST_BACKEND_RUN')) {
+    if (!(await assertStillOwner(db, runId, executionToken, 'POST_BACKEND_RUN'))) {
       removeTracker(executionToken);
       return { success: false, runId, discarded: true, reason: 'STALE_EXECUTION' };
     }
 
     // Save metadata early in case of normalization failure
-    db.updateRun(runId, {
+    await db.updateRun(runId, {
       activeBackend: result.activeBackend,
       backendKind: result.backendKind,
       backendStatus: result.backendStatus,
@@ -110,17 +113,17 @@ async function executeRun(runId, platform, query, options = {}) {
 
     // Guard again immediately before the PERSISTING stage: this is where legacy
     // snapshots, product_current, and daily_packed_history all get written.
-    if (!assertStillOwner(db, runId, executionToken, 'PRE_PERSIST')) {
+    if (!(await assertStillOwner(db, runId, executionToken, 'PRE_PERSIST'))) {
       removeTracker(executionToken);
       return { success: false, runId, discarded: true, reason: 'STALE_EXECUTION' };
     }
 
     // Save to DB
     tracker.setStage(STAGES.PERSISTING);
-    const dbCounts = db.insertSnapshots(runId, platform, query, itemsWithImages);
+    const dbCounts = await db.insertSnapshots(runId, platform, query, itemsWithImages);
 
     tracker.setStage(STAGES.COMPLETED);
-    db.updateRun(runId, {
+    await db.updateRun(runId, {
       status: 'done',
       ...dbCounts
     });
@@ -132,7 +135,7 @@ async function executeRun(runId, platform, query, options = {}) {
     tracker.setStage(STAGES.FAILED, { error: err.message });
     console.error(`Run ${runId} failed:`, err.message);
 
-    if (!isCurrentOwner(db, runId, executionToken)) {
+    if (!(await isCurrentOwner(db, runId, executionToken))) {
       console.warn(`Run ${runId}: stale execution (token ${executionToken}) errored after being superseded; not touching run status.`);
       removeTracker(executionToken);
       throw err;
@@ -141,13 +144,13 @@ async function executeRun(runId, platform, query, options = {}) {
     if (defaultRetryPolicy.shouldRetry(attempt, err)) {
       const nextAttempt = attempt + 1;
       const updatedOptions = { ...options, attempt: nextAttempt };
-      db.updateRun(runId, {
+      await db.updateRun(runId, {
         status: 'queued',
         errorMessage: `Transient error, retrying (${attempt}/${defaultRetryPolicy.maxAttempts}): ${err.message}`,
         inputOptions: JSON.stringify(updatedOptions)
       });
     } else {
-      db.updateRun(runId, { status: 'failed', errorMessage: err.message });
+      await db.updateRun(runId, { status: 'failed', errorMessage: err.message });
     }
     removeTracker(executionToken);
     throw err;

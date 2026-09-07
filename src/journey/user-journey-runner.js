@@ -65,10 +65,10 @@ async function runUserJourney({
   let activeRunId = runId;
   let isInternalRun = false;
   if (!activeRunId) {
-    const runObj = db.createRun({ platform: normPlatform, query: keyword, maxItems: maxProducts });
+    const runObj = await db.createRun({ platform: normPlatform, query: keyword, maxItems: maxProducts });
     activeRunId = runObj.id;
     isInternalRun = true;
-    db.updateRun(activeRunId, { status: 'running', activeBackend: 'user-journey-bot' });
+    await db.updateRun(activeRunId, { status: 'running', activeBackend: 'user-journey-bot' });
   }
 
   let stealthSession = null;
@@ -151,7 +151,7 @@ async function runUserJourney({
       });
 
       await fallbackPool.run(fallbackItems, async (item) => {
-        assertOwner('PRE_CHECKPOINT_PERSIST');
+        await assertOwner('PRE_CHECKPOINT_PERSIST');
 
         const rawPrice = typeof item.price === 'number' ? item.price : parseFloat(item.price) || 0;
         const rawCurrency = item.currency || 'USD';
@@ -207,13 +207,13 @@ async function runUserJourney({
       // UI-BUG-10: one batched write with the FULL accumulated list, not one
       // overwrite per item — see checkpoint-store.js's processAndSaveProductDetail.
       if (store.savedProducts.length > 0) {
-        assertOwner('PRE_CHECKPOINT_PERSIST'); // §7/§8: immediately before the business write
-        db.insertSnapshots(activeRunId, normPlatform, keyword, store.savedProducts);
+        await assertOwner('PRE_CHECKPOINT_PERSIST'); // §7/§8: immediately before the business write
+        await db.insertSnapshots(activeRunId, normPlatform, keyword, store.savedProducts);
       }
 
       const summary = store.saveSummary('COMPLETED');
       if (isInternalRun) {
-        db.updateRun(activeRunId, {
+        await db.updateRun(activeRunId, {
           status: 'done',
           items_count: summary.productsCollectedCount,
           new_count: summary.productsCollectedCount,
@@ -289,7 +289,7 @@ async function runUserJourney({
     monitor.reserve(internalReservationKey, internalConcurrency * taskCostMB);
     try {
       await taskPool.run(productUrls, async (url, i) => {
-        assertOwner('PRE_CHECKPOINT_PERSIST');
+        await assertOwner('PRE_CHECKPOINT_PERSIST');
         const detailHtml = await handler.interactProductDetail(url, i);
         if (detailHtml) {
           await store.processAndSaveProductDetail(url, detailHtml, fxContext);
@@ -302,13 +302,13 @@ async function runUserJourney({
     // UI-BUG-10: one batched write with the FULL accumulated list, not one
     // overwrite per item — see checkpoint-store.js's processAndSaveProductDetail.
     if (store.savedProducts.length > 0) {
-      assertOwner('PRE_CHECKPOINT_PERSIST'); // §7/§8: immediately before the business write
-      db.insertSnapshots(activeRunId, normPlatform, keyword, store.savedProducts);
+      await assertOwner('PRE_CHECKPOINT_PERSIST'); // §7/§8: immediately before the business write
+      await db.insertSnapshots(activeRunId, normPlatform, keyword, store.savedProducts);
     }
 
     const summary = store.saveSummary('COMPLETED');
     if (isInternalRun) {
-      db.updateRun(activeRunId, {
+      await db.updateRun(activeRunId, {
         status: 'done',
         items_count: summary.productsCollectedCount,
         new_count: summary.productsCollectedCount,
@@ -330,7 +330,7 @@ async function runUserJourney({
     const summary = store.saveSummary('FAILED');
     summary.errorMessage = err.message;
     if (isInternalRun) {
-      db.updateRun(activeRunId, { status: 'failed', errorMessage: err.message });
+      await db.updateRun(activeRunId, { status: 'failed', errorMessage: err.message });
     }
     return summary;
   } finally {

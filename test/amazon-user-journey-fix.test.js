@@ -97,7 +97,7 @@ test('Test C: three differently-shaped URLs for the same ASIN produce the same c
 // separate runs must NOT split into two product_current rows or two
 // separate history identities.
 // ============================================================
-test('Test D: same ASIN via different raw URLs does not split product_current or history', () => {
+test('Test D: same ASIN via different raw URLs does not split product_current or history', async () => {
   // Real ASINs are always exactly 10 alphanumeric chars — listingIdFromUrl's
   // regex (correctly) only captures 10, so a longer fake ASIN in a test
   // fixture gets silently truncated. Keep this exactly 10 chars.
@@ -114,10 +114,10 @@ test('Test D: same ASIN via different raw URLs does not split product_current or
   assert.equal(recordV1.url, recordV2.url, 'both raw URLs must canonicalize to the same url before persistence');
 
   const query = 'test-d-' + Date.now();
-  const run1 = db.createRun({ platform: 'amazon', query, maxItems: 1 });
-  db.insertSnapshots(run1.id, 'amazon', query, [recordV1]);
-  const run2 = db.createRun({ platform: 'amazon', query, maxItems: 1 });
-  db.insertSnapshots(run2.id, 'amazon', query, [recordV2]);
+  const run1 = await db.createRun({ platform: 'amazon', query, maxItems: 1 });
+  await db.insertSnapshots(run1.id, 'amazon', query, [recordV1]);
+  const run2 = await db.createRun({ platform: 'amazon', query, maxItems: 1 });
+  await db.insertSnapshots(run2.id, 'amazon', query, [recordV2]);
 
   try {
     const itemUid = `amazon:https://www.amazon.com/dp/${asin}`;
@@ -126,20 +126,20 @@ test('Test D: same ASIN via different raw URLs does not split product_current or
     // list is capped (default LIMIT 100, ranked), and this synthetic test
     // item's rank_score has no reason to land in the top 100 alongside real
     // production data already in this DB.
-    const current = db.getProductCurrentByUid(itemUid);
+    const current = await db.getProductCurrentByUid(itemUid);
     assert.ok(current, 'product_current must have exactly ONE row for this ASIN, not one per raw URL variant (it must exist at all)');
     assert.equal(current.current_price, 11.99, 'the single row must reflect the latest observation (proves run2 updated the SAME row, not a new one)');
 
     // Directly prove the raw-slug'd URL from run2 did NOT create its own,
     // separate product_current row (the pre-fix split-identity failure mode).
     const rawUrlItemUid = `amazon:https://www.amazon.com/some-different-slug/dp/${asin}/ref=sr_1_9`;
-    assert.equal(db.getProductCurrentByUid(rawUrlItemUid), undefined, 'the raw, non-canonical URL must NOT have its own product_current row');
+    assert.equal(await db.getProductCurrentByUid(rawUrlItemUid), undefined, 'the raw, non-canonical URL must NOT have its own product_current row');
 
-    const history = db.getProductHistoryWithMetadata(itemUid);
+    const history = await db.getProductHistoryWithMetadata(itemUid);
     assert.equal(history.length, 2, 'history must show 2 observations (one per run), both under the SAME item_uid');
     assert.deepEqual(history.map((h) => h.price).sort((a, b) => a - b), [9.99, 11.99]);
   } finally {
-    db.deleteRun(run1.id);
-    db.deleteRun(run2.id);
+    await db.deleteRun(run1.id);
+    await db.deleteRun(run2.id);
   }
 });

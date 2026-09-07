@@ -1,0 +1,26 @@
+[
+  {
+    "id": 274,
+    "schedule_id": 558,
+    "summary": "{\"discovered\":20,\"captured\":0,\"blocked\":0,\"failed\":20}",
+    "completed_at": "2026-08-28T06:48:23.929Z"
+  },
+  {
+    "id": 344,
+    "schedule_id": 558,
+    "summary": "{\"discovered\":11,\"captured\":0,\"blocked\":0,\"failed\":11}",
+    "completed_at": "2026-08-29T06:48:43.882Z"
+  },
+  {
+    "id": 450,
+    "schedule_id": 1125,
+    "summary": "{\"runId\":4376,\"status\":\"done\",\"discovered\":0,\"captured\":0,\"failed\":0,\"error\":null}",
+    "completed_at": "2026-09-04T06:40:48.677Z"
+  },
+  {
+    "id": 451,
+    "schedule_id": 558,
+    "summary": "{\"runId\":4377,\"status\":\"done\",\"discovered\":0,\"captured\":0,\"failed\":0,\"error\":null}",
+    "completed_at": "2026-09-04T06:41:50.436Z"
+  }
+]

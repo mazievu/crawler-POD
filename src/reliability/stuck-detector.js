@@ -100,7 +100,7 @@ class StuckDetector {
   async recoverExecution(hb, reasonCode, reasonMessage) {
     console.warn(`[StuckDetector] Run #${hb.runId} ${reasonCode}: ${reasonMessage}`);
 
-    const run = this.db.getRunById(hb.runId);
+    const run = await this.db.getRunById(hb.runId);
     const options = typeof run?.input_options === 'string' ? JSON.parse(run.input_options || '{}') : (run?.options || {});
     const attempt = Number(options.attempt || 1);
 
@@ -119,7 +119,7 @@ class StuckDetector {
     // tombstoned token can never equal a real token, so isCurrentOwner()
     // rejects it exactly like any other superseded token.
     const revokedOptions = { ...options, executionToken: `REVOKED:${hb.executionToken}` };
-    this.db.updateRun(hb.runId, { inputOptions: JSON.stringify(revokedOptions) });
+    await this.db.updateRun(hb.runId, { inputOptions: JSON.stringify(revokedOptions) });
 
     // §1.3: detecting stuck is not the same as recovering it — actually try
     // to stop A's real work (abort signal + registered cleanup, e.g. closing
@@ -143,7 +143,7 @@ class StuckDetector {
       // whenever it actually does settle (however late) — this function has
       // no further role once it reports the failure honestly.
       console.error(`[StuckDetector] Run #${hb.runId} (token ${hb.executionToken}) did not confirm cleanup within ${this.cleanupGraceMs}ms of abort — RECOVERY_CLEANUP_FAILED. NOT queuing a retry: Attempt A's real work is not confirmed stopped.`);
-      this.db.updateRun(hb.runId, {
+      await this.db.updateRun(hb.runId, {
         status: 'stuck',
         errorMessage: `RECOVERY_CLEANUP_FAILED (${reasonCode}): ${reasonMessage} — old attempt did not confirm settlement within ${this.cleanupGraceMs}ms; retry withheld to avoid a concurrent duplicate execution`
       });
@@ -163,7 +163,7 @@ class StuckDetector {
       const status = await getStatusFn(externalExecution.externalExecutionId);
       if (!APIFY_TERMINAL_STATUSES.has(status)) {
         console.error(`[StuckDetector] Run #${hb.runId} remote Apify actor (${externalExecution.externalExecutionId}) status is ${status} — RECOVERY_FAILED. Retry withheld.`);
-        this.db.updateRun(hb.runId, {
+        await this.db.updateRun(hb.runId, {
           status: 'stuck',
           errorMessage: `RECOVERY_FAILED (${reasonCode}): remote Apify actor (${externalExecution.externalExecutionId}) is still active (${status}) — retry withheld until old actor is confirmed terminal.`
         });
@@ -176,13 +176,13 @@ class StuckDetector {
       // A fresh executionToken revokes the stuck attempt's ownership: if it
       // wakes up later, isCurrentOwner() will reject its writes (P0-8/#11).
       const updatedOptions = { ...options, attempt: nextAttempt, executionToken: issueExecutionToken(hb.runId, nextAttempt) };
-      this.db.updateRun(hb.runId, {
+      await this.db.updateRun(hb.runId, {
         status: 'queued',
         errorMessage: `Recovered from ${reasonCode} (attempt ${attempt}/${this.retryPolicy.maxAttempts}): ${reasonMessage}`,
         inputOptions: JSON.stringify(updatedOptions)
       });
     } else {
-      this.db.updateRun(hb.runId, {
+      await this.db.updateRun(hb.runId, {
         status: 'stuck',
         errorMessage: `${reasonCode}: ${reasonMessage}`
       });

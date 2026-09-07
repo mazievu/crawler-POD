@@ -32,9 +32,9 @@ function getRunToken(run) {
  * whichever execution asks first (returns true), so this stays backward compatible
  * with runs submitted before the lease system existed.
  */
-function isCurrentOwner(db, runId, token) {
+async function isCurrentOwner(db, runId, token) {
   if (!token) return true; // No lease requested: legacy behavior, always allowed.
-  const fresh = db.getRunById(runId);
+  const fresh = await db.getRunById(runId);
   const freshToken = getRunToken(fresh);
   if (!freshToken) return true; // Nothing has claimed a newer lease yet.
   return freshToken === token;

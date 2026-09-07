@@ -75,8 +75,11 @@ function createDailyHistoryOps(db) {
     UPDATE daily_packed_history SET
       observations_json = @observations_json,
       observation_count = @observation_count,
-      min_price = MIN(min_price, @price),
-      max_price = MAX(max_price, @price),
+      -- LEAST/GREATEST, not MIN/MAX: SQLite has a two-argument scalar MIN()/MAX(),
+      -- PostgreSQL only has MIN()/MAX() as aggregates, so the scalar form fails
+      -- there with "function min(double precision, unknown) does not exist".
+      min_price = LEAST(min_price, @price),
+      max_price = GREATEST(max_price, @price),
       latest_price = @price,
       latest_likes = @likes,
       latest_views = @views,
@@ -92,7 +95,7 @@ function createDailyHistoryOps(db) {
     LIMIT ?
   `);
 
-  function appendObservation(item, timestamp = new Date(), identity = {}) {
+  async function appendObservation(item, timestamp = new Date(), identity = {}) {
     const { runId = null, legacySnapshotId = null } = identity || {};
     const isoStr = normalizeLegacyUtcTimestamp(timestamp);
     const dateStr = isoStr.slice(0, 10); // 'YYYY-MM-DD'
@@ -127,11 +130,11 @@ function createDailyHistoryOps(db) {
       reviews
     };
 
-    const existing = findRow.get(item.item_uid, dateStr);
+    const existing = await findRow.get(item.item_uid, dateStr);
 
     if (!existing) {
       const observationsArray = [observation];
-      insertRow.run({
+      await insertRow.run({
         item_uid: item.item_uid,
         platform: item.platform,
         date: dateStr,
@@ -172,7 +175,7 @@ function createDailyHistoryOps(db) {
       observationsArray.push(observation);
     }
 
-    updateRow.run({
+    await updateRow.run({
       item_uid: item.item_uid,
       date: dateStr,
       observations_json: JSON.stringify(observationsArray),
@@ -185,8 +188,8 @@ function createDailyHistoryOps(db) {
     return { date: dateStr, count: observationsArray.length, duplicate };
   }
 
-  function getHistory(itemUid, limitDays = 30) {
-    const rows = findHistoryByUid.all(itemUid, limitDays);
+  async function getHistory(itemUid, limitDays = 30) {
+    const rows = await findHistoryByUid.all(itemUid, limitDays);
     return rows.map(r => {
       let observations = [];
       try {
@@ -204,7 +207,7 @@ function createDailyHistoryOps(db) {
   return {
     appendObservation,
     getHistory,
-    findRow: (itemUid, date) => findRow.get(itemUid, date),
+    findRow: async (itemUid, date) => await findRow.get(itemUid, date),
     buildObservationId,
     normalizeLegacyUtcTimestamp
   };

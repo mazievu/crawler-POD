@@ -12,4 +12,6 @@ scratch-run.js
 .claude/
 docs/BACKUPS/
 handoff.md
+logs/
+*.zip
 

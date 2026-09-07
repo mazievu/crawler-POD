@@ -15,9 +15,9 @@ const DEFAULT_TOLERANCE_MS = 30 * 60 * 1000; // bots may run a few minutes late
  * Returns null when nothing in the window qualifies — callers must NOT default
  * to 0, since 0 would be indistinguishable from "no growth happened".
  */
-function findObservationNear(dailyHistoryOps, itemUid, targetTimeMs, toleranceMs) {
+async function findObservationNear(dailyHistoryOps, itemUid, targetTimeMs, toleranceMs) {
   const daysNeeded = Math.ceil((Date.now() - targetTimeMs + toleranceMs) / 86400000) + 2;
-  const rows = dailyHistoryOps.getHistory(itemUid, Math.max(3, daysNeeded));
+  const rows = await dailyHistoryOps.getHistory(itemUid, Math.max(3, daysNeeded));
 
   let best = null;
   let bestDist = Infinity;
@@ -35,8 +35,8 @@ function findObservationNear(dailyHistoryOps, itemUid, targetTimeMs, toleranceMs
   return best;
 }
 
-function windowedDelta(dailyHistoryOps, itemUid, currentValue, currentTimeMs, windowMs, field, toleranceMs) {
-  const reference = findObservationNear(dailyHistoryOps, itemUid, currentTimeMs - windowMs, toleranceMs);
+async function windowedDelta(dailyHistoryOps, itemUid, currentValue, currentTimeMs, windowMs, field, toleranceMs) {
+  const reference = await findObservationNear(dailyHistoryOps, itemUid, currentTimeMs - windowMs, toleranceMs);
   if (!reference) return null; // No qualifying historical point -> unknown, not 0.
   const refValue = Number(reference[field] || 0);
   return currentValue - refValue;
@@ -115,8 +115,8 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
 
   const listCurrent = db.prepare(`
     SELECT * FROM product_current
-    WHERE (@platform IS NULL OR platform = @platform)
-      AND (@search IS NULL OR title LIKE '%' || @search || '%' OR query LIKE '%' || @search || '%')
+    WHERE (@platform::text IS NULL OR platform = @platform)
+      AND (@search::text IS NULL OR title LIKE '%' || @search || '%' OR query LIKE '%' || @search || '%')
     ORDER BY rank_score DESC, last_crawled_at DESC
     LIMIT @limit
   `);
@@ -125,8 +125,8 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
   // crawl (see database.js), so daily_packed_history at this point only contains
   // strictly-past observations — the windowed lookups below can never "see" the
   // current observation and double-count it.
-  function upsertItem(item, runId = null, timestamp = new Date()) {
-    const existing = findByUid.get(item.item_uid);
+  async function upsertItem(item, runId = null, timestamp = new Date()) {
+    const existing = await findByUid.get(item.item_uid);
     const price = Number(item.price || 0);
     const rating = Number(item.rating || 0);
     const reviews = Number(item.reviews || 0);
@@ -144,7 +144,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
         current_rating: rating
       });
 
-      insertCurrent.run({
+      await insertCurrent.run({
         item_uid: item.item_uid,
         platform: item.platform,
         query: item.query || '',
@@ -175,11 +175,11 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
       const delta_sold = sold - existing.current_sold;
       const delta_reviews = reviews - existing.current_reviews;
 
-      const delta_3h_likes = windowedDelta(dailyHistoryOps, item.item_uid, likes, nowMs, THREE_HOURS_MS, 'likes', toleranceMs);
-      const delta_3h_views = windowedDelta(dailyHistoryOps, item.item_uid, views, nowMs, THREE_HOURS_MS, 'views', toleranceMs);
-      const delta_24h_likes = windowedDelta(dailyHistoryOps, item.item_uid, likes, nowMs, TWENTY_FOUR_HOURS_MS, 'likes', toleranceMs);
-      const delta_24h_views = windowedDelta(dailyHistoryOps, item.item_uid, views, nowMs, TWENTY_FOUR_HOURS_MS, 'views', toleranceMs);
-      const delta_24h_sold = windowedDelta(dailyHistoryOps, item.item_uid, sold, nowMs, TWENTY_FOUR_HOURS_MS, 'sold', toleranceMs);
+      const delta_3h_likes = await windowedDelta(dailyHistoryOps, item.item_uid, likes, nowMs, THREE_HOURS_MS, 'likes', toleranceMs);
+      const delta_3h_views = await windowedDelta(dailyHistoryOps, item.item_uid, views, nowMs, THREE_HOURS_MS, 'views', toleranceMs);
+      const delta_24h_likes = await windowedDelta(dailyHistoryOps, item.item_uid, likes, nowMs, TWENTY_FOUR_HOURS_MS, 'likes', toleranceMs);
+      const delta_24h_views = await windowedDelta(dailyHistoryOps, item.item_uid, views, nowMs, TWENTY_FOUR_HOURS_MS, 'views', toleranceMs);
+      const delta_24h_sold = await windowedDelta(dailyHistoryOps, item.item_uid, sold, nowMs, TWENTY_FOUR_HOURS_MS, 'sold', toleranceMs);
 
       const rankScore = defaultRanker.calculateRankScore({
         delta_sold,
@@ -190,7 +190,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
         current_rating: rating
       });
 
-      updateCurrent.run({
+      await updateCurrent.run({
         item_uid: item.item_uid,
         title: item.title || existing.title,
         url: item.url || existing.url,
@@ -232,9 +232,9 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
 
   return {
     upsertItem,
-    findByUid: (uid) => findByUid.get(uid),
-    listCurrent: ({ platform = null, search = null, limit = 100 } = {}) => {
-      return listCurrent.all({ platform, search, limit });
+    findByUid: async (uid) => await findByUid.get(uid),
+    listCurrent: async ({ platform = null, search = null, limit = 100 } = {}) => {
+      return await listCurrent.all({ platform, search, limit });
     }
   };
 }

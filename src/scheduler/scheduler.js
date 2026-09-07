@@ -111,7 +111,7 @@ class ResourceScheduler {
   }
 
   async submitRun(runPayload) {
-    const queuedRun = this.queue.enqueue(runPayload);
+    const queuedRun = await this.queue.enqueue(runPayload);
     setImmediate(() => {
       void this.tick().catch(console.error);
     });
@@ -122,7 +122,7 @@ class ResourceScheduler {
   async waitForCompletion(runId, { pollMs = 500, timeoutMs = 300000 } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const run = this.queue.getById(runId);
+      const run = await this.queue.getById(runId);
       if (run && ['done', 'failed', 'stuck'].includes(run.status)) return run;
       await new Promise(r => setTimeout(r, pollMs));
     }
@@ -141,12 +141,12 @@ class ResourceScheduler {
     return NO_RETRY_REASON_CODES.has(classifyFailureReason(err));
   }
 
-  handlePlanningFailure(run, err) {
+  async handlePlanningFailure(run, err) {
     const reasonCode = classifyFailureReason(err);
 
     if (NO_RETRY_REASON_CODES.has(reasonCode)) {
       console.warn(`[Scheduler] Run #${run.id} (${run.platform}) ${reasonCode} (no retry spam): ${err.message}`);
-      this.queue.markFailed(run.id, `${reasonCode}: ${err.message}`);
+      await this.queue.markFailed(run.id, `${reasonCode}: ${err.message}`);
       this.planFailureCounts.delete(run.id);
       return;
     }
@@ -158,7 +158,7 @@ class ResourceScheduler {
 
     if (failures >= this.maxPlanFailures) {
       console.error(`[Scheduler] Run #${run.id} (${run.platform}) failed planning ${failures} times (${reasonCode}), marking failed:`, err.message);
-      this.queue.markFailed(run.id, `${reasonCode}: ${err.message}`);
+      await this.queue.markFailed(run.id, `${reasonCode}: ${err.message}`);
       this.planFailureCounts.delete(run.id);
     } else {
       console.warn(`[Scheduler] ${reasonCode} planning failure for run #${run.id} (${run.platform}), attempt ${failures}/${this.maxPlanFailures}: ${err.message}`);
@@ -166,12 +166,12 @@ class ResourceScheduler {
   }
 
   /** Splits an oversized run into child shard runs and parks the parent as 'sharded'. Returns true if sharding happened. */
-  shardIfNeeded(run, plan) {
+  async shardIfNeeded(run, plan) {
     if (!needsSharding(plan)) return false;
 
     const shards = planShards(run, plan);
     for (const shard of shards) {
-      this.database.createRun({
+      await this.database.createRun({
         platform: run.platform,
         query: run.query,
         maxItems: shard.maxItems,
@@ -179,20 +179,20 @@ class ResourceScheduler {
         parentRunId: run.id
       });
     }
-    this.database.updateRun(run.id, { status: 'sharded' });
+    await this.database.updateRun(run.id, { status: 'sharded' });
     console.log(`[Scheduler] Run #${run.id} (${run.platform}) split into ${shards.length} shards (shardSize=${plan.shardSize})`);
     return true;
   }
 
   /** Aggregates any parent runs whose shards have all finished. Called every tick. */
-  reconcileShardedParents() {
-    const parents = this.database.getRunsByStatus ? this.database.getRunsByStatus('sharded') : [];
+  async reconcileShardedParents() {
+    const parents = this.database.getRunsByStatus ? await this.database.getRunsByStatus('sharded') : [];
     for (const parent of parents) {
-      const children = this.database.getChildRuns ? this.database.getChildRuns(parent.id) : [];
+      const children = this.database.getChildRuns ? await this.database.getChildRuns(parent.id) : [];
       if (!allShardsTerminal(children)) continue;
       const summary = aggregateShardResults(children);
       const finalStatus = summary.doneShards > 0 ? 'done' : 'failed';
-      this.database.updateRun(parent.id, {
+      await this.database.updateRun(parent.id, {
         status: finalStatus,
         itemsCount: summary.itemsCount,
         newCount: summary.newCount,
@@ -208,14 +208,14 @@ class ResourceScheduler {
     this.isTicking = true;
 
     try {
-      this.reconcileShardedParents();
+      await this.reconcileShardedParents();
 
       const ramSnapshot = this.monitor.getSnapshot();
       if (ramSnapshot.state === 'RED') {
         return; // Strict admission block under critical memory pressure.
       }
 
-      const candidates = this.queue.peek(20);
+      const candidates = await this.queue.peek(20);
       if (!candidates || candidates.length === 0) return;
 
       for (const run of candidates) {
@@ -223,12 +223,12 @@ class ResourceScheduler {
         try {
           plan = await this.planner.plan(run);
         } catch (err) {
-          this.handlePlanningFailure(run, err);
+          await this.handlePlanningFailure(run, err);
           continue;
         }
         this.planFailureCounts.delete(run.id);
 
-        if (this.shardIfNeeded(run, plan)) {
+        if (await this.shardIfNeeded(run, plan)) {
           continue; // Parent parked as 'sharded'; its children will be admitted on their own in subsequent ticks.
         }
 
@@ -301,14 +301,19 @@ class ResourceScheduler {
         }
 
         this.monitor.reserve(executionToken, plan.estimatedEnvelopeMB);
-        this.dispatchRun(run, plan, poolName, executionToken, attempt);
+        // Awaited so that when tick() returns, an admitted run is already
+        // marked running and holding its slot — the guarantee the synchronous
+        // better-sqlite3 version gave for free. dispatchRun only awaits the
+        // status write; the executor itself stays fire-and-forget inside it,
+        // so this does not block the tick on actual crawl work.
+        await this.dispatchRun(run, plan, poolName, executionToken, attempt);
       }
     } finally {
       this.isTicking = false;
     }
   }
 
-  dispatchRun(run, plan, poolName, executionToken, attempt) {
+  async dispatchRun(run, plan, poolName, executionToken, attempt) {
     const startTime = Date.now();
     const dispatchOptions = { ...plan.options, backend: plan.backend, mode: plan.mode, executionClass: plan.executionClass, attempt, executionToken };
 
@@ -322,7 +327,7 @@ class ResourceScheduler {
       estimatedEnvelopeMB: plan.estimatedEnvelopeMB
     });
 
-    this.queue.markRunning(run.id, {
+    await this.queue.markRunning(run.id, {
       activeBackend: plan.backend,
       inputOptions: JSON.stringify(dispatchOptions)
     });
@@ -381,14 +386,14 @@ class ResourceScheduler {
       });
   }
 
-  getStatus() {
+  async getStatus() {
     return {
       scheduler: {
         activeTicker: this.timer !== null,
         tickIntervalMs: this.tickIntervalMs
       },
       ram: this.monitor.getSnapshot(),
-      queue: this.queue.countByStatus(),
+      queue: await this.queue.countByStatus(),
       pools: this.pools.getStatus(),
       proxies: this.proxyPool ? this.proxyPool.getStatus() : null,
       cleanupFailed: Array.from(this.cleanupFailedTokens.entries()).map(([token, meta]) => ({

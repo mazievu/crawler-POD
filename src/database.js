@@ -1,5 +1,5 @@
-/**
- * Database Module — Snapshot-based tracking
+﻿/**
+ * Database Module â€” Snapshot-based tracking
  * Each collection run creates snapshots. Comparing snapshots shows:
  * - New items (appeared since last run)
  * - Active items (still running)
@@ -7,277 +7,73 @@
  * - Growth (likes/comments/shares change)
  */
 
-const Database = require('better-sqlite3');
+const { openDatabase } = require('./database/pg-client');
 const path = require('path');
 const fs = require('fs');
 const { PLATFORMS } = require('./platform-config');
 const { cleanImageUrl, extractImage, sanitizeForStorage } = require('./image-utils');
-const { initSchemaV2, migrateDeltaColumnsNullable, migrateWeeklySummaryColumns, migrateRatingDeltaColumns } = require('./database/schema-v2');
+// schema-v2's initSchemaV2/migrate* helpers were SQLite in-place upgrade paths
+// (PRAGMA probe + ALTER TABLE). pg-schema.sql declares those columns up front,
+// so they are no longer imported here.
 const { createProductCurrentOps } = require('./database/product-current');
 const { createDailyHistoryOps, normalizeLegacyUtcTimestamp } = require('./database/daily-history');
-const { createWeeklySummaryOps, recomputeWeeklySummaryFromHistory } = require('./database/weekly-summary');
+const { createWeeklySummaryOps } = require('./database/weekly-summary');
 
-const DB_PATH = path.join(__dirname, '..', 'data', 'collector.db');
-const dataDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-
-// §14/§16 DB Cutover flags — controlled via .env, default keeps legacy behavior.
+// Â§14/Â§16 DB Cutover flags â€” controlled via .env, default keeps legacy behavior.
 const LEGACY_SNAPSHOT_WRITE = (process.env.LEGACY_SNAPSHOT_WRITE || 'true').toLowerCase() !== 'false';
 const READ_MODEL_V2 = (process.env.READ_MODEL_V2 || 'false').toLowerCase() === 'true';
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-// Real concurrent-writer contention (multiple Scheduler executions writing
-// at once, or multiple processes opening this same file) previously failed
-// immediately with SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT instead of waiting
-// briefly for the other writer's transaction to finish. Found via a real
-// SQLITE_BUSY_SNAPSHOT failure during a concurrent test run this round.
-db.pragma('busy_timeout = 5000');
+// PostgreSQL connection. Opening the pool is synchronous; the schema is created
+// by initDatabase(), which entry points once before any query runs.
+// There is deliberately NO SQLite fallback â€” if Postgres is unreachable the
+// error must surface, never silently route writes back into the archived
+// collector.db.
+const db = openDatabase();
 
-initSchemaV2(db);
-migrateDeltaColumnsNullable(db);
-migrateRatingDeltaColumns(db);
-const weeklyMigration = migrateWeeklySummaryColumns(db);
-if (weeklyMigration.migrated) {
-  // Old rows used the wrong (avg+new)/2 running-average formula; rebuild every
-  // week from Tier 2 (daily_packed_history), which is untouched and authoritative.
-  recomputeWeeklySummaryFromHistory(db);
-}
+// The ops factories only build statement handles (pg-client's prepare() is
+// synchronous, exactly like better-sqlite3's), so they are still constructed at
+// module load and the statement tables below keep working unchanged.
 const dailyHistoryOps = createDailyHistoryOps(db);
 const productCurrentOps = createProductCurrentOps(db, dailyHistoryOps);
 const weeklySummaryOps = createWeeklySummaryOps(db);
 
-// ==================== Schema ====================
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS platforms (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT UNIQUE NOT NULL,
-    display_name    TEXT NOT NULL,
-    description     TEXT,
-    query_type      TEXT DEFAULT 'keyword',
-    actor_id        TEXT NOT NULL,
-    country_support INTEGER DEFAULT 0,
-    icon            TEXT DEFAULT '🔗',
-    color           TEXT DEFAULT '#888888'
-  );
-
-  CREATE TABLE IF NOT EXISTS runs (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform         TEXT NOT NULL,
-    query            TEXT NOT NULL,
-    status           TEXT DEFAULT 'pending',
-    apify_run_id     TEXT,
-    apify_dataset_id TEXT,
-    items_count      INTEGER DEFAULT 0,
-    new_count        INTEGER DEFAULT 0,
-    active_count     INTEGER DEFAULT 0,
-    dropped_count    INTEGER DEFAULT 0,
-    error_message    TEXT,
-    max_items        INTEGER DEFAULT 100,
-    country          TEXT,
-    input_options    TEXT DEFAULT '{}',
-    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at     DATETIME
-  );
-
-  CREATE TABLE IF NOT EXISTS snapshots (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id          INTEGER NOT NULL,
-    platform        TEXT NOT NULL,
-    query           TEXT NOT NULL,
-    item_uid        TEXT NOT NULL,
-    raw_data        TEXT NOT NULL,
-    title           TEXT DEFAULT '',
-    url             TEXT DEFAULT '',
-    image           TEXT DEFAULT '',
-    author          TEXT DEFAULT '',
-    price           REAL DEFAULT 0,
-    rating          REAL DEFAULT 0,
-    reviews         INTEGER DEFAULT 0,
-    sold_count      INTEGER DEFAULT 0,
-    likes           INTEGER DEFAULT 0,
-    comments        INTEGER DEFAULT 0,
-    shares          INTEGER DEFAULT 0,
-    views           INTEGER DEFAULT 0,
-    status          TEXT DEFAULT 'new',
-    prev_snapshot_id INTEGER,
-    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_snapshots_uid ON snapshots(item_uid);
-  CREATE INDEX IF NOT EXISTS idx_snapshots_platform_query ON snapshots(platform, query);
-  CREATE INDEX IF NOT EXISTS idx_snapshots_latest ON snapshots(platform, query, run_id DESC);
-  CREATE INDEX IF NOT EXISTS idx_snapshots_run ON snapshots(run_id);
-
-  CREATE TABLE IF NOT EXISTS marketplace_proxies (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    label             TEXT NOT NULL UNIQUE,
-    protocol          TEXT NOT NULL DEFAULT 'socks5',
-    host              TEXT NOT NULL,
-    port              INTEGER NOT NULL,
-    config_encrypted  TEXT NOT NULL,
-    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS marketplace_accounts (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform          TEXT NOT NULL,
-    label             TEXT NOT NULL,
-    session_encrypted TEXT NOT NULL,
-    proxy_id          INTEGER,
-    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(platform, label),
-    FOREIGN KEY (proxy_id) REFERENCES marketplace_proxies(id) ON DELETE SET NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS marketplace_captures (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform          TEXT NOT NULL,
-    account_id        INTEGER,
-    url               TEXT NOT NULL,
-    html_encrypted    TEXT NOT NULL,
-    html_sha256       TEXT NOT NULL,
-    parsed_data       TEXT NOT NULL,
-    variant_mode      TEXT NOT NULL DEFAULT 'base',
-    max_variants      INTEGER NOT NULL DEFAULT 0,
-    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (account_id) REFERENCES marketplace_accounts(id) ON DELETE SET NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_marketplace_captures_platform ON marketplace_captures(platform, created_at DESC);
-
-  CREATE TABLE IF NOT EXISTS marketplace_capture_schedules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform TEXT NOT NULL,
-    keyword TEXT NOT NULL,
-    account_id INTEGER,
-    every_minutes INTEGER NOT NULL,
-    schedule_type TEXT NOT NULL DEFAULT 'interval',
-    daily_time TEXT,
-    run_at TEXT,
-    variant_mode TEXT NOT NULL DEFAULT 'base',
-    max_variants INTEGER NOT NULL DEFAULT 0,
-    max_listings INTEGER NOT NULL DEFAULT 30,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    next_run_at TEXT NOT NULL,
-    last_run_at TEXT,
-    last_summary TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (account_id) REFERENCES marketplace_accounts(id) ON DELETE SET NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_marketplace_capture_schedules_due ON marketplace_capture_schedules(enabled, next_run_at);
-
-  CREATE TABLE IF NOT EXISTS marketplace_capture_schedule_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    schedule_id INTEGER NOT NULL,
-    summary TEXT NOT NULL,
-    completed_at TEXT NOT NULL,
-    FOREIGN KEY (schedule_id) REFERENCES marketplace_capture_schedules(id) ON DELETE CASCADE
-  );
-  CREATE INDEX IF NOT EXISTS idx_marketplace_capture_schedule_runs_schedule ON marketplace_capture_schedule_runs(schedule_id, id DESC);
-
-  CREATE TABLE IF NOT EXISTS social_bot_state (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    bot_key           TEXT NOT NULL,
-    scheduled_window  INTEGER NOT NULL,
-    query_key         TEXT NOT NULL,
-    status            TEXT NOT NULL DEFAULT 'pending',
-    run_id            INTEGER,
-    error_message     TEXT,
-    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(bot_key, scheduled_window, query_key)
-  );
-  CREATE INDEX IF NOT EXISTS idx_social_bot_state_bot ON social_bot_state(bot_key, scheduled_window DESC);
-`);
-
-const marketplaceCaptureColumns = db.prepare('PRAGMA table_info(marketplace_captures)').all();
-if (!marketplaceCaptureColumns.some((column) => column.name === 'variant_mode')) {
-  db.exec("ALTER TABLE marketplace_captures ADD COLUMN variant_mode TEXT NOT NULL DEFAULT 'base'");
-}
-if (!marketplaceCaptureColumns.some((column) => column.name === 'max_variants')) {
-  db.exec('ALTER TABLE marketplace_captures ADD COLUMN max_variants INTEGER NOT NULL DEFAULT 0');
-}
-db.exec('CREATE INDEX IF NOT EXISTS idx_marketplace_captures_cache ON marketplace_captures(platform, url, account_id, variant_mode, max_variants, id DESC)');
-const marketplaceScheduleColumns = db.prepare('PRAGMA table_info(marketplace_capture_schedules)').all();
-if (!marketplaceScheduleColumns.some((column) => column.name === 'schedule_type')) db.exec("ALTER TABLE marketplace_capture_schedules ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'interval'");
-if (!marketplaceScheduleColumns.some((column) => column.name === 'daily_time')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN daily_time TEXT');
-if (!marketplaceScheduleColumns.some((column) => column.name === 'run_at')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN run_at TEXT');
-if (!marketplaceScheduleColumns.some((column) => column.name === 'claimed_until')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN claimed_until TEXT');
-if (!marketplaceScheduleColumns.some((column) => column.name === 'claim_token')) db.exec('ALTER TABLE marketplace_capture_schedules ADD COLUMN claim_token TEXT');
-try {
-  const { normalizeMarketplaceCaptureUrl } = require('./marketplaces/validation');
-  const normalizeCaptureUrl = db.prepare('UPDATE marketplace_captures SET url = ? WHERE id = ?');
-  for (const capture of db.prepare('SELECT id, platform, url FROM marketplace_captures').all()) {
-    const normalizedUrl = normalizeMarketplaceCaptureUrl(capture.platform, capture.url);
-    if (normalizedUrl !== capture.url) normalizeCaptureUrl.run(normalizedUrl, capture.id);
-  }
-} catch (error) {
-  console.warn('[DB] Could not normalize existing marketplace capture URLs:', error.message);
-}
-
-// Migrate: if old schema exists, migrate
-const tableInfo = db.prepare(`PRAGMA table_info(runs)`).all();
-const hasRuns = tableInfo.some((c) => c.name === 'new_count');
-if (!hasRuns) {
-  // Old schema — keep old tables, just add runs/snapshots
-  console.log('[DB] Adding snapshot tables...');
-}
-
-// Run backend metadata migration
-try {
-  const runBackendMetadataMigration = require('./migrations/001_run_backend_metadata');
-  runBackendMetadataMigration(db);
-} catch (e) {
-  console.error('[DB] Failed to run backend metadata migration:', e);
-}
-
-// Product fields are additive so existing local databases remain usable.
-const snapshotColumns = new Set(db.prepare('PRAGMA table_info(snapshots)').all().map((column) => column.name));
-for (const [name, definition] of Object.entries({
-  rating: 'REAL DEFAULT 0',
-  reviews: 'INTEGER DEFAULT 0',
-  sold_count: 'INTEGER DEFAULT 0',
-})) {
-  if (!snapshotColumns.has(name)) db.exec(`ALTER TABLE snapshots ADD COLUMN ${name} ${definition}`);
-}
-
-const runColumns = new Set(db.prepare('PRAGMA table_info(runs)').all().map((column) => column.name));
-if (!runColumns.has('input_options')) db.exec("ALTER TABLE runs ADD COLUMN input_options TEXT DEFAULT '{}'");
-if (!runColumns.has('parent_run_id')) db.exec('ALTER TABLE runs ADD COLUMN parent_run_id INTEGER');
-// §6.1 (Final Blocker Fix Round): a Run's own packed result array, for
-// run-detail/export/debug reads that must work regardless of
-// LEGACY_SNAPSHOT_WRITE. A normal Run is <=20-30 items, so this is a small
-// JSON column on the existing runs row — not a new one-row-per-item table
-// (explicitly avoided per this round's "no row explosion" instruction).
-// History (trends over time) is never sourced from this column — that
-// remains daily_packed_history exclusively.
-if (!runColumns.has('result_items_json')) db.exec('ALTER TABLE runs ADD COLUMN result_items_json TEXT');
-// Gap #4 closure (Final Gap Closure Round): minimum metadata to identify
-// external work that can outlive this Node process (Toidispy/CDP child
-// process, Apify actor run) — {executionClass, externalExecutionId,
-// startedAt}. RestartRecovery reads this on boot to avoid blindly
-// duplicating a still-running external execution. Kept separate from
-// health_snapshot (which heartbeat.js overwrites on its own throttled
-// schedule) so neither write path clobbers the other.
-if (!runColumns.has('external_execution_json')) db.exec('ALTER TABLE runs ADD COLUMN external_execution_json TEXT');
-db.exec('CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id)');
-
-const marketplaceAccountColumns = new Set(db.prepare('PRAGMA table_info(marketplace_accounts)').all().map((column) => column.name));
-if (!marketplaceAccountColumns.has('proxy_id')) db.exec('ALTER TABLE marketplace_accounts ADD COLUMN proxy_id INTEGER');
-
-// ==================== Seed Platforms ====================
+const PG_SCHEMA_PATH = path.join(__dirname, 'database', 'pg-schema.sql');
 
 const insertPlatform = db.prepare(`
   INSERT OR IGNORE INTO platforms (name, display_name, description, query_type, actor_id, country_support, icon, color)
   VALUES (@name, @displayName, @description, @queryType, @actorId, @countrySupport, @icon, @color)
 `);
-db.transaction(() => { for (const p of PLATFORMS) insertPlatform.run(p); })();
+
+let initPromise = null;
+
+/**
+ * Creates the schema and seeds the platform table.
+ *
+ * Under better-sqlite3 all of this ran as a side effect of require(), because
+ * every call was synchronous. Postgres queries are async, so initialisation
+ * becomes an explicit step callers once at startup. The promise is
+ * memoised, so concurrent callers share a single initialisation.
+ *
+ * The long chain of `PRAGMA table_info` probes and conditional `ALTER TABLE`s
+ * that used to live here existed only to upgrade *older SQLite files* in place.
+ * A Postgres database is created from pg-schema.sql, which already declares
+ * every one of those columns, so those probes have no work left to do.
+ */
+async function initDatabase() {
+  if (!initPromise) {
+    initPromise = (async () => {
+      await db.exec(fs.readFileSync(PG_SCHEMA_PATH, 'utf8'));
+      const seed = db.transaction(async () => {
+        for (const p of PLATFORMS) await insertPlatform.run(p);
+      });
+      await seed();
+      // Historic-data backfills; previously require()-time side effects.
+      await backfillSnapshotImages();
+      await backfillSnapshotProductMetrics();
+    })();
+  }
+  return initPromise;
+}
 
 // ==================== Prepared Statements ====================
 
@@ -294,8 +90,8 @@ const stmt = {
   findQueuedRuns: db.prepare("SELECT * FROM runs WHERE status IN ('queued', 'pending') ORDER BY id ASC LIMIT ?"),
   findAllRuns: db.prepare('SELECT * FROM runs ORDER BY created_at DESC LIMIT ?'),
   findRunsByStatus: db.prepare('SELECT * FROM runs WHERE status = ? ORDER BY id ASC'),
-  // Final Implementation Closure §2: completed_at must only be stamped on a
-  // terminal transition, never on a routine heartbeat/progress update — those
+  // Final Implementation Closure Â§2: completed_at must only be stamped on a
+  // terminal transition, never on a routine heartbeat/progress update â€” those
   // call updateRun() too (via HeartbeatTracker.persist()) while the Run is
   // still legitimately running.
   updateRun: db.prepare(`
@@ -326,7 +122,7 @@ const stmt = {
     SELECT * FROM snapshots WHERE platform = ? AND query = ? AND item_uid = ? AND run_id < ?
     ORDER BY run_id DESC LIMIT 1
   `),
-  // §12: marks a V2 product_current row dropped — used by insertSnapshots()
+  // Â§12: marks a V2 product_current row dropped â€” used by insertSnapshots()
   // for dropped-item detection that no longer depends on the legacy
   // snapshots table.
   markProductCurrentDropped: db.prepare(`UPDATE product_current SET status = 'dropped' WHERE item_uid = ?`),
@@ -399,7 +195,7 @@ const stmt = {
   `),
   findMarketplaceCaptures: db.prepare(`
     SELECT id, platform, account_id, url, html_sha256, parsed_data, variant_mode, max_variants, created_at
-    FROM marketplace_captures WHERE (@platform IS NULL OR platform = @platform)
+    FROM marketplace_captures WHERE (@platform::text IS NULL OR platform = @platform)
     ORDER BY id DESC LIMIT @limit
   `),
   findMarketplaceCapture: db.prepare(`
@@ -411,7 +207,7 @@ const stmt = {
     FROM marketplace_captures
     WHERE platform = @platform
       AND url = @url
-      AND ((account_id IS NULL AND @accountId IS NULL) OR account_id = @accountId)
+      AND ((account_id IS NULL AND @accountId::int IS NULL) OR account_id = @accountId)
       AND variant_mode = @variantMode
       AND max_variants = @maxVariants
     ORDER BY id DESC
@@ -436,10 +232,10 @@ const stmt = {
     WHERE id = @id AND (claimed_until IS NULL OR claimed_until < @now)
   `),
   // Final Stabilization Round #12: opposite guard from the initial claim above
-  // — only extends a claim that is CURRENTLY still held (claimed_until in the
+  // â€” only extends a claim that is CURRENTLY still held (claimed_until in the
   // future), never one that has already expired (a second tick may have
   // claimed it in the meantime; renewal must not steal it back).
-  // §6: claim_token must match — a second process that claimed between
+  // Â§6: claim_token must match â€” a second process that claimed between
   // renewals gets a different token and this renewal correctly no-ops.
   renewMarketplaceCaptureScheduleClaim: db.prepare(`
     UPDATE marketplace_capture_schedules SET claimed_until = @claimedUntil
@@ -449,12 +245,12 @@ const stmt = {
     UPDATE marketplace_capture_schedules SET claimed_until = NULL, claim_token = NULL
     WHERE id = @id AND (claim_token IS NULL OR claim_token = @claimToken)
   `),
-  // §3 (Final Blocker Fix Round): completion is claim_token-protected exactly
-  // like renew/release — a stale attempt whose claim was already lost cannot
+  // Â§3 (Final Blocker Fix Round): completion is claim_token-protected exactly
+  // like renew/release â€” a stale attempt whose claim was already lost cannot
   // mark the schedule complete, clear a newer claim, or advance next_run_at.
   // `IS` (not `=`) is required for NULL-safe comparison: a never-claimed
   // schedule has claim_token IS NULL, and completing it with no claimToken
-  // supplied (claimToken=NULL) must still match — `NULL = NULL` is NULL
+  // supplied (claimToken=NULL) must still match â€” `NULL = NULL` is NULL
   // (never true) in SQL, but `NULL IS NULL` is true.
   completeMarketplaceCaptureSchedule: db.prepare(`
     UPDATE marketplace_capture_schedules SET last_run_at = @now, next_run_at = @nextRunAt, last_summary = @summary, claimed_until = NULL, claim_token = NULL
@@ -485,26 +281,27 @@ const stmt = {
 
 // Existing records keep their history, but recover images that were already
 // present in raw payloads and were missed by the former fixed-field parser.
-function backfillSnapshotImages() {
-  const rows = stmt.findSnapshotsMissingImage.all();
-  const update = db.transaction((snapshots) => {
+async function backfillSnapshotImages() {
+  const rows = await stmt.findSnapshotsMissingImage.all();
+  const update = db.transaction(async (snapshots) => {
     for (const snapshot of snapshots) {
       try {
         const image = extractImage(JSON.parse(snapshot.raw_data));
-        if (image) stmt.updateSnapshotImage.run(image, snapshot.id);
+        if (image) await stmt.updateSnapshotImage.run(image, snapshot.id);
       } catch {
         // Keep malformed historic payloads untouched.
       }
     }
   });
-  update(rows);
+  await update(rows);
 }
 
-backfillSnapshotImages();
+// Invoked from initDatabase() â€” these used to run as a require()-time side
+// effect when every SQLite call was synchronous.
 
-function backfillSnapshotProductMetrics() {
-  const rows = db.prepare('SELECT id, raw_data, price, rating, reviews, sold_count FROM snapshots').all();
-  const update = db.transaction((snapshots) => {
+async function backfillSnapshotProductMetrics() {
+  const rows = await db.prepare('SELECT id, raw_data, price, rating, reviews, sold_count FROM snapshots').all();
+  const update = db.transaction(async (snapshots) => {
     for (const snapshot of snapshots) {
       try {
         const parsed = parseItemData(JSON.parse(snapshot.raw_data));
@@ -513,120 +310,166 @@ function backfillSnapshotProductMetrics() {
         const reviews = snapshot.reviews || parsed.reviews;
         const soldCount = snapshot.sold_count || parsed.soldCount;
         if (price !== snapshot.price || rating !== snapshot.rating || reviews !== snapshot.reviews || soldCount !== snapshot.sold_count) {
-          stmt.updateSnapshotProductMetrics.run(price, rating, reviews, soldCount, snapshot.id);
+          await stmt.updateSnapshotProductMetrics.run(price, rating, reviews, soldCount, snapshot.id);
         }
       } catch {
         // Keep malformed historic payloads untouched.
       }
     }
   });
-  update(rows);
+  await update(rows);
 }
 
-backfillSnapshotProductMetrics();
+// Invoked from initDatabase() (see above).
 
 // ==================== CRUD Operations ====================
 
-function getAllPlatforms() { return stmt.findAllPlatforms.all(); }
+async function getAllPlatforms() { return await stmt.findAllPlatforms.all(); }
 
-function createRun({ platform, query, maxItems = 100, country = null, requestedBackend = null, options = {}, parentRunId = null }) {
-  const r = stmt.createRun.run({ platform, query, maxItems, country, requestedBackend, inputOptions: JSON.stringify(options || {}) });
+async function createRun({ platform, query, maxItems = 100, country = null, requestedBackend = null, options = {}, parentRunId = null }) {
+  const r = await stmt.createRun.run({ platform, query, maxItems, country, requestedBackend, inputOptions: JSON.stringify(options || {}) });
   if (parentRunId) {
-    db.prepare('UPDATE runs SET parent_run_id = ? WHERE id = ?').run(parentRunId, r.lastInsertRowid);
+    await db.prepare('UPDATE runs SET parent_run_id = ? WHERE id = ?').run(parentRunId, r.lastInsertRowid);
   }
-  return stmt.findRunById.get(r.lastInsertRowid);
+  return await stmt.findRunById.get(r.lastInsertRowid);
 }
 
-function getChildRuns(parentRunId) {
-  return db.prepare('SELECT * FROM runs WHERE parent_run_id = ? ORDER BY id ASC').all(parentRunId);
+async function getChildRuns(parentRunId) {
+  return await db.prepare('SELECT * FROM runs WHERE parent_run_id = ? ORDER BY id ASC').all(parentRunId);
 }
 
-function getRunById(id) { return stmt.findRunById.get(id); }
-function getQueuedRuns(limit = 10) { return stmt.findQueuedRuns.all(limit); }
-function getAllRuns(limit = 100) { return stmt.findAllRuns.all(limit); }
-function getRunsByStatus(status) { return stmt.findRunsByStatus.all(status); }
-function deleteRun(id) { stmt.deleteRun.run(id); }
+async function getRunById(id) { return await stmt.findRunById.get(id); }
+async function getQueuedRuns(limit = 10) { return await stmt.findQueuedRuns.all(limit); }
+async function getAllRuns(limit = 100) { return await stmt.findAllRuns.all(limit); }
+async function getRunsByStatus(status) { return await stmt.findRunsByStatus.all(status); }
+async function deleteRun(id) { await stmt.deleteRun.run(id); }
 
-function deleteItem(itemUid) {
+async function deleteItem(itemUid) {
   if (!itemUid) return { changes: 0 };
-  const tx = db.transaction((uid) => {
-    const snapResult = db.prepare('DELETE FROM snapshots WHERE item_uid = ?').run(uid);
-    try { db.prepare('DELETE FROM product_current WHERE item_uid = ?').run(uid); } catch (_) {}
-    try { db.prepare('DELETE FROM daily_packed_history WHERE item_uid = ?').run(uid); } catch (_) {}
-    try { db.prepare('DELETE FROM weekly_product_summary WHERE item_uid = ?').run(uid); } catch (_) {}
+  const tx = db.transaction(async (uid) => {
+    const snapResult = await db.prepare('DELETE FROM snapshots WHERE item_uid = ?').run(uid);
+    try { await db.prepare('DELETE FROM product_current WHERE item_uid = ?').run(uid); } catch (_) {}
+    try { await db.prepare('DELETE FROM daily_packed_history WHERE item_uid = ?').run(uid); } catch (_) {}
+    try { await db.prepare('DELETE FROM weekly_product_summary WHERE item_uid = ?').run(uid); } catch (_) {}
     return { changes: snapResult.changes };
   });
-  return tx(itemUid);
+  return await tx(itemUid);
 }
 
-function deleteAllItems({ platform = null, query = null } = {}) {
-  const tx = db.transaction(() => {
+async function deleteAllItems({ platform = null, query = null } = {}) {
+  const tx = db.transaction(async () => {
     let snapResult;
     if (platform && query) {
-      snapResult = db.prepare('DELETE FROM snapshots WHERE platform = ? AND query = ?').run(platform, query);
-      try { db.prepare('DELETE FROM product_current WHERE platform = ? AND query = ?').run(platform, query); } catch (_) {}
-      try { db.prepare('DELETE FROM daily_packed_history WHERE platform = ? AND query = ?').run(platform, query); } catch (_) {}
+      snapResult = await db.prepare('DELETE FROM snapshots WHERE platform = ? AND query = ?').run(platform, query);
+      try { await db.prepare('DELETE FROM product_current WHERE platform = ? AND query = ?').run(platform, query); } catch (_) {}
+      try { await db.prepare('DELETE FROM daily_packed_history WHERE platform = ? AND query = ?').run(platform, query); } catch (_) {}
     } else if (platform) {
-      snapResult = db.prepare('DELETE FROM snapshots WHERE platform = ?').run(platform);
-      try { db.prepare('DELETE FROM product_current WHERE platform = ?').run(platform); } catch (_) {}
-      try { db.prepare('DELETE FROM daily_packed_history WHERE platform = ?').run(platform); } catch (_) {}
+      snapResult = await db.prepare('DELETE FROM snapshots WHERE platform = ?').run(platform);
+      try { await db.prepare('DELETE FROM product_current WHERE platform = ?').run(platform); } catch (_) {}
+      try { await db.prepare('DELETE FROM daily_packed_history WHERE platform = ?').run(platform); } catch (_) {}
     } else {
-      snapResult = db.prepare('DELETE FROM snapshots').run();
-      try { db.prepare('DELETE FROM product_current').run(); } catch (_) {}
-      try { db.prepare('DELETE FROM daily_packed_history').run(); } catch (_) {}
+      snapResult = await db.prepare('DELETE FROM snapshots').run();
+      try { await db.prepare('DELETE FROM product_current').run(); } catch (_) {}
+      try { await db.prepare('DELETE FROM daily_packed_history').run(); } catch (_) {}
     }
     return { changes: snapResult.changes };
   });
-  return tx();
+  return await tx();
 }
 
 const TERMINAL_RUN_STATUSES = new Set(['done', 'failed', 'stuck', 'cancelled', 'timeout']);
 
-function updateRun(id, updates) {
-  const run = stmt.findRunById.get(id);
+/**
+ * Column names updateRun() accepts, in both camelCase and snake_case (callers
+ * use both spellings).
+ */
+const RUN_UPDATE_COLUMNS = {
+  status: 'status',
+  apifyRunId: 'apify_run_id', apify_run_id: 'apify_run_id',
+  apifyDatasetId: 'apify_dataset_id', apify_dataset_id: 'apify_dataset_id',
+  itemsCount: 'items_count', items_count: 'items_count',
+  newCount: 'new_count', new_count: 'new_count',
+  activeCount: 'active_count', active_count: 'active_count',
+  droppedCount: 'dropped_count', dropped_count: 'dropped_count',
+  errorMessage: 'error_message', error_message: 'error_message',
+  activeBackend: 'active_backend', active_backend: 'active_backend',
+  backendKind: 'backend_kind', backend_kind: 'backend_kind',
+  backendStatus: 'backend_status', backend_status: 'backend_status',
+  backendVersion: 'backend_version', backend_version: 'backend_version',
+  backendRunId: 'backend_run_id', backend_run_id: 'backend_run_id',
+  healthSnapshot: 'health_snapshot', health_snapshot: 'health_snapshot',
+  costEstimate: 'cost_estimate', cost_estimate: 'cost_estimate',
+  inputOptions: 'input_options', input_options: 'input_options',
+};
+
+/**
+ * Writes ONLY the fields the caller supplied.
+ *
+ * This used to read the whole row, merge `updates` over it, and write every
+ * column back. That was safe while better-sqlite3 made read-then-write a single
+ * uninterrupted step. Once the PostgreSQL cutover made both halves async, two
+ * concurrent callers could interleave:
+ *
+ *   heartbeat  : read row (status='running')
+ *   executeRun : read row (status='running')
+ *   executeRun : write status='done'   + completed_at
+ *   heartbeat  : write status='running'   <- from its own stale snapshot
+ *
+ * which left a finished run stuck at 'running' with completed_at already
+ * stamped (seen on run #1: 20/20 items saved, heartbeat stage COMPLETED,
+ * status still 'running'). completed_at survived only because its CASE keeps
+ * the existing value on a non-terminal write.
+ *
+ * Touching just the supplied columns removes the lost update: a heartbeat
+ * writing health_snapshot can no longer move `status` at all.
+ */
+async function updateRun(id, updates) {
+  const run = await stmt.findRunById.get(id);
   if (!run) return;
-  const nextStatus = updates.status ?? run.status;
+
+  const assignments = [];
+  const params = { id };
+  const seen = new Set();
+
+  for (const [key, value] of Object.entries(updates)) {
+    const column = RUN_UPDATE_COLUMNS[key];
+    // `undefined` meant "not supplied" to the old merge, which fell back to the
+    // existing value — leaving the column alone is the same behaviour.
+    if (!column || value === undefined || seen.has(column)) continue;
+    seen.add(column);
+    assignments.push(`${column}=@${key}`);
+    params[key] = value;
+  }
+
+  // Gap #4 closure: `externalExecution: null` explicitly clears it; omitting it
+  // entirely leaves the existing value untouched.
+  if ('externalExecution' in updates) {
+    assignments.push('external_execution_json=@externalExecutionJson');
+    params.externalExecutionJson =
+      updates.externalExecution == null ? null : JSON.stringify(updates.externalExecution);
+  }
+
   // Only a terminal status stamps completed_at — a heartbeat/progress update
-  // (which calls updateRun() with the SAME non-terminal status, e.g. 'running')
-  // must leave completed_at untouched.
-  const isTerminal = TERMINAL_RUN_STATUSES.has(nextStatus) ? 1 : 0;
-  stmt.updateRun.run({
-    id,
-    isTerminal,
-    status: updates.status ?? run.status,
-    apifyRunId: updates.apifyRunId ?? run.apify_run_id,
-    apifyDatasetId: updates.apifyDatasetId ?? run.apify_dataset_id,
-    itemsCount: updates.itemsCount ?? run.items_count,
-    newCount: updates.newCount ?? run.new_count,
-    activeCount: updates.activeCount ?? run.active_count,
-    droppedCount: updates.droppedCount ?? run.dropped_count,
-    errorMessage: updates.errorMessage ?? run.error_message,
-    activeBackend: updates.activeBackend ?? updates.active_backend ?? run.active_backend,
-    backendKind: updates.backendKind ?? updates.backend_kind ?? run.backend_kind,
-    backendStatus: updates.backendStatus ?? updates.backend_status ?? run.backend_status,
-    backendVersion: updates.backendVersion ?? updates.backend_version ?? run.backend_version,
-    backendRunId: updates.backendRunId ?? updates.backend_run_id ?? run.backend_run_id,
-    healthSnapshot: updates.healthSnapshot ?? updates.health_snapshot ?? run.health_snapshot,
-    costEstimate: updates.costEstimate ?? updates.cost_estimate ?? run.cost_estimate,
-    inputOptions: updates.inputOptions ?? updates.input_options ?? run.input_options,
-    // Gap #4 closure: `externalExecution: null` explicitly clears it (e.g. once
-    // no longer relevant); omitted entirely leaves the existing value untouched.
-    externalExecutionJson: 'externalExecution' in updates
-      ? (updates.externalExecution == null ? null : JSON.stringify(updates.externalExecution))
-      : run.external_execution_json,
-  });
+  // does not send `status` at all, so it must leave completed_at untouched.
+  if (updates.status !== undefined) {
+    params.isTerminal = TERMINAL_RUN_STATUSES.has(updates.status) ? 1 : 0;
+    assignments.push('completed_at=CASE WHEN @isTerminal = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END');
+  }
+
+  if (assignments.length === 0) return;
+  await db.prepare(`UPDATE runs SET ${assignments.join(', ')} WHERE id=@id`).run(params);
 }
 
 /**
  * Insert items from a collection run, comparing with previous run.
  * Returns { newItems, activeItems, droppedItems, snapshots }
  */
-function insertSnapshots(runId, platform, query, items) {
-  const run = stmt.findRunById.get(runId);
+async function insertSnapshots(runId, platform, query, items) {
+  const run = await stmt.findRunById.get(runId);
   if (!run) return { newItems: 0, activeItems: 0, droppedItems: 0 };
 
   // Get the most recent previous run for this platform+query
-  const prevRun = db.prepare(`
+  const prevRun = await db.prepare(`
     SELECT id FROM runs WHERE platform=? AND query=? AND status='done' AND id < ?
     ORDER BY id DESC LIMIT 1
   `).get(platform, query, runId);
@@ -635,16 +478,16 @@ function insertSnapshots(runId, platform, query, items) {
 
   let newCount = 0, activeCount = 0, droppedCount = 0;
   const currentUids = new Set();
-  const resultItems = []; // §6.1: this Run's own packed result array
+  const resultItems = []; // Â§6.1: this Run's own packed result array
 
-  const insertMany = db.transaction((txItems) => {
+  const insertMany = db.transaction(async (txItems) => {
     for (const item of txItems) {
       const parsed = parseItemData(item);
       const itemUid = generateUid(platform, query, parsed);
       currentUids.add(itemUid);
 
-      // §12: new/active must be derived from V2 (product_current), which is
-      // authoritative regardless of LEGACY_SNAPSHOT_WRITE — the legacy
+      // Â§12: new/active must be derived from V2 (product_current), which is
+      // authoritative regardless of LEGACY_SNAPSHOT_WRITE â€” the legacy
       // snapshots table stops growing once legacy writes are disabled, which
       // would otherwise make every item look "new" forever from that point on.
       const v2Payload = {
@@ -667,8 +510,8 @@ function insertSnapshots(runId, platform, query, items) {
 
       let v2Result = null;
       try {
-        v2Result = productCurrentOps.upsertItem(v2Payload, runId);
-        // §4: runId gives this observation a stable identity (run:<runId>:<itemUid>)
+        v2Result = await productCurrentOps.upsertItem(v2Payload, runId);
+        // Â§4: runId gives this observation a stable identity (run:<runId>:<itemUid>)
         // so a retried insertSnapshots() call for the same run never duplicates it.
         dailyHistoryOps.appendObservation(v2Payload, new Date(), { runId });
         // weekly_summary is deprecated from the core write path (Simplification
@@ -679,8 +522,8 @@ function insertSnapshots(runId, platform, query, items) {
         // Simplification Round #17: a V2 write failure must never be a silent
         // divergence between legacy snapshots (already committed above) and
         // V2 Current/History. Record a durable repair task instead of only
-        // logging — recordV2WriteFailure() below.
-        recordV2WriteFailure(runId, itemUid, v2Err.message);
+        // logging â€” recordV2WriteFailure() below.
+        await recordV2WriteFailure(runId, itemUid, v2Err.message);
       }
 
       // Legacy status field kept for the optional legacy row below; falls
@@ -691,13 +534,13 @@ function insertSnapshots(runId, platform, query, items) {
       if (v2Result) {
         status = v2Result.isNew ? 'new' : 'active';
       } else {
-        const prevSnapshot = prevRunId > 0 ? stmt.findPreviousSnapshot.get(platform, query, itemUid, runId + 1) : null;
+        const prevSnapshot = prevRunId > 0 ? await stmt.findPreviousSnapshot.get(platform, query, itemUid, runId + 1) : null;
         status = prevSnapshot ? 'active' : 'new';
         if (prevSnapshot) prevSnapshotId = prevSnapshot.id;
       }
       if (status === 'new') newCount++; else activeCount++;
 
-      // §6.1: this Run's own packed result array — populated unconditionally
+      // Â§6.1: this Run's own packed result array â€” populated unconditionally
       // (not gated by LEGACY_SNAPSHOT_WRITE), so /api/runs/:id and
       // /api/export/:runId never depend on legacy `snapshots` rows existing.
       resultItems.push({
@@ -732,10 +575,10 @@ function insertSnapshots(runId, platform, query, items) {
         observed_at: new Date().toISOString()
       });
 
-      // §14/§16: Gate legacy snapshot writes. When LEGACY_SNAPSHOT_WRITE=false,
+      // Â§14/Â§16: Gate legacy snapshot writes. When LEGACY_SNAPSHOT_WRITE=false,
       // the snapshots table stops growing (no new rows). V2 dual-write continues.
       if (LEGACY_SNAPSHOT_WRITE) {
-        stmt.insertSnapshot.run({
+        await stmt.insertSnapshot.run({
           runId,
           platform,
           query,
@@ -759,7 +602,7 @@ function insertSnapshots(runId, platform, query, items) {
       }
     }
 
-    // §12: dropped items — sourced from product_current (V2), never the
+    // Â§12: dropped items â€” sourced from product_current (V2), never the
     // legacy snapshots table. An item counts as dropped for this run when it
     // was last touched by the immediately-preceding run for this
     // platform+query (product_current.last_run_id = prevRunId) but is absent
@@ -767,19 +610,19 @@ function insertSnapshots(runId, platform, query, items) {
     // off, across arbitrarily many subsequent runs, using only columns
     // product_current already has (no new metadata table).
     if (prevRunId > 0) {
-      const staleCandidates = db.prepare(
+      const staleCandidates = await db.prepare(
         "SELECT * FROM product_current WHERE platform = ? AND query = ? AND last_run_id = ? AND status != 'dropped'"
       ).all(platform, query, prevRunId);
       for (const cand of staleCandidates) {
         if (currentUids.has(cand.item_uid)) continue;
         droppedCount++;
-        stmt.markProductCurrentDropped.run(cand.item_uid);
-        // §16: Only insert legacy dropped snapshots if flag is on. Sourced
+        await stmt.markProductCurrentDropped.run(cand.item_uid);
+        // Â§16: Only insert legacy dropped snapshots if flag is on. Sourced
         // from product_current's own fields, not a legacy-table read, so
         // this still works correctly even if legacy writes were already off
         // during the run that most recently touched this item.
         if (LEGACY_SNAPSHOT_WRITE) {
-          stmt.insertSnapshot.run({
+          await stmt.insertSnapshot.run({
             runId,
             platform,
             query,
@@ -805,13 +648,13 @@ function insertSnapshots(runId, platform, query, items) {
     }
   });
 
-  insertMany(items);
+  await insertMany(items);
 
-  // §6.1: written unconditionally, independent of LEGACY_SNAPSHOT_WRITE.
-  db.prepare('UPDATE runs SET result_items_json = ? WHERE id = ?').run(JSON.stringify(resultItems), runId);
+  // Â§6.1: written unconditionally, independent of LEGACY_SNAPSHOT_WRITE.
+  await db.prepare('UPDATE runs SET result_items_json = ? WHERE id = ?').run(JSON.stringify(resultItems), runId);
 
   // Update run counts
-  updateRun(runId, {
+  await updateRun(runId, {
     itemsCount: items.length,
     newCount,
     activeCount,
@@ -822,18 +665,18 @@ function insertSnapshots(runId, platform, query, items) {
 }
 
 /**
- * §6.2: single helper for "what items did this Run produce" — used by both
+ * Â§6.2: single helper for "what items did this Run produce" â€” used by both
  * /api/runs/:id and /api/export/:runId so neither route hand-rolls its own
  * legacy-vs-V2 branching. READ_MODEL_V2=false reads legacy `snapshots`
  * (unchanged behavior); READ_MODEL_V2=true reads runs.result_items_json,
  * which is populated on every insertSnapshots() call regardless of
- * LEGACY_SNAPSHOT_WRITE — so this never returns empty for a post-cutover Run.
+ * LEGACY_SNAPSHOT_WRITE â€” so this never returns empty for a post-cutover Run.
  */
-function getRunItems(runId) {
+async function getRunItems(runId) {
   if (!READ_MODEL_V2) {
-    return getSnapshotsByRunId(runId);
+    return await getSnapshotsByRunId(runId);
   }
-  const run = stmt.findRunById.get(runId);
+  const run = await stmt.findRunById.get(runId);
   if (!run || !run.result_items_json) return [];
   try {
     return JSON.parse(run.result_items_json);
@@ -843,28 +686,28 @@ function getRunItems(runId) {
 }
 
 /**
- * §6.3: idempotent backfill — only processes runs whose result_items_json is
+ * Â§6.3: idempotent backfill â€” only processes runs whose result_items_json is
  * still NULL, from their existing legacy `snapshots` rows. Running this
  * twice processes zero additional rows the second time. Never deletes or
  * modifies legacy data.
  */
-function backfillRunResultItems() {
-  const targets = db.prepare('SELECT id FROM runs WHERE result_items_json IS NULL').all();
+async function backfillRunResultItems() {
+  const targets = await db.prepare('SELECT id FROM runs WHERE result_items_json IS NULL').all();
   let migrated = 0;
   for (const { id } of targets) {
-    const snapshots = getSnapshotsByRunId(id);
+    const snapshots = await getSnapshotsByRunId(id);
     const resultItems = snapshots.map((s) => ({
       item_uid: s.item_uid, platform: s.platform, title: s.title, url: s.url, image: s.image, author: s.author,
       price: s.price, rating: s.rating, reviews: s.reviews, sold_count: s.sold_count, likes: s.likes,
       comments: s.comments, shares: s.shares, views: s.views, status: s.status, observed_at: s.created_at
     }));
-    db.prepare('UPDATE runs SET result_items_json = ? WHERE id = ?').run(JSON.stringify(resultItems), id);
+    await db.prepare('UPDATE runs SET result_items_json = ? WHERE id = ?').run(JSON.stringify(resultItems), id);
     migrated++;
   }
   return { migrated, totalCandidates: targets.length };
 }
 
-function getLatestSnapshots({ search = '', platform = '', limit = 200 } = {}) {
+async function getLatestSnapshots({ search = '', platform = '', limit = 200 } = {}) {
   const terms = String(search).trim().toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
   const filters = [];
   const params = { limit: Math.min(500, Math.max(1, Number.parseInt(limit, 10) || 200)) };
@@ -878,7 +721,7 @@ function getLatestSnapshots({ search = '', platform = '', limit = 200 } = {}) {
     params[parameter] = `%${term}%`;
   }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-  return db.prepare(`
+  return await db.prepare(`
     SELECT s.* FROM snapshots s
     INNER JOIN (SELECT platform, query, MAX(run_id) as max_run FROM snapshots GROUP BY platform, query) latest
     ON s.platform = latest.platform AND s.query = latest.query AND s.run_id = latest.max_run
@@ -887,53 +730,77 @@ function getLatestSnapshots({ search = '', platform = '', limit = 200 } = {}) {
     LIMIT @limit
   `).all(params);
 }
-function getSnapshotHistory(itemUid) { return stmt.getSnapshotHistory.all(itemUid); }
-function getLatestSnapshotByUid(itemUid) {
-  return db.prepare('SELECT * FROM snapshots WHERE item_uid = ? ORDER BY id DESC LIMIT 1').get(itemUid);
+async function getSnapshotHistory(itemUid) { return await stmt.getSnapshotHistory.all(itemUid); }
+async function getLatestSnapshotByUid(itemUid) {
+  return await db.prepare('SELECT * FROM snapshots WHERE item_uid = ? ORDER BY id DESC LIMIT 1').get(itemUid);
 }
-function getSnapshotsByRunId(runId) { return stmt.findSnapshotsByRunId.all(runId); }
-function getSnapshotsMissingEtsyImages(limit = 50) {
-  const normalizedLimit = Math.min(500, Math.max(1, Number.parseInt(limit, 10) || 50));
-  return stmt.findSnapshotsMissingEtsyImage.all(normalizedLimit);
-}
-function updateSnapshotImage(id, image) {
-  const normalizedImage = cleanImageUrl(image);
-  if (!normalizedImage) return false;
-  return stmt.updateSnapshotImage.run(normalizedImage, id).changes > 0;
+async function getSnapshotsByRunId(runId) { return await stmt.findSnapshotsByRunId.all(runId); }
+/**
+ * Cache-tier lookup for the marketplace scrapers' last-resort "reuse real past
+ * data" step.
+ *
+ * The Etsy and eBay scrapers used to open ./data/collector.db directly with
+ * their own read-only better-sqlite3 handle. After the Postgres cutover that
+ * would have been an active runtime read of the archived SQLite file, so the
+ * query lives here instead and runs against the same Postgres connection as
+ * everything else. LIKE is rewritten to ILIKE by pg-client, preserving the
+ * case-insensitive matching these scrapers relied on under SQLite.
+ */
+async function getSnapshotsMatchingQuery(platform, query, limit = 30) {
+  const normalizedLimit = Math.min(500, Math.max(1, Number.parseInt(limit, 10) || 30));
+  const like = `%${String(query || '')}%`;
+  return await db
+    .prepare(
+      `SELECT DISTINCT title, url, image, author, price, rating, reviews, sold_count
+       FROM snapshots
+       WHERE platform = ? AND (author LIKE ? OR query LIKE ? OR title LIKE ?)
+       LIMIT ?`
+    )
+    .all(platform, like, like, like, normalizedLimit);
 }
 
-function getStats() {
-  const totalRuns = stmt.countRuns.get().total;
+async function getSnapshotsMissingEtsyImages(limit = 50) {
+  const normalizedLimit = Math.min(500, Math.max(1, Number.parseInt(limit, 10) || 50));
+  return await stmt.findSnapshotsMissingEtsyImage.all(normalizedLimit);
+}
+async function updateSnapshotImage(id, image) {
+  const normalizedImage = cleanImageUrl(image);
+  if (!normalizedImage) return false;
+  return (await stmt.updateSnapshotImage.run(normalizedImage, id)).changes > 0;
+}
+
+async function getStats() {
+  const totalRuns = (await stmt.countRuns.get()).total;
   let totalSnapshots = 0;
   const platformCounts = {};
 
   try {
     if (READ_MODEL_V2) {
-      const totalRow = db.prepare("SELECT COUNT(*) as total FROM product_current WHERE status != 'dropped'").get();
+      const totalRow = await db.prepare("SELECT COUNT(*) as total FROM product_current WHERE status != 'dropped'").get();
       totalSnapshots = totalRow?.total || 0;
-      const rows = db.prepare("SELECT platform, COUNT(*) as count FROM product_current WHERE status != 'dropped' GROUP BY platform").all();
+      const rows = await db.prepare("SELECT platform, COUNT(*) as count FROM product_current WHERE status != 'dropped' GROUP BY platform").all();
       for (const r of rows) {
         platformCounts[r.platform] = r.count;
       }
     } else {
-      totalSnapshots = stmt.countSnapshots.get().total;
-      const rows = db.prepare("SELECT platform, COUNT(DISTINCT item_uid) as count FROM snapshots WHERE status != 'dropped' GROUP BY platform").all();
+      totalSnapshots = (await stmt.countSnapshots.get()).total;
+      const rows = await db.prepare("SELECT platform, COUNT(DISTINCT item_uid) as count FROM snapshots WHERE status != 'dropped' GROUP BY platform").all();
       for (const r of rows) {
         platformCounts[r.platform] = r.count;
       }
     }
   } catch (_e) {
-    totalSnapshots = stmt.countSnapshots.get().total;
+    totalSnapshots = (await stmt.countSnapshots.get()).total;
   }
 
   return { totalRuns, totalSnapshots, platformCounts };
 }
 
-function getRunStats() {
-  return stmt.getRunsByPlatform.all();
+async function getRunStats() {
+  return await stmt.getRunsByPlatform.all();
 }
 
-function createMarketplaceAccount({ platform, label, storageState, proxyId = null }) {
+async function createMarketplaceAccount({ platform, label, storageState, proxyId = null }) {
   const { assertSupportedMarketplace } = require('./marketplaces/validation');
   const { encryptText } = require('./security/encrypted-store');
   const { normalizeBrowserStorageState } = require('./marketplaces/storage-state');
@@ -942,83 +809,83 @@ function createMarketplaceAccount({ platform, label, storageState, proxyId = nul
   if (!cleanedLabel || cleanedLabel.length > 100) throw new Error('Account label must be between 1 and 100 characters');
 
   const state = normalizeBrowserStorageState(platform, storageState);
-  const normalizedProxyId = resolveMarketplaceProxyId(proxyId);
+  const normalizedProxyId = await resolveMarketplaceProxyId(proxyId);
 
-  const result = stmt.createMarketplaceAccount.run({
+  const result = await stmt.createMarketplaceAccount.run({
     platform,
     label: cleanedLabel,
     sessionEncrypted: encryptText(JSON.stringify(state)),
     proxyId: normalizedProxyId,
   });
-  return stmt.findMarketplaceAccount.get(result.lastInsertRowid);
+  return await stmt.findMarketplaceAccount.get(result.lastInsertRowid);
 }
 
-function getMarketplaceAccounts(platform) {
+async function getMarketplaceAccounts(platform) {
   const { assertSupportedMarketplace } = require('./marketplaces/validation');
   assertSupportedMarketplace(platform);
-  return stmt.findMarketplaceAccounts.all(platform);
+  return await stmt.findMarketplaceAccounts.all(platform);
 }
 
-function getMarketplaceStorageState(id) {
+async function getMarketplaceStorageState(id) {
   const { decryptText } = require('./security/encrypted-store');
-  const record = stmt.findMarketplaceSession.get(id);
+  const record = await stmt.findMarketplaceSession.get(id);
   if (!record) return null;
   return decryptText(record.session_encrypted);
 }
 
-function deleteMarketplaceAccount(id) {
-  return stmt.deleteMarketplaceAccount.run(id).changes > 0;
+async function deleteMarketplaceAccount(id) {
+  return (await stmt.deleteMarketplaceAccount.run(id)).changes > 0;
 }
 
-function createMarketplaceProxy(input) {
+async function createMarketplaceProxy(input) {
   const { validateSocks5Proxy } = require('./marketplaces/proxy');
   const { encryptText } = require('./security/encrypted-store');
   const proxy = validateSocks5Proxy(input);
-  const result = stmt.createMarketplaceProxy.run({
+  const result = await stmt.createMarketplaceProxy.run({
     label: proxy.label,
     protocol: proxy.protocol,
     host: proxy.host,
     port: proxy.port,
     configEncrypted: encryptText(JSON.stringify(proxy)),
   });
-  return stmt.findMarketplaceProxy.get(result.lastInsertRowid);
+  return await stmt.findMarketplaceProxy.get(result.lastInsertRowid);
 }
 
-function getMarketplaceProxies() {
-  return stmt.findMarketplaceProxies.all();
+async function getMarketplaceProxies() {
+  return await stmt.findMarketplaceProxies.all();
 }
 
-function getMarketplaceProxyUrl(id) {
+async function getMarketplaceProxyUrl(id) {
   if (!id) return null;
   const { decryptText } = require('./security/encrypted-store');
   const { buildSocks5ProxyUrl } = require('./marketplaces/proxy');
-  const record = stmt.findMarketplaceProxyConfig.get(Number(id));
+  const record = await stmt.findMarketplaceProxyConfig.get(Number(id));
   if (!record) return null;
   return buildSocks5ProxyUrl(JSON.parse(decryptText(record.config_encrypted)));
 }
 
-function assignMarketplaceAccountProxy(accountId, proxyId = null) {
-  const account = stmt.findMarketplaceAccount.get(Number(accountId));
+async function assignMarketplaceAccountProxy(accountId, proxyId = null) {
+  const account = await stmt.findMarketplaceAccount.get(Number(accountId));
   if (!account) return null;
-  const normalizedProxyId = resolveMarketplaceProxyId(proxyId);
-  stmt.updateMarketplaceAccountProxy.run(normalizedProxyId, Number(accountId));
-  return stmt.findMarketplaceAccount.get(Number(accountId));
+  const normalizedProxyId = await resolveMarketplaceProxyId(proxyId);
+  await stmt.updateMarketplaceAccountProxy.run(normalizedProxyId, Number(accountId));
+  return await stmt.findMarketplaceAccount.get(Number(accountId));
 }
 
 function deleteMarketplaceProxy(id) {
   const normalizedId = Number(id);
   if (!Number.isInteger(normalizedId) || normalizedId < 1) return false;
-  return db.transaction(() => {
-    stmt.clearMarketplaceProxyAssignments.run(normalizedId);
-    return stmt.deleteMarketplaceProxy.run(normalizedId).changes > 0;
+  return db.transaction(async () => {
+    await stmt.clearMarketplaceProxyAssignments.run(normalizedId);
+    return (await stmt.deleteMarketplaceProxy.run(normalizedId)).changes > 0;
   })();
 }
 
-function resolveMarketplaceProxyId(proxyId) {
+async function resolveMarketplaceProxyId(proxyId) {
   if (proxyId == null || proxyId === '') return null;
   const normalizedId = Number(proxyId);
   if (!Number.isInteger(normalizedId) || normalizedId < 1) throw new Error('Proxy profile is invalid');
-  if (!stmt.findMarketplaceProxy.get(normalizedId)) throw new Error('Proxy profile was not found');
+  if (!await stmt.findMarketplaceProxy.get(normalizedId)) throw new Error('Proxy profile was not found');
   return normalizedId;
 }
 
@@ -1028,7 +895,7 @@ function normalizeCaptureVariantOptions(variantMode, maxVariants) {
   return { variantMode: mode, maxVariants: mode === 'all' ? normalizeMaxVariants(maxVariants) : 0 };
 }
 
-function createMarketplaceCapture({ platform, accountId = null, url, html, parsedData, variantMode = 'base', maxVariants = 0 }) {
+async function createMarketplaceCapture({ platform, accountId = null, url, html, parsedData, variantMode = 'base', maxVariants = 0 }) {
   const crypto = require('crypto');
   const { normalizeMarketplaceCaptureUrl } = require('./marketplaces/validation');
   const { encryptText } = require('./security/encrypted-store');
@@ -1036,7 +903,7 @@ function createMarketplaceCapture({ platform, accountId = null, url, html, parse
   const captureOptions = normalizeCaptureVariantOptions(variantMode, maxVariants);
   if (typeof html !== 'string' || !html.trim()) throw new Error('Captured HTML is required');
 
-  const result = stmt.createMarketplaceCapture.run({
+  const result = await stmt.createMarketplaceCapture.run({
     platform,
     accountId,
     url: captureUrl,
@@ -1046,14 +913,14 @@ function createMarketplaceCapture({ platform, accountId = null, url, html, parse
     variantMode: captureOptions.variantMode,
     maxVariants: captureOptions.maxVariants,
   });
-  return getMarketplaceCaptureMetadata(result.lastInsertRowid);
+  return await getMarketplaceCaptureMetadata(result.lastInsertRowid);
 }
 
-function getCachedMarketplaceCapture({ platform, accountId = null, url, variantMode = 'base', maxVariants = 0 }) {
+async function getCachedMarketplaceCapture({ platform, accountId = null, url, variantMode = 'base', maxVariants = 0 }) {
   const { normalizeMarketplaceCaptureUrl } = require('./marketplaces/validation');
   const captureOptions = normalizeCaptureVariantOptions(variantMode, maxVariants);
   const captureUrl = normalizeMarketplaceCaptureUrl(platform, url);
-  const captures = stmt.findCachedMarketplaceCaptures.all({
+  const captures = await stmt.findCachedMarketplaceCaptures.all({
     platform,
     accountId: accountId == null ? null : Number(accountId),
     url: captureUrl,
@@ -1070,8 +937,8 @@ function getCachedMarketplaceCapture({ platform, accountId = null, url, variantM
   return null;
 }
 
-function getMarketplaceCaptureMetadata(id) {
-  const capture = stmt.findMarketplaceCapture.get(id);
+async function getMarketplaceCaptureMetadata(id) {
+  const capture = await stmt.findMarketplaceCapture.get(id);
   if (!capture) return null;
   const metadata = { ...capture };
   delete metadata.html_encrypted;
@@ -1080,59 +947,59 @@ function getMarketplaceCaptureMetadata(id) {
   return { ...metadata, parsedData };
 }
 
-function getMarketplaceCapture(id) {
+async function getMarketplaceCapture(id) {
   const { decryptText } = require('./security/encrypted-store');
-  const capture = stmt.findMarketplaceCapture.get(id);
+  const capture = await stmt.findMarketplaceCapture.get(id);
   if (!capture) return null;
   const { html_encrypted, parsed_data, ...metadata } = capture;
   return { ...metadata, html: decryptText(html_encrypted), parsedData: JSON.parse(parsed_data) };
 }
 
-function getMarketplaceCaptures({ platform = null, limit = 50 } = {}) {
+async function getMarketplaceCaptures({ platform = null, limit = 50 } = {}) {
   if (platform) require('./marketplaces/validation').assertSupportedMarketplace(platform);
-  return stmt.findMarketplaceCaptures.all({ platform, limit: Math.min(Math.max(Number(limit) || 50, 1), 100) })
+  return (await stmt.findMarketplaceCaptures.all({ platform, limit: Math.min(Math.max(Number(limit) || 50, 1), 100) }))
     .map(({ parsed_data, ...capture }) => ({ ...capture, parsedData: JSON.parse(parsed_data) }));
 }
 
-function createMarketplaceCaptureSchedule(input) {
+async function createMarketplaceCaptureSchedule(input) {
   const { normalizeScheduleInput } = require('./marketplaces/capture-scheduler');
   const schedule = normalizeScheduleInput(input);
-  if (schedule.accountId && !stmt.findMarketplaceAccount.get(schedule.accountId)) throw new Error('Marketplace account not found');
+  if (schedule.accountId && !await stmt.findMarketplaceAccount.get(schedule.accountId)) throw new Error('Marketplace account not found');
   const { nextScheduleRunAt } = require('./marketplaces/capture-scheduler');
   const nextRunAt = nextScheduleRunAt({ schedule_type: schedule.scheduleType, daily_time: schedule.dailyTime, run_at: schedule.runAt, every_minutes: schedule.everyMinutes }).toISOString();
   if (schedule.scheduleType === 'once' && new Date(nextRunAt) <= new Date()) throw new Error('Choose a future date and time');
-  const result = stmt.createMarketplaceCaptureSchedule.run({ ...schedule, nextRunAt });
-  return getMarketplaceCaptureSchedules().find((candidate) => candidate.id === Number(result.lastInsertRowid));
+  const result = await stmt.createMarketplaceCaptureSchedule.run({ ...schedule, nextRunAt });
+  return (await getMarketplaceCaptureSchedules()).find((candidate) => candidate.id === Number(result.lastInsertRowid));
 }
 
-function getMarketplaceCaptureSchedules() {
-  return stmt.findMarketplaceCaptureSchedules.all().map((schedule) => ({ ...schedule, last_summary: schedule.last_summary ? JSON.parse(schedule.last_summary) : null }));
+async function getMarketplaceCaptureSchedules() {
+  return (await stmt.findMarketplaceCaptureSchedules.all()).map((schedule) => ({ ...schedule, last_summary: schedule.last_summary ? JSON.parse(schedule.last_summary) : null }));
 }
 
-function getDueMarketplaceCaptureSchedules(now = new Date()) {
-  return stmt.findDueMarketplaceCaptureSchedules.all({ now: now.toISOString() });
+async function getDueMarketplaceCaptureSchedules(now = new Date()) {
+  return await stmt.findDueMarketplaceCaptureSchedules.all({ now: now.toISOString() });
 }
 
 /**
  * Atomic claim (Live-Readiness Round #12): the UPDATE's WHERE clause re-checks
  * claimed_until at the moment of the write, so two ticks racing to claim the
- * same schedule cannot both succeed — only one UPDATE actually changes a row.
+ * same schedule cannot both succeed â€” only one UPDATE actually changes a row.
  * A crash mid-capture leaves claimed_until in the past once the lease expires,
  * so the schedule becomes claimable again automatically (no manual recovery needed).
  */
-function claimMarketplaceCaptureSchedule(id, leaseMs = 5 * 60 * 1000) {
+async function claimMarketplaceCaptureSchedule(id, leaseMs = 5 * 60 * 1000) {
   const crypto = require('crypto');
   const now = new Date();
   const claimedUntil = new Date(now.getTime() + leaseMs).toISOString();
   const claimToken = crypto.randomBytes(12).toString('hex');
-  const info = stmt.claimMarketplaceCaptureSchedule.run({ id: Number(id), claimedUntil, claimToken, now: now.toISOString() });
+  const info = await stmt.claimMarketplaceCaptureSchedule.run({ id: Number(id), claimedUntil, claimToken, now: now.toISOString() });
   // Return the claim_token on success so callers can use it for renew/release.
   // Existing callers that check `=== true` will still be truthy with a string.
   return info.changes > 0 ? claimToken : false;
 }
 
-function releaseMarketplaceCaptureScheduleClaim(id, claimToken = null) {
-  stmt.releaseMarketplaceCaptureScheduleClaim.run({ id: Number(id), claimToken });
+async function releaseMarketplaceCaptureScheduleClaim(id, claimToken = null) {
+  await stmt.releaseMarketplaceCaptureScheduleClaim.run({ id: Number(id), claimToken });
 }
 
 /**
@@ -1140,58 +1007,58 @@ function releaseMarketplaceCaptureScheduleClaim(id, claimToken = null) {
  * schedule whose real work (discovery + N sequential captures) can outlive
  * the original lease window. Extends claimed_until only while the caller
  * still holds an unexpired claim (see renewMarketplaceCaptureScheduleClaim
- * statement) — a process that already lost its lease cannot resurrect a claim
+ * statement) â€” a process that already lost its lease cannot resurrect a claim
  * a second tick has since taken over.
- * §6: claim_token must match for renewal to succeed.
+ * Â§6: claim_token must match for renewal to succeed.
  */
-function renewMarketplaceCaptureScheduleClaim(id, leaseMs = 5 * 60 * 1000, claimToken = null) {
+async function renewMarketplaceCaptureScheduleClaim(id, leaseMs = 5 * 60 * 1000, claimToken = null) {
   const now = new Date();
   const claimedUntil = new Date(now.getTime() + leaseMs).toISOString();
-  const info = stmt.renewMarketplaceCaptureScheduleClaim.run({ id: Number(id), claimedUntil, claimToken, now: now.toISOString() });
+  const info = await stmt.renewMarketplaceCaptureScheduleClaim.run({ id: Number(id), claimedUntil, claimToken, now: now.toISOString() });
   return info.changes > 0;
 }
 
-// §3: claimToken is a 4th, optional param (kept after `now` for backward
+// Â§3: claimToken is a 4th, optional param (kept after `now` for backward
 // compatibility with existing callers that pass `now` positionally without a
 // claim in play, e.g. test schedules that were never claimed).
-function completeMarketplaceCaptureSchedule(id, summary, now = new Date(), claimToken = null) {
-  const schedule = getMarketplaceCaptureSchedules().find((candidate) => candidate.id === Number(id));
+async function completeMarketplaceCaptureSchedule(id, summary, now = new Date(), claimToken = null) {
+  const schedule = (await getMarketplaceCaptureSchedules()).find((candidate) => candidate.id === Number(id));
   if (!schedule) return false;
   const summaryJson = JSON.stringify(summary);
-  return db.transaction(() => {
-    // §3: the schedule-row UPDATE is claim_token-protected FIRST. If a stale
+  return db.transaction(async () => {
+    // Â§3: the schedule-row UPDATE is claim_token-protected FIRST. If a stale
     // attempt's token no longer matches the current claim (or no claim
-    // exists but one was expected), 0 rows change — do NOT insert a
+    // exists but one was expected), 0 rows change â€” do NOT insert a
     // completion history row or touch next_run_at for whoever actually owns
     // the schedule now.
     let changes;
     if (schedule.schedule_type === 'once') {
-      changes = stmt.completeOneTimeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), summary: summaryJson, claimToken }).changes;
+      changes = (await stmt.completeOneTimeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), summary: summaryJson, claimToken })).changes;
     } else {
       const { nextScheduleRunAt } = require('./marketplaces/capture-scheduler');
-      changes = stmt.completeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), nextRunAt: nextScheduleRunAt(schedule, now).toISOString(), summary: summaryJson, claimToken }).changes;
+      changes = (await stmt.completeMarketplaceCaptureSchedule.run({ id: Number(id), now: now.toISOString(), nextRunAt: nextScheduleRunAt(schedule, now).toISOString(), summary: summaryJson, claimToken })).changes;
     }
     if (changes === 0) return false; // MARKETPLACE_CLAIM_LOST
-    stmt.createMarketplaceCaptureScheduleRun.run({ scheduleId: Number(id), summary: summaryJson, completedAt: now.toISOString() });
+    await stmt.createMarketplaceCaptureScheduleRun.run({ scheduleId: Number(id), summary: summaryJson, completedAt: now.toISOString() });
     return true;
   })();
 }
 
-function getMarketplaceCaptureScheduleRuns(scheduleId, limit = 20) {
+async function getMarketplaceCaptureScheduleRuns(scheduleId, limit = 20) {
   const normalizedId = Number(scheduleId);
   if (!Number.isInteger(normalizedId) || normalizedId < 1) return [];
-  return stmt.findMarketplaceCaptureScheduleRuns.all({ scheduleId: normalizedId, limit: Math.min(Math.max(Number(limit) || 20, 1), 100) })
+  return (await stmt.findMarketplaceCaptureScheduleRuns.all({ scheduleId: normalizedId, limit: Math.min(Math.max(Number(limit) || 20, 1), 100) }))
     .map((run) => ({ ...run, summary: JSON.parse(run.summary) }));
 }
 
-function deleteMarketplaceCaptureSchedule(id) {
-  return stmt.deleteMarketplaceCaptureSchedule.run(Number(id)).changes > 0;
+async function deleteMarketplaceCaptureSchedule(id) {
+  return (await stmt.deleteMarketplaceCaptureSchedule.run(Number(id))).changes > 0;
 }
 
-function toggleMarketplaceCaptureSchedule(id) {
-  const info = stmt.toggleMarketplaceCaptureSchedule.run(Number(id));
+async function toggleMarketplaceCaptureSchedule(id) {
+  const info = await stmt.toggleMarketplaceCaptureSchedule.run(Number(id));
   if (info.changes === 0) return null;
-  return getMarketplaceCaptureSchedules().find((c) => c.id === Number(id)) || null;
+  return (await getMarketplaceCaptureSchedules()).find((c) => c.id === Number(id)) || null;
 }
 
 // ==================== Helpers ====================
@@ -1242,7 +1109,7 @@ function parseItemData(item) {
   const landingUrl = d.landingUrl || d.snapshot?.linkUrl || '';
   // Reddit-specific: subreddit name for UI display (r/xxx). `likes` already
   // carries Reddit's upvote score (reddit.js sets likes:d.ups) and `comments`
-  // already carries the real total comment count — both reused as-is, only
+  // already carries the real total comment count â€” both reused as-is, only
   // the subreddit label itself was missing from persisted metadata.
   const subreddit = d.subreddit || '';
 
@@ -1283,25 +1150,25 @@ function generateUid(platform, query, parsed) {
 
 // ==================== V2 3-Tier Storage Accessors & Backfill ====================
 
-function getProductCurrent(options = {}) {
-  return productCurrentOps.listCurrent(options);
+async function getProductCurrent(options = {}) {
+  return await productCurrentOps.listCurrent(options);
 }
 
 /**
- * §11 (Final Architecture Closure Round): single-row V2 lookup so callers
+ * Â§11 (Final Architecture Closure Round): single-row V2 lookup so callers
  * (export growth) can read this item's already-computed delta_* fields
  * instead of falling back to legacy getSnapshotHistory().
  */
-function getProductCurrentByUid(itemUid) {
-  return productCurrentOps.findByUid(itemUid);
+async function getProductCurrentByUid(itemUid) {
+  return await productCurrentOps.findByUid(itemUid);
 }
 
-function getProductHistory(itemUid, limitDays = 30) {
-  return dailyHistoryOps.getHistory(itemUid, limitDays);
+async function getProductHistory(itemUid, limitDays = 30) {
+  return await dailyHistoryOps.getHistory(itemUid, limitDays);
 }
 
 // UI-BUG-04: SQLite's default CURRENT_TIMESTAMP format is naive
-// "YYYY-MM-DD HH:MM:SS" UTC, with no timezone marker — writing it straight
+// "YYYY-MM-DD HH:MM:SS" UTC, with no timezone marker â€” writing it straight
 // into a CSV export reads as if it were already local time to anyone opening
 // the file, a ~7h (UTC+7) gap from the real Vietnam-local time it
 // represents. Convert explicitly and label it, matching the "(Vietnam)"
@@ -1314,7 +1181,7 @@ function formatVietnamTime(utcString) {
 }
 
 // UI-BUG-01: daily_packed_history observations only ever carry the metric
-// fields (price/likes/comments/shares/views/sold/rating/reviews) — never the
+// fields (price/likes/comments/shares/views/sold/rating/reviews) â€” never the
 // item's static metadata (title/platform/url/image/author/status), which
 // lives in product_current instead. The Product Detail modal renders
 // `history[history.length-1].title/platform/url`, so every point was
@@ -1322,12 +1189,12 @@ function formatVietnamTime(utcString) {
 // product_current itself has correct data. Look the item's metadata up once
 // and denormalize it onto every point, matching what the legacy
 // `snapshots`-backed history path already returns per-row.
-function getProductHistoryWithMetadata(itemUid, limitDays = 365) {
-  const currentItem = getProductCurrentByUid(itemUid);
+async function getProductHistoryWithMetadata(itemUid, limitDays = 365) {
+  const currentItem = await getProductCurrentByUid(itemUid);
   let richMeta = {};
   if (currentItem?.last_run_id) {
     try {
-      const run = stmt.findRunById.get(currentItem.last_run_id);
+      const run = await stmt.findRunById.get(currentItem.last_run_id);
       if (run?.result_items_json) {
         const items = JSON.parse(run.result_items_json);
         const match = items.find(it => it.item_uid === itemUid);
@@ -1359,7 +1226,7 @@ function getProductHistoryWithMetadata(itemUid, limitDays = 365) {
       }
     : {};
 
-  const dailyRows = getProductHistory(itemUid, limitDays);
+  const dailyRows = await getProductHistory(itemUid, limitDays);
   const points = [];
   for (const day of dailyRows) {
     for (const obs of day.observations || []) {
@@ -1383,43 +1250,35 @@ function getProductHistoryWithMetadata(itemUid, limitDays = 365) {
  * whatever historical rows already exist for rollback/archival purposes only.
  * No API route in server.js calls this.
  */
-function getProductWeekly(itemUid, limitWeeks = 12) {
-  return weeklySummaryOps.getWeekly(itemUid, limitWeeks);
+async function getProductWeekly(itemUid, limitWeeks = 12) {
+  return await weeklySummaryOps.getWeekly(itemUid, limitWeeks);
 }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS v2_write_failures (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id        INTEGER,
-    item_uid      TEXT NOT NULL,
-    error_message TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'pending', -- pending | repaired
-    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// Table created by pg-schema.sql via initDatabase(); the inline DDL that
+// used to run at module load here is redundant under PostgreSQL.
 
 /**
- * Durable repair task (Simplification Round #17) — a V2 (Current/History)
+ * Durable repair task (Simplification Round #17) â€” a V2 (Current/History)
  * write failure is recorded here instead of only console.warn'd, so a
  * legacy-write-succeeded-but-V2-write-failed divergence is discoverable and
  * repairable, not silently lost. repairPendingV2WriteFailures() replays these
  * against the same snapshot data already safely stored in `snapshots`.
  */
-function recordV2WriteFailure(runId, itemUid, errorMessage) {
+async function recordV2WriteFailure(runId, itemUid, errorMessage) {
   console.warn('[DB V2 Dual-Write Error]:', errorMessage);
-  db.prepare('INSERT INTO v2_write_failures (run_id, item_uid, error_message) VALUES (?, ?, ?)').run(runId, itemUid, String(errorMessage || ''));
+  await db.prepare('INSERT INTO v2_write_failures (run_id, item_uid, error_message) VALUES (?, ?, ?)').run(runId, itemUid, String(errorMessage || ''));
 }
 
-function getPendingV2WriteFailures() {
-  return db.prepare("SELECT * FROM v2_write_failures WHERE status = 'pending' ORDER BY id ASC").all();
+async function getPendingV2WriteFailures() {
+  return await db.prepare("SELECT * FROM v2_write_failures WHERE status = 'pending' ORDER BY id ASC").all();
 }
 
 /** Re-attempts each pending V2 write failure from its original snapshot row. Marks repaired on success. */
-function repairPendingV2WriteFailures() {
-  const pending = getPendingV2WriteFailures();
+async function repairPendingV2WriteFailures() {
+  const pending = await getPendingV2WriteFailures();
   let repaired = 0;
   for (const failure of pending) {
-    const snap = db.prepare('SELECT * FROM snapshots WHERE run_id = ? AND item_uid = ? ORDER BY id DESC LIMIT 1').get(failure.run_id, failure.item_uid);
+    const snap = await db.prepare('SELECT * FROM snapshots WHERE run_id = ? AND item_uid = ? ORDER BY id DESC LIMIT 1').get(failure.run_id, failure.item_uid);
     if (!snap) continue;
     try {
       const v2Item = {
@@ -1427,12 +1286,12 @@ function repairPendingV2WriteFailures() {
         image: snap.image, author: snap.author, price: snap.price, rating: snap.rating, reviews: snap.reviews,
         sold_count: snap.sold_count, likes: snap.likes, comments: snap.comments, shares: snap.shares, views: snap.views
       };
-      productCurrentOps.upsertItem(v2Item, snap.run_id, snap.created_at);
-      // §4.1: migrated observations use legacy:<snapshot_id> identity — a
+      await productCurrentOps.upsertItem(v2Item, snap.run_id, snap.created_at);
+      // Â§4.1: migrated observations use legacy:<snapshot_id> identity â€” a
       // re-run of this migration for the same legacy row replaces its own
-      // prior entry instead of duplicating it (§4.2 idempotency).
+      // prior entry instead of duplicating it (Â§4.2 idempotency).
       dailyHistoryOps.appendObservation(v2Item, snap.created_at, { legacySnapshotId: snap.id });
-      db.prepare("UPDATE v2_write_failures SET status = 'repaired' WHERE id = ?").run(failure.id);
+      await db.prepare("UPDATE v2_write_failures SET status = 'repaired' WHERE id = ?").run(failure.id);
       repaired++;
     } catch (_err) {
       // Still pending; will be retried on the next repair pass.
@@ -1441,30 +1300,25 @@ function repairPendingV2WriteFailures() {
   return { attempted: pending.length, repaired };
 }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS migration_checkpoints (
-    key TEXT PRIMARY KEY,
-    value TEXT,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// Table created by pg-schema.sql via initDatabase(); the inline DDL that
+// used to run at module load here is redundant under PostgreSQL.
 
 const BACKFILL_CHECKPOINT_KEY = 'backfill_v2_last_snapshot_id';
 
 /**
  * Idempotent (Simplification Round #18): only processes snapshots newer than
  * the last recorded checkpoint. Running this twice in a row processes zero
- * new rows the second time — it cannot append duplicate observations to
+ * new rows the second time â€” it cannot append duplicate observations to
  * daily_packed_history or re-count deltas in product_current.
  */
-function backfillSnapshotsToV2() {
-  const checkpointRow = db.prepare('SELECT value FROM migration_checkpoints WHERE key = ?').get(BACKFILL_CHECKPOINT_KEY);
+async function backfillSnapshotsToV2() {
+  const checkpointRow = await db.prepare('SELECT value FROM migration_checkpoints WHERE key = ?').get(BACKFILL_CHECKPOINT_KEY);
   const lastId = checkpointRow ? Number(checkpointRow.value) : 0;
-  const allSnapshots = db.prepare('SELECT * FROM snapshots WHERE id > ? ORDER BY created_at ASC, id ASC').all(lastId);
+  const allSnapshots = await db.prepare('SELECT * FROM snapshots WHERE id > ? ORDER BY created_at ASC, id ASC').all(lastId);
   let migrated = 0;
   let maxId = lastId;
 
-  const tx = db.transaction((rows) => {
+  const tx = db.transaction(async (rows) => {
     for (const snap of rows) {
       const v2Item = {
         item_uid: snap.item_uid,
@@ -1484,25 +1338,25 @@ function backfillSnapshotsToV2() {
         views: snap.views
       };
       const normalizedTs = normalizeLegacyUtcTimestamp(snap.created_at);
-      productCurrentOps.upsertItem(v2Item, snap.run_id, normalizedTs);
-      // §4.1: migrated observations use legacy:<snapshot_id> identity — a
+      await productCurrentOps.upsertItem(v2Item, snap.run_id, normalizedTs);
+      // Â§4.1: migrated observations use legacy:<snapshot_id> identity â€” a
       // re-run of this migration for the same legacy row replaces its own
-      // prior entry instead of duplicating it (§4.2 idempotency).
+      // prior entry instead of duplicating it (Â§4.2 idempotency).
       dailyHistoryOps.appendObservation(v2Item, normalizedTs, { legacySnapshotId: snap.id });
-      // weekly_summary deprecated from backfill too — see note in insertSnapshots.
+      // weekly_summary deprecated from backfill too â€” see note in insertSnapshots.
       maxId = Math.max(maxId, snap.id);
       migrated++;
     }
-    db.prepare('INSERT INTO migration_checkpoints (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP')
+    await db.prepare('INSERT INTO migration_checkpoints (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP')
       .run(BACKFILL_CHECKPOINT_KEY, String(maxId));
   });
 
-  tx(allSnapshots);
+  await tx(allSnapshots);
   return { migrated, totalSnapshots: allSnapshots.length };
 }
 
-// §13: fields checked for semantic current-state parity — price/likes alone
-// (the pre-§13 check) is not enough to gate a real cutover.
+// Â§13: fields checked for semantic current-state parity â€” price/likes alone
+// (the pre-Â§13 check) is not enough to gate a real cutover.
 const V2_PARITY_METRIC_FIELDS = [
   { legacy: 'price', v2: 'current_price' },
   { legacy: 'views', v2: 'current_views' },
@@ -1529,14 +1383,14 @@ const HISTORY_OBSERVATION_METRIC_FIELDS = [
 ];
 
 /**
- * V2 Read/Write Parity Check (Live-Readiness Round #14, extended §13) —
+ * V2 Read/Write Parity Check (Live-Readiness Round #14, extended Â§13) â€”
  * this is the gate for safely flipping READ_MODEL_V2=true and disabling
  * LEGACY_SNAPSHOT_WRITE; it never modifies data. Two independent checks:
  *
  *  current: every item_uid in legacy `snapshots` must exist in
  *    `product_current` with agreeing price/views/likes/comments/shares/
  *    sold/rating/reviews/platform (a field null on either side is treated as
- *    "unknown", not a mismatch — a platform that never populated a metric on
+ *    "unknown", not a mismatch â€” a platform that never populated a metric on
  *    one side isn't a parity failure).
  *
  *  history: legacy stores one row per crawl per item_uid; V2 packs same-day
@@ -1546,9 +1400,9 @@ const HISTORY_OBSERVATION_METRIC_FIELDS = [
  *    not). Also scans for genuine duplicate observations (same item_uid+date
  *    +time recorded twice) within packed rows.
  */
-function checkV2Parity() {
-  const snapshotUids = db.prepare('SELECT DISTINCT item_uid FROM snapshots').all().map(r => r.item_uid);
-  const productCurrentUids = new Set(db.prepare('SELECT item_uid FROM product_current').all().map(r => r.item_uid));
+async function checkV2Parity() {
+  const snapshotUids = (await db.prepare('SELECT DISTINCT item_uid FROM snapshots').all()).map(r => r.item_uid);
+  const productCurrentUids = new Set((await db.prepare('SELECT item_uid FROM product_current').all()).map(r => r.item_uid));
 
   const missingCurrent = [];
   const metricMismatches = [];
@@ -1559,8 +1413,8 @@ function checkV2Parity() {
   for (const uid of snapshotUids) {
     if (!productCurrentUids.has(uid)) { missingCurrent.push(uid); continue; }
     checked++;
-    const latestSnap = findLatestSnapshot.get(uid);
-    const current = findCurrent.get(uid);
+    const latestSnap = await findLatestSnapshot.get(uid);
+    const current = await findCurrent.get(uid);
 
     if (latestSnap.platform && current.platform && latestSnap.platform !== current.platform) {
       metricMismatches.push({ itemUid: uid, field: 'platform', legacyValue: latestSnap.platform, v2Value: current.platform });
@@ -1569,7 +1423,7 @@ function checkV2Parity() {
     for (const { legacy, v2 } of V2_PARITY_METRIC_FIELDS) {
       const legacyValue = latestSnap[legacy];
       const v2Value = current[v2];
-      if (legacyValue == null && v2Value == null) continue; // both unpopulated — equal
+      if (legacyValue == null && v2Value == null) continue; // both unpopulated â€” equal
       if (legacyValue == null || v2Value == null || Number(legacyValue) !== Number(v2Value)) {
         metricMismatches.push({ itemUid: uid, field: legacy, legacyValue, v2Value });
       }
@@ -1577,10 +1431,10 @@ function checkV2Parity() {
   }
 
   const legacyObsCountByUid = new Map(
-    db.prepare('SELECT item_uid, COUNT(*) c FROM snapshots GROUP BY item_uid').all().map(r => [r.item_uid, r.c])
+    (await db.prepare('SELECT item_uid, COUNT(*) c FROM snapshots GROUP BY item_uid').all()).map(r => [r.item_uid, r.c])
   );
   const packedObsCountByUid = new Map(
-    db.prepare('SELECT item_uid, SUM(observation_count) c FROM daily_packed_history GROUP BY item_uid').all().map(r => [r.item_uid, r.c])
+    (await db.prepare('SELECT item_uid, SUM(observation_count) c FROM daily_packed_history GROUP BY item_uid').all()).map(r => [r.item_uid, r.c])
   );
 
   let missingHistoricalObservations = 0;
@@ -1593,8 +1447,8 @@ function checkV2Parity() {
     }
   }
 
-  // §4/§16.E: prefer the stable observationId identity (present on every
-  // observation written by the current appendObservation()) when available —
+  // Â§4/Â§16.E: prefer the stable observationId identity (present on every
+  // observation written by the current appendObservation()) when available â€”
   // it correctly distinguishes two real observations that legitimately land
   // in the same second from an actual duplicate. Rows written before this
   // round have no observationId; those fall back to the weaker time-based
@@ -1614,7 +1468,7 @@ function checkV2Parity() {
   const observationIndex = new Map();
   const obsRowDateMap = new Map(); // observationId -> date
 
-  for (const row of db.prepare('SELECT * FROM daily_packed_history').iterate()) {
+  for (const row of await db.prepare('SELECT * FROM daily_packed_history').all()) {
     let observations = [];
     try {
       observations = JSON.parse(row.observations_json || '[]');
@@ -1681,7 +1535,10 @@ function checkV2Parity() {
   let historyTimestampMismatches = 0;
   const historyTimestampMismatchSamples = [];
 
-  for (const snap of db.prepare('SELECT * FROM snapshots').iterate()) {
+  // .all(), not .iterate(): the adapter's iterate() is an async generator, so
+  // a plain for...of over it throws "is not iterable". The row count here is
+  // small enough to materialise.
+  for (const snap of await db.prepare('SELECT * FROM snapshots').all()) {
     const expectedObservationId = `legacy:${snap.id}`;
     const byId = observationIndex.get(snap.item_uid);
     const obs = byId ? byId.get(expectedObservationId) : null;
@@ -1693,7 +1550,7 @@ function checkV2Parity() {
     for (const { legacy, obs: obsField } of HISTORY_OBSERVATION_METRIC_FIELDS) {
       const legacyValue = snap[legacy];
       const obsValue = obs[obsField];
-      if (legacyValue == null && obsValue == null) continue; // both unpopulated — equal
+      if (legacyValue == null && obsValue == null) continue; // both unpopulated â€” equal
       if (legacyValue == null || obsValue == null || Number(legacyValue) !== Number(obsValue)) {
         historyMetricMismatches += 1;
         if (historyMetricMismatchSamples.length < 20) {
@@ -1702,7 +1559,7 @@ function checkV2Parity() {
       }
     }
 
-    // Gap #5 / Patch 2B: Timestamp Parity — compare legacy snapshot timestamp
+    // Gap #5 / Patch 2B: Timestamp Parity â€” compare legacy snapshot timestamp
     // with the exact V2 observation timestamp (normalized to canonical UTC representation).
     if (snap.created_at && obs.time) {
       const snapIso = normalizeLegacyUtcTimestamp(snap.created_at);
@@ -1730,7 +1587,7 @@ function checkV2Parity() {
   // Gap #3 closure: a packed observation claiming a `legacy:<id>` identity
   // that no real legacy snapshot row backs is an extra/orphaned observation
   // (e.g. a corrupted or duplicated migration write).
-  const allLegacySnapshotIds = new Set(db.prepare('SELECT id FROM snapshots').all().map((r) => String(r.id)));
+  const allLegacySnapshotIds = new Set((await db.prepare('SELECT id FROM snapshots').all()).map((r) => String(r.id)));
   let historyExtraObservations = 0;
   const historyExtraObservationUids = [];
   for (const [uid, byId] of observationIndex.entries()) {
@@ -1745,7 +1602,7 @@ function checkV2Parity() {
   const legacyObservations = Array.from(legacyObsCountByUid.values()).reduce((a, b) => a + b, 0);
   const packedObservations = Array.from(packedObsCountByUid.values()).reduce((a, b) => a + b, 0);
 
-  // §5/Gap #5: every history failure mode gates parityOk — duplicates/malformed
+  // Â§5/Gap #5: every history failure mode gates parityOk â€” duplicates/malformed
   // observations, metric mismatches, and timestamp mismatches all gate parityOk.
   const parityOk = missingCurrent.length === 0
     && metricMismatches.length === 0
@@ -1792,27 +1649,31 @@ function checkV2Parity() {
 }
 
 /**
- * DB Health Monitor (Simplification Round #16) — replaces the mandatory 10M
+ * DB Health Monitor (Simplification Round #16) â€” replaces the mandatory 10M
  * synthetic benchmark as a release gate. Reports the metrics that actually
  * matter for "is row growth under control", not a one-off performance claim.
  */
-function getDatabaseHealth() {
-  const fs = require('fs');
-  const dbSizeBytes = fs.existsSync(DB_PATH) ? fs.statSync(DB_PATH).size : 0;
+async function getDatabaseHealth() {
+  // Previously stat()'d the collector.db file. Postgres has no single file to
+  // measure, and reading the archived SQLite file here would keep an active
+  // runtime dependency on it â€” so the size now comes from Postgres itself.
+  const dbSizeBytes = Number(
+    (await db.prepare('SELECT pg_database_size(current_database()) AS size').get()).size
+  ) || 0;
 
-  const productCurrentRows = db.prepare('SELECT COUNT(*) c FROM product_current').get().c;
-  const dailyHistoryStats = db.prepare('SELECT COUNT(*) c, AVG(observation_count) avgObs, MAX(observation_count) maxObs, SUM(observation_count) totalObs FROM daily_packed_history').get();
-  const legacySnapshotRows = db.prepare('SELECT COUNT(*) c FROM snapshots').get().c;
-  const weeklySummaryRows = db.prepare('SELECT COUNT(*) c FROM weekly_summary').get().c;
-  // §15: pending V2 repair count — dual-write failures recorded by
+  const productCurrentRows = (await db.prepare('SELECT COUNT(*) c FROM product_current').get()).c;
+  const dailyHistoryStats = await db.prepare('SELECT COUNT(*) c, AVG(observation_count) avgObs, MAX(observation_count) maxObs, SUM(observation_count) totalObs FROM daily_packed_history').get();
+  const legacySnapshotRows = (await db.prepare('SELECT COUNT(*) c FROM snapshots').get()).c;
+  const weeklySummaryRows = (await db.prepare('SELECT COUNT(*) c FROM weekly_summary').get()).c;
+  // Â§15: pending V2 repair count â€” dual-write failures recorded by
   // recordV2WriteFailure() that repairPendingV2WriteFailures() hasn't
   // resolved yet. A non-zero count here means product_current/daily_packed_history
   // is currently missing data that legacy `snapshots` has, independent of the
   // full checkV2Parity() scan.
-  const pendingV2RepairCount = db.prepare("SELECT COUNT(*) c FROM v2_write_failures WHERE status = 'pending'").get().c;
+  const pendingV2RepairCount = (await db.prepare("SELECT COUNT(*) c FROM v2_write_failures WHERE status = 'pending'").get()).c;
 
   const t0 = process.hrtime.bigint();
-  db.prepare('SELECT * FROM product_current ORDER BY rank_score DESC LIMIT 1').get();
+  await db.prepare('SELECT * FROM product_current ORDER BY rank_score DESC LIMIT 1').get();
   const representativeQueryLatencyMs = Number((Number(process.hrtime.bigint() - t0) / 1e6).toFixed(3));
 
   return {
@@ -1849,13 +1710,13 @@ const socialBotStmt = {
 /**
  * Atomically reserves a (bot_key, scheduled_window, query_key) slot. Returns the
  * new row id, or null if this window/query was already reserved/dispatched by a
- * prior tick (before or after a restart — this table is the persistent source of
+ * prior tick (before or after a restart â€” this table is the persistent source of
  * truth, unlike the old in-memory Map/Set). The UNIQUE constraint is what makes
  * this safe under concurrent ticks.
  */
-function reserveSocialBotWindow(botKey, scheduledWindow, queryKey) {
+async function reserveSocialBotWindow(botKey, scheduledWindow, queryKey) {
   try {
-    const info = socialBotStmt.reserveWindow.run({ botKey, scheduledWindow, queryKey });
+    const info = await socialBotStmt.reserveWindow.run({ botKey, scheduledWindow, queryKey });
     return info.lastInsertRowid;
   } catch (err) {
     if (String(err.code || '').startsWith('SQLITE_CONSTRAINT')) return null; // Already reserved.
@@ -1863,33 +1724,44 @@ function reserveSocialBotWindow(botKey, scheduledWindow, queryKey) {
   }
 }
 
-function markSocialBotDispatched(id, runId) { socialBotStmt.markDispatched.run({ id, runId }); }
-function markSocialBotFailed(id, errorMessage) { socialBotStmt.markFailed.run({ id, errorMessage: String(errorMessage || '') }); }
-function releaseSocialBotWindow(id) { socialBotStmt.deleteById.run(id); }
+async function markSocialBotDispatched(id, runId) { await socialBotStmt.markDispatched.run({ id, runId }); }
+async function markSocialBotFailed(id, errorMessage) { await socialBotStmt.markFailed.run({ id, errorMessage: String(errorMessage || '') }); }
+async function releaseSocialBotWindow(id) { await socialBotStmt.deleteById.run(id); }
 
 /**
  * Crash-safety sweep (Simplification Round #20): if the process crashed after
  * reserveSocialBotWindow() inserted a 'pending' row but before markSocialBot
  * Dispatched()/releaseSocialBotWindow() ran, that row would otherwise block
- * the UNIQUE(bot_key, scheduled_window, query_key) constraint forever — the
+ * the UNIQUE(bot_key, scheduled_window, query_key) constraint forever â€” the
  * window could never be retried. Any 'pending' row older than thresholdMs is
  * assumed abandoned and deleted so the next tick can legitimately re-reserve
  * and re-enqueue it exactly once.
  */
-function recoverStalePendingSocialBotWindows(thresholdMs = 5 * 60 * 1000) {
+async function recoverStalePendingSocialBotWindows(thresholdMs = 5 * 60 * 1000) {
   // SQLite's CURRENT_TIMESTAMP formats as 'YYYY-MM-DD HH:MM:SS' (UTC, no 'T'/'Z'/ms);
   // the cutoff must match exactly or the string comparison sorts incorrectly.
   const cutoff = new Date(Date.now() - thresholdMs).toISOString().replace('T', ' ').slice(0, 19);
-  const info = db.prepare("DELETE FROM social_bot_state WHERE status = 'pending' AND created_at < ?").run(cutoff);
+  const info = await db.prepare("DELETE FROM social_bot_state WHERE status = 'pending' AND created_at < ?").run(cutoff);
   if (info.changes > 0) {
     console.warn(`[SocialBotRecovery] Cleared ${info.changes} stale pending window(s) older than ${thresholdMs}ms so they can be retried.`);
   }
   return { cleared: info.changes };
 }
-function getLastDispatchedSocialBotWindow(botKey) { return socialBotStmt.findLastDispatched.get(botKey); }
-function countDispatchedSocialBotRuns(botKey) { return socialBotStmt.countDispatched.get(botKey).c; }
+async function getLastDispatchedSocialBotWindow(botKey) { return await socialBotStmt.findLastDispatched.get(botKey); }
+async function countDispatchedSocialBotRuns(botKey) { return (await socialBotStmt.countDispatched.get(botKey)).c; }
 
-module.exports = {
+const api = {
+  // Test/diagnostic access to the underlying PostgreSQL connection. Tests used
+  // to open a second better-sqlite3 handle on data/collector.db to inspect rows
+  // directly; with PostgreSQL a second connection would contend for the same
+  // database, so they share this one instead.
+  _connection: db,
+  // Creates the Postgres schema and seeds platforms â€” work that used to happen
+  // implicitly at require() time, when every SQLite call was synchronous.
+  // server.js awaits this explicitly at boot so failures are fatal there, but
+  // it is memoised and every async export below also waits on it (see the
+  // wrapper at the end of this file), so no caller can race an empty database.
+  initDatabase,
   getAllPlatforms, createRun, getRunById, getQueuedRuns, getAllRuns, getRunsByStatus, getChildRuns, updateRun, deleteRun,
   deleteItem, deleteAllItems,
   reserveSocialBotWindow, markSocialBotDispatched, markSocialBotFailed, releaseSocialBotWindow,
@@ -1897,7 +1769,7 @@ module.exports = {
   insertSnapshots, getLatestSnapshots, getLatestSnapshotByUid, getSnapshotHistory, getSnapshotsByRunId, getRunItems, backfillRunResultItems,
   getProductCurrent, getProductCurrentByUid, getProductHistory, getProductHistoryWithMetadata, getProductWeekly, backfillSnapshotsToV2, getDatabaseHealth, formatVietnamTime,
   getPendingV2WriteFailures, repairPendingV2WriteFailures, checkV2Parity, normalizeLegacyUtcTimestamp,
-  getSnapshotsMissingEtsyImages, updateSnapshotImage,
+  getSnapshotsMissingEtsyImages, updateSnapshotImage, getSnapshotsMatchingQuery,
   getStats, getRunStats,
   createMarketplaceAccount, getMarketplaceAccounts, getMarketplaceStorageState, deleteMarketplaceAccount,
   createMarketplaceProxy, getMarketplaceProxies, getMarketplaceProxyUrl, assignMarketplaceAccountProxy, deleteMarketplaceProxy,
@@ -1905,3 +1777,26 @@ module.exports = {
   createMarketplaceCaptureSchedule, getMarketplaceCaptureSchedules, getDueMarketplaceCaptureSchedules, completeMarketplaceCaptureSchedule, getMarketplaceCaptureScheduleRuns, deleteMarketplaceCaptureSchedule, toggleMarketplaceCaptureSchedule,
   claimMarketplaceCaptureSchedule, releaseMarketplaceCaptureScheduleClaim, renewMarketplaceCaptureScheduleClaim,
 };
+
+/**
+ * Every asynchronous export waits for initDatabase() before it runs.
+ *
+ * Under better-sqlite3 the schema was guaranteed to exist the instant this
+ * module was required. Making initialisation async would otherwise turn that
+ * guarantee into a footgun â€” any caller that forgot to await initDatabase()
+ * would get "relation does not exist" instead. initDatabase() is memoised, so
+ * this costs one already-resolved promise per call after the first.
+ *
+ * Synchronous helpers (formatVietnamTime, normalizeLegacyUtcTimestamp) are
+ * passed through untouched so they keep returning values, not promises.
+ */
+module.exports = Object.fromEntries(
+  Object.entries(api).map(([name, value]) => {
+    if (name === 'initDatabase' || typeof value !== 'function') return [name, value];
+    if (value.constructor.name !== 'AsyncFunction') return [name, value];
+    return [name, async (...args) => {
+      await initDatabase();
+      return value(...args);
+    }];
+  })
+);
