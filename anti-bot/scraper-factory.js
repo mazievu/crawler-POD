@@ -8,6 +8,7 @@ const path = require('path');
 const { diagnose, getFixHint } = require('./error-diagnose');
 const { calculateBackoff, getEscalationStep } = require('./backoff');
 const { ProxyPool } = require('./proxy-pool');
+const { defaultRetryPolicy } = require('../src/reliability/retry-policy');
 
 const STRATEGIES_PATH = path.join(__dirname, 'strategies.json');
 const STRATEGIES = JSON.parse(fs.readFileSync(STRATEGIES_PATH, 'utf-8'));
@@ -19,6 +20,23 @@ function setProxies(proxies) {
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Gap #2 closure (Final Gap Closure Round): an abortable backoff wait — a
+// stuck LOCAL_HTTP execution previously could not be forcibly stopped between
+// retry attempts; the loop would blindly sleep out the full backoff delay and
+// start a NEW attempt regardless of any abort signal. This does not make an
+// in-flight fetch itself instantly cancellable (that remains per-scraper),
+// but it bounds how long a cancelled execution can keep retrying.
+const abortableSleep = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal && signal.aborted) { reject(new Error('ABORTED: execution cancelled during backoff')); return; }
+  const timer = setTimeout(resolve, ms);
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new Error('ABORTED: execution cancelled during backoff'));
+    }, { once: true });
+  }
+});
 
 function validateResult(platform, data) {
   if (!data) return false;
@@ -36,8 +54,14 @@ async function scrapeWithRetry(platform, query, options) {
   const maxAttempts = options.maxAttempts || strategy.retry?.maxAttempts || 5;
   const logs = [];
   let lastError = null;
+  let lastAttemptNumber = 0;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (options.signal && options.signal.aborted) {
+      console.log('  Aborted before attempt ' + attempt + ' — stopping retries');
+      throw new Error('ABORTED: execution cancelled');
+    }
+    lastAttemptNumber = attempt;
     const escalation = getEscalationStep(attempt);
     const backoffDelay = calculateBackoff(attempt, strategy.retry);
     const needsProxy = strategy.proxy?.required || escalation.proxy;
@@ -87,15 +111,25 @@ async function scrapeWithRetry(platform, query, options) {
         break;
       }
 
+      // Unified retry classification (Simplification Round #22): this loop
+      // previously retried EVERY error up to maxAttempts (including HTTP 404,
+      // invalid platform/schema), diverging from src/reliability/retry-policy.js
+      // which correctly treats those as non-retryable. A 404 no longer burns
+      // through 5 attempts before surfacing.
+      if (!defaultRetryPolicy.isRetryable(err)) {
+        console.log('  Fatal: non-retryable per unified retry policy, stopping retries');
+        break;
+      }
+
       if (attempt < maxAttempts) {
         console.log('  Waiting ' + backoffDelay + 'ms before retry...');
-        await sleep(backoffDelay);
+        await abortableSleep(backoffDelay, options.signal);
       }
     }
   }
 
   const error = lastError || new Error('All attempts failed');
-  console.error('[' + platform + '] FAILED after ' + maxAttempts + ' attempts');
+  console.error('[' + platform + '] FAILED after ' + lastAttemptNumber + '/' + maxAttempts + ' attempt(s)' + (lastAttemptNumber < maxAttempts ? ' (stopped early: non-retryable)' : ''));
   throw error;
 }
 

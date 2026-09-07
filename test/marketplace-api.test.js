@@ -69,10 +69,18 @@ test('all Etsy variants are acknowledged as a background capture job', async () 
   assert.equal(response.status, 202);
   assert.equal(body.job.status, 'running');
 
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  const statusResponse = await fetch(`${baseUrl}/api/html-capture-jobs/${encodeURIComponent(body.job.id)}`);
-  const status = await statusResponse.json();
-  assert.equal(statusResponse.status, 200);
+  // The capture now goes through the shared Resource Scheduler (Simplification
+  // Round #8: no crawler workload bypasses admission control), so it is no
+  // longer synchronous — poll instead of assuming a fixed short delay.
+  let status;
+  const deadline = Date.now() + 10000;
+  do {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const statusResponse = await fetch(`${baseUrl}/api/html-capture-jobs/${encodeURIComponent(body.job.id)}`);
+    assert.equal(statusResponse.status, 200);
+    status = await statusResponse.json();
+  } while (status.status === 'running' && Date.now() < deadline);
+
   assert.equal(status.status, 'failed');
   assert.match(status.error, /URL does not belong to etsy/);
 });

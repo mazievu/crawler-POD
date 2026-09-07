@@ -65,7 +65,7 @@ class ToidispyAutomation {
 
   // ==================== SCROLLING ====================
 
-  async scrollAndLoad(maxScrolls = 5) {
+  async scrollAndLoad(maxScrolls = 5, targetCount = null) {
     let lastCount = 0;
     for (let i = 0; i < maxScrolls; i++) {
       await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)); // eslint-disable-line no-undef
@@ -73,6 +73,13 @@ class ToidispyAutomation {
 
       const currentCount = await this.page.$$eval('.p-item-col', els => els.length);
       console.error(`  📜 Scroll ${i + 1}/${maxScrolls}: ${currentCount} items`);
+
+      // §9: stop scrolling early once we already have enough for a bounded
+      // maxItems request — no point loading more than will ever be returned.
+      if (Number.isFinite(targetCount) && targetCount > 0 && currentCount >= targetCount) {
+        console.error(`  ⏹️ Reached requested maxItems=${targetCount}, stopping scroll`);
+        break;
+      }
 
       if (currentCount === lastCount) {
         console.error('  ⏹️ No more items to load');
@@ -266,7 +273,8 @@ class ToidispyAutomation {
       filters = {},
       maxScrolls = 3,
       saveToDb = true,
-      importUrl = 'http://localhost:3000/api/toidispy/import'
+      importUrl = 'http://localhost:3000/api/toidispy/import',
+      maxItems = null
     } = options;
 
     const appliedFilters = { ...filters, keyword };
@@ -302,7 +310,7 @@ class ToidispyAutomation {
     }
 
     // 5. Scroll to load more
-    await this.scrollAndLoad(maxScrolls);
+    await this.scrollAndLoad(maxScrolls, maxItems);
 
     // 6. Scrape data
     let items;
@@ -310,6 +318,12 @@ class ToidispyAutomation {
       items = await this.scrapeAdsLibrary();
     } else {
       items = await this.scrapePosts();
+    }
+
+    // §9: final result slice safety — one execution, no fake sharding, but the
+    // returned/processed count must respect maxItems where technically possible.
+    if (Number.isFinite(maxItems) && maxItems > 0 && items.length > maxItems) {
+      items = items.slice(0, maxItems);
     }
 
     console.error(`📊 Scraped ${items.length} items`);
@@ -365,14 +379,22 @@ async function fatal(error, context = {}, page = null) {
   console.error(JSON.stringify(diagnostic));
 }
 
-async function main() {
-  const args = process.argv.slice(2);
+const MAX_ITEMS_SAFE_UPPER_BOUND = 1000;
+
+/**
+ * §9/§20.K: extracted from main() so the CLI parsing contract (in particular
+ * --max-items, which previously referenced an undeclared `maxItems` variable
+ * — a guaranteed ReferenceError on every run that reached that line) can be
+ * unit-tested without spawning a real CDP-connected process.
+ */
+function parseCliArgs(args) {
   let output = 'import'; // default legacy
   let keyword = 'press on nail';
   let section = 'posts';
   let filters = {};
   let importUrl = 'http://localhost:3000/api/toidispy/import';
   let cdpUrl = process.env.CDP_URL || 'http://localhost:9222';
+  let maxItems = null;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--output' && args[i + 1]) output = args[++i];
@@ -380,11 +402,25 @@ async function main() {
     else if (args[i] === '--section' && args[i + 1]) section = args[++i];
     else if (args[i] === '--import-url' && args[i + 1]) importUrl = args[++i];
     else if (args[i] === '--cdp-url' && args[i + 1]) cdpUrl = args[++i];
+    else if (args[i] === '--max-items' && args[i + 1]) {
+      const parsed = Number.parseInt(args[++i], 10);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        maxItems = Math.min(parsed, MAX_ITEMS_SAFE_UPPER_BOUND);
+      } else {
+        console.error(`⚠️ Invalid --max-items value, ignoring (must be a positive integer)`);
+      }
+    }
     else if (args[i] === '--filters' && args[i + 1]) {
       try { filters = JSON.parse(args[++i]); }
       catch { console.error('⚠️ Invalid filters JSON, using defaults'); }
     }
   }
+
+  return { output, keyword, section, filters, importUrl, cdpUrl, maxItems };
+}
+
+async function main() {
+  const { output, keyword, section, filters, importUrl, cdpUrl, maxItems } = parseCliArgs(process.argv.slice(2));
 
   const auto = new ToidispyAutomation();
   const context = { section, query: keyword, filters, outputMode: output, cdpUrl };
@@ -396,10 +432,10 @@ async function main() {
     }
 
     const saveToDb = (output === 'import');
-    const result = await auto.run(keyword, { section, filters, saveToDb, importUrl });
+    const result = await auto.run(keyword, { section, filters, saveToDb, importUrl, maxItems });
 
     if (output === 'stdout') {
-      process.stdout.write(JSON.stringify({ items: result.items, meta: { platform: 'toidispy', status: 'ok', query: keyword, section, filters: result.filters } }) + '\n');
+      process.stdout.write(JSON.stringify({ items: result.items, meta: { platform: 'toidispy', status: 'ok', query: keyword, section, filters: result.filters, maxItems } }) + '\n');
     } else {
       console.error('\n📊 Summary:');
       console.error(`- Total items: ${result.items.length}`);
@@ -449,7 +485,7 @@ async function main() {
   }
 }
 
-module.exports = { ToidispyAutomation, DB, fatal };
+module.exports = { ToidispyAutomation, DB, fatal, parseCliArgs };
 
 if (require.main === module) {
   main();

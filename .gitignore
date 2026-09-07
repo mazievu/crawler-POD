@@ -7,4 +7,9 @@ proxies.txt
 .playwright-mcp/
 debug/
 scratch-run.js
+.agent/
+.backup/
+.claude/
+docs/BACKUPS/
+handoff.md
 

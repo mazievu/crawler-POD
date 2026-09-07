@@ -97,8 +97,17 @@ async function runDoctor(options = {}) {
       if (bConf.status === 'warn') hasWarnBackend = true;
     }
 
+    // UI-BUG-02: a channel used to be dragged down to 'warn' whenever it had
+    // more than one candidate backend and the SECOND (lower-priority,
+    // usually a paid fallback like Apify) wasn't fully verified — even when
+    // the actual `activeBackend` the system will use (e.g. Shopify's
+    // local-scraper) is completely healthy. `hasFallback` answers "is there
+    // a backup ready too," which is a different question from "does this
+    // channel work right now" — the badge shown to the user must answer the
+    // second one. An unready fallback is still visible per-backend in
+    // `channelReport.backends`; it should not overrule a healthy active one.
     if (hasOkBackend) {
-      channelReport.status = hasFallback || candidateBackends.length === 1 ? 'ok' : 'warn';
+      channelReport.status = 'ok';
     } else if (hasWarnBackend) {
       channelReport.status = 'warn';
     } else {

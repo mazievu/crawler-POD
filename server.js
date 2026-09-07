@@ -17,15 +17,99 @@ const { createMarketplaceLoginManager } = require('./src/marketplaces/login-mana
 const { createCaptureJobQueue } = require('./src/marketplaces/capture-jobs');
 const { createMarketplaceCaptureScheduler } = require('./src/marketplaces/capture-scheduler');
 const { discoverMarketplaceListingsViaEverbeeHost } = require('./src/marketplaces/everbee-host-client');
+const { getScheduler } = require('./src/scheduler/scheduler');
+const { getSocialScheduler, createSocialBotsRouter } = require('./src/social-bots');
+const { getStuckDetector } = require('./src/reliability/stuck-detector');
+const { recoverOrphanedRuns } = require('./src/reliability/restart-recovery');
+const { runManaged } = require('./src/reliability/managed-execution');
+const { abortExecution } = require('./src/reliability/execution-control');
+
+// Boot-time crash recovery
+void recoverOrphanedRuns(db).catch((err) => console.error('[RestartRecovery] Boot-time recovery failed:', err.message));
+// Boot-time V2 dual-write divergence repair (Simplification Round #17)
+const v2RepairResult = db.repairPendingV2WriteFailures();
+if (v2RepairResult.attempted > 0) {
+  console.log(`[V2Repair] Repaired ${v2RepairResult.repaired}/${v2RepairResult.attempted} pending V2 dual-write failures.`);
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SERVER_STARTED_AT = new Date().toISOString();
+
+// Live-Readiness Round #16: makes stale-process/port confusion diagnosable
+// instead of mysterious — print identity at boot AND expose it over HTTP.
+function getSystemInfo() {
+  let gitCommit = null;
+  try { gitCommit = require('child_process').execSync('git rev-parse --short HEAD', { cwd: __dirname, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch (_e) { /* not a git repo or git unavailable */ }
+  let appVersion = null;
+  try { appVersion = require('./package.json').version; } catch (_e) { /* ignore */ }
+  return {
+    pid: process.pid,
+    serverStartedAt: SERVER_STARTED_AT,
+    port: PORT,
+    appVersion,
+    gitCommit,
+    workingDirectory: process.cwd(),
+    sourcePath: __dirname,
+    nodeVersion: process.version
+  };
+}
 const LOCAL_SCRAPER_PLATFORMS = new Set(['shopify', 'reddit', 'pinterest', 'etsy', 'ebay']);
 const marketplaceLoginManager = createMarketplaceLoginManager();
+const scheduler = getScheduler({
+  executeRun,
+  // Non-channel job kinds (no BackendRouter/channel entry) still go through the
+  // same admission/pool/RAM control — they just use a different executor
+  // (Simplification Round #8/#9: no crawler workload may bypass the Scheduler).
+  // Live-Readiness Round #11: every non-channel executor is wrapped in
+  // ManagedExecution, so heartbeat/lease-ownership/retry/timeout/cleanup are
+  // implemented exactly once, not re-hand-rolled in each executor.
+  executors: {
+    user_journey: (runId, platform, query, options) => runManaged(runId, { ...options, database: db, onTimeout: (ctrl) => ctrl.abort() }, async ({ reportProgress, signal, assertOwner, executionToken }) => {
+      const { runUserJourney } = require('./src/journey/user-journey-runner');
+      // §5: runId must reach runUserJourney() so it reuses THIS Scheduler-owned
+      // Run instead of creating a second nested Run. §6: signal propagates so a
+      // timeout actually closes the browser this execution owns. §7/§8:
+      // assertOwner guards every checkpoint write inside the journey.
+      const summary = await runUserJourney({ ...options, query, runId, signal, assertOwner, executionToken });
+      reportProgress(summary.productsCollectedCount || 0);
+      return summary;
+    }),
+    marketplace_capture: (runId, platform, query, options) => runManaged(runId, { ...options, database: db }, async ({ reportProgress, assertOwner }) => {
+      // §7: assertOwner is threaded into runMarketplaceCapture() and called
+      // immediately before its db.createMarketplaceCapture() write — not
+      // after runMarketplaceCapture() has already returned, which would be
+      // too late (the write already happened by then).
+      const result = await runMarketplaceCapture({ platform, url: query, ...options }, assertOwner);
+      if (result.capture == null) {
+        throw new Error(result.captureStatus?.message || 'Capture failed');
+      }
+      reportProgress(1);
+      return result;
+    }),
+    marketplace_discovery: (runId, platform, query, options) => runManaged(runId, { ...options, database: db, onTimeout: (ctrl) => ctrl.abort() }, async ({ reportProgress }) => {
+      const result = await discoverScheduledEtsyListings(query, options);
+      reportProgress((result.items || []).length);
+      return result;
+    })
+  }
+});
+scheduler.start();
+const stuckDetector = getStuckDetector({ database: db, queue: scheduler.queue });
+stuckDetector.start();
+const socialScheduler = getSocialScheduler({ scheduler });
+socialScheduler.start();
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
+app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0 }));
+app.use(createSocialBotsRouter({ socialScheduler }));
 
 // ==================== Routes ====================
 
@@ -129,7 +213,7 @@ app.get('/api/html-captures/:id', (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-async function runMarketplaceCapture(payload) {
+async function runMarketplaceCapture(payload, assertOwner = () => {}) {
   const { platform, url, accountId, variantMode, maxVariants } = payload || {};
   let normalizedAccountId = null;
   if (accountId) {
@@ -164,6 +248,10 @@ async function runMarketplaceCapture(payload) {
   if (result.capture?.status !== 'ok') {
     return { capture: null, metrics: result.metrics, variants: result.variants || [], captureStatus: result.capture, cached: false };
   }
+  // §7: COLLECT (captureMarketplaceHtml above) -> ASSERT OWNER -> PERSIST.
+  // A stale execution whose lease was revoked WHILE the browser capture was
+  // running must never reach the write below.
+  assertOwner('PRE_CAPTURE_PERSIST');
   const capture = db.createMarketplaceCapture({
     platform,
     accountId: normalizedAccountId,
@@ -202,20 +290,111 @@ async function discoverScheduledEtsyListings(keyword, { limit, accountId } = {})
     }
   }
 
-  // Tier 2: Multi-Tier Resilient Scraper (SearXNG + DB Snapshot matching + Resilient card generator)
+  // Tier 2: SearXNG + DB historical-cache fallback (Live-Readiness Round #5: no synthetic/fabricated data)
   const { scrape: etsyScrape } = require('./src/scrapers/etsy');
   const result = await etsyScrape(keyword, { maxItems: limit || 30 });
   const rawItems = Array.isArray(result?.items) ? result.items : (Array.isArray(result) ? result : []);
   return { items: rawItems.map(item => ({ url: item.url, title: item.title })) };
 }
 
-const marketplaceCaptureJobs = createCaptureJobQueue({ runCapture: runMarketplaceCapture });
+/**
+ * Submits Etsy keyword discovery through the shared Resource Scheduler
+ * (Final Stabilization Round #13) instead of calling discoverScheduledEtsyListings()
+ * directly from the schedule tick. The `marketplace_discovery` executor
+ * registered above already wraps this call in ManagedExecution (heartbeat,
+ * lease ownership, timeout, retry classification) — this is what actually
+ * makes that executor reachable; before this fix nothing ever submitted a
+ * `marketplace_discovery` job, so it existed but was dead code.
+ */
+async function submitMarketplaceDiscoveryViaScheduler(keyword, { limit, accountId } = {}) {
+  const run = db.createRun({
+    platform: 'etsy',
+    query: keyword,
+    maxItems: limit || 30,
+    options: { jobKind: 'marketplace_discovery', limit, accountId }
+  });
+  await scheduler.submitRun(run);
+  const finished = await scheduler.waitForCompletion(run.id, { pollMs: 250, timeoutMs: 120000 });
+  if (finished.status !== 'done') {
+    const err = new Error(finished.error_message || 'Discovery failed');
+    err.status = 400;
+    throw err;
+  }
+  const snapshotObj = JSON.parse(finished.health_snapshot || '{}');
+  return snapshotObj.result || { items: [] };
+}
+
+const marketplaceCaptureJobs = createCaptureJobQueue({ runCapture: (payload) => submitMarketplaceCaptureViaScheduler(payload) });
 const marketplaceCaptureScheduler = createMarketplaceCaptureScheduler({
-  discover: discoverScheduledEtsyListings,
-  capture: runMarketplaceCapture,
-  markComplete: (id, summary) => db.completeMarketplaceCaptureSchedule(id, summary),
+  discover: submitMarketplaceDiscoveryViaScheduler,
+  // Each discovered listing is submitted as its own marketplace_capture job
+  // through the shared Resource Scheduler (Simplification Round #8/#12) —
+  // not a direct browser call — so BROWSER pool/RAM admission applies per item.
+  capture: (payload) => submitMarketplaceCaptureViaScheduler(payload),
+  // §3: claimToken threaded through so a stale attempt's completion write is
+  // rejected at the DB layer (claim_token IS @claimToken), never silently
+  // clearing a newer claim or advancing next_run_at out from under it.
+  markComplete: (id, summary, claimToken) => db.completeMarketplaceCaptureSchedule(id, summary, new Date(), claimToken),
+  // §4: claimToken is passed through from run(schedule, claimToken) below —
+  // renewal without the matching token is a guaranteed no-op by design.
+  renewClaim: (id, claimToken) => db.renewMarketplaceCaptureScheduleClaim(id, 5 * 60 * 1000, claimToken),
 });
 let marketplaceScheduleTickActive = false;
+
+/**
+ * This tick must never block on a long-running capture: it only detects due
+ * schedules and DISPATCHES them (fire-and-forget) — it does not `await` the
+ * actual capture work, so a single hung capture cannot hold
+ * `marketplaceScheduleTickActive` true forever (Simplification Round #12).
+ *
+ * Live-Readiness Round #12: because dispatch is now fire-and-forget, a
+ * schedule whose capture takes longer than the 60s tick interval would
+ * otherwise still show up as "due" (next_run_at is only updated on
+ * completion) and get dispatched AGAIN by the next tick. `claimMarketplaceCaptureSchedule()`
+ * atomically reserves the schedule (claimed_until = now + lease) so a second
+ * tick's claim attempt fails while the first execution is still active. If
+ * the process crashes mid-capture, the claim expires on its own once
+ * claimed_until passes — no manual recovery step needed.
+ */
+async function dispatchScheduleExecution(schedule, claimToken) {
+  if (schedule.platform === 'etsy' && schedule.variant_mode === 'all') {
+    return marketplaceCaptureScheduler.run(schedule, claimToken);
+  }
+
+  // General platform collection dispatched through ResourceScheduler
+  try {
+    const platform = schedule.platform;
+    const query = schedule.keyword;
+    const maxItems = schedule.max_listings || 30;
+    const normalizedOptions = buildCollectionOptions(platform, { maxItems });
+    const run = db.createRun({ platform, query, maxItems, country: null, options: normalizedOptions });
+
+    await scheduler.submitRun(run);
+    const finishedRun = await scheduler.waitForCompletion(run.id, { timeoutMs: 180000 });
+
+    const summary = {
+      runId: run.id,
+      status: finishedRun.status,
+      discovered: finishedRun.item_count || 0,
+      captured: finishedRun.item_count || 0,
+      failed: finishedRun.status === 'failed' ? 1 : 0,
+      error: finishedRun.error || null
+    };
+
+    db.completeMarketplaceCaptureSchedule(schedule.id, summary, new Date(), claimToken);
+    return summary;
+  } catch (err) {
+    const summary = {
+      status: 'failed',
+      discovered: 0,
+      captured: 0,
+      failed: 1,
+      error: err.message
+    };
+    db.completeMarketplaceCaptureSchedule(schedule.id, summary, new Date(), claimToken);
+    throw err;
+  }
+}
 
 async function runDueMarketplaceSchedules() {
   if (marketplaceScheduleTickActive) return;
@@ -223,11 +402,14 @@ async function runDueMarketplaceSchedules() {
   try {
     const dueSchedules = db.getDueMarketplaceCaptureSchedules();
     for (const schedule of dueSchedules) {
-      try {
-        await marketplaceCaptureScheduler.run(schedule);
-      } catch (schErr) {
-        console.error(`[Marketplace schedules] Error running schedule #${schedule.id} (${schedule.keyword}):`, schErr.message);
+      const claimToken = db.claimMarketplaceCaptureSchedule(schedule.id);
+      if (!claimToken) {
+        continue; // Already claimed by a still-active execution
       }
+      dispatchScheduleExecution(schedule, claimToken).catch((schErr) => {
+        console.error(`[Marketplace schedules] Error running schedule #${schedule.id} (${schedule.platform}:${schedule.keyword}):`, schErr.message);
+        db.releaseMarketplaceCaptureScheduleClaim(schedule.id, claimToken);
+      });
     }
   } catch (error) {
     console.error('[Marketplace schedules] Global tick error:', error.message);
@@ -245,6 +427,30 @@ app.get('/api/marketplace-capture-schedules', (req, res) => {
 app.post('/api/marketplace-capture-schedules', (req, res) => {
   try { res.status(201).json(db.createMarketplaceCaptureSchedule(req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/marketplace-capture-schedules/:id/toggle', (req, res) => {
+  try {
+    const updated = db.toggleMarketplaceCaptureSchedule(req.params.id);
+    if (!updated) return res.status(404).json({ error: 'Schedule not found' });
+    res.json(updated);
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/marketplace-capture-schedules/:id/run-now', async (req, res) => {
+  try {
+    const schedule = db.getMarketplaceCaptureSchedules().find((s) => s.id === Number(req.params.id));
+    if (!schedule) return res.status(404).json({ error: 'Schedule not found' });
+    const claimToken = db.claimMarketplaceCaptureSchedule(schedule.id);
+    if (!claimToken) return res.status(409).json({ error: 'Schedule is already running' });
+
+    dispatchScheduleExecution(schedule, claimToken).catch((err) => {
+      console.error(`[Marketplace schedules] Manual run error for #${schedule.id}:`, err.message);
+      db.releaseMarketplaceCaptureScheduleClaim(schedule.id, claimToken);
+    });
+
+    res.json({ success: true, message: 'Schedule execution triggered' });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 app.get('/api/marketplace-capture-schedules/:id/runs', (req, res) => {
@@ -265,13 +471,27 @@ app.get('/api/html-capture-jobs/:id', (req, res) => {
   res.json(job);
 });
 
+/** Submits a marketplace capture through the shared Resource Scheduler (BROWSER pool) instead of launching a browser directly. */
+async function submitMarketplaceCaptureViaScheduler(payload) {
+  const run = db.createRun({ platform: payload.platform || 'marketplace', query: payload.url || 'capture', maxItems: 1, options: { jobKind: 'marketplace_capture', ...payload } });
+  await scheduler.submitRun(run);
+  const finished = await scheduler.waitForCompletion(run.id, { pollMs: 150, timeoutMs: 180000 });
+  const snapshotObj = JSON.parse(finished.health_snapshot || '{}');
+  if (finished.status !== 'done') {
+    const err = new Error(finished.error_message || 'Capture failed');
+    err.status = 400;
+    throw err;
+  }
+  return snapshotObj.result;
+}
+
 app.post('/api/html-captures', async (req, res) => {
   const payload = req.body || {};
   if (payload.platform === 'etsy' && payload.variantMode === 'all') {
     return res.status(202).json({ job: marketplaceCaptureJobs.enqueue(payload) });
   }
   try {
-    res.status(201).json(await runMarketplaceCapture(payload));
+    res.status(201).json(await submitMarketplaceCaptureViaScheduler(payload));
   } catch (err) { res.status(err.status || 400).json({ error: err.message }); }
 });
 
@@ -279,9 +499,23 @@ app.post('/api/html-captures', async (req, res) => {
 app.post('/api/user-journey/run', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   try {
-    const { runUserJourney } = require('./src/journey/user-journey-runner');
-    const summary = await runUserJourney(req.body || {});
-    res.status(200).json(summary);
+    const body = req.body || {};
+    // Goes through the shared Resource Scheduler (BROWSER pool) instead of
+    // launching Playwright directly — this is real browser automation and
+    // must be admission-controlled like every other crawl workload.
+    const run = db.createRun({
+      platform: 'user-journey',
+      query: body.startUrl || body.url || body.query || 'journey',
+      maxItems: 1,
+      options: { jobKind: 'user_journey', ...body }
+    });
+    await scheduler.submitRun(run);
+    const finished = await scheduler.waitForCompletion(run.id, { timeoutMs: 180000 });
+    if (finished.status !== 'done') {
+      return res.status(500).json({ status: 'FAILED', error: finished.error_message || 'User journey failed' });
+    }
+    const snapshotObj = JSON.parse(finished.health_snapshot || '{}');
+    res.status(200).json(snapshotObj.result || {});
   } catch (err) {
     res.status(500).json({ status: 'FAILED', error: err.message });
   }
@@ -309,7 +543,10 @@ app.get('/api/runs/:id', (req, res) => {
   try {
     const run = db.getRunById(parseInt(req.params.id, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
-    run.snapshots = db.getSnapshotsByRunId(run.id);
+    // §6.2: getRunItems() reads legacy `snapshots` or runs.result_items_json
+    // depending on READ_MODEL_V2 — this route never depends on legacy rows
+    // existing for a post-cutover Run.
+    run.snapshots = db.getRunItems(run.id);
     res.json(run);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -321,7 +558,7 @@ app.post('/api/runs', async (req, res) => {
     if (!platform || !query) return res.status(400).json({ error: `${queryField.label} is required` });
     const config = require('./src/platform-config').getPlatform(platform);
     if (!config) return res.status(400).json({ error: `Unknown platform: ${platform}` });
-    const normalizedOptions = buildCollectionOptions(platform, options || {});
+    const normalizedOptions = buildCollectionOptions(platform, { ...req.body, ...(options || {}) });
 
     // Pre-flight check
     try {
@@ -342,24 +579,148 @@ app.post('/api/runs', async (req, res) => {
     const country = normalizedOptions.country || null;
     const run = db.createRun({ platform, query, maxItems, country, options: normalizedOptions });
 
-    // Start the best available collector path async.
-    executeRun(run.id, platform, query, normalizedOptions).catch(console.error);
+    // Submit to Resource-Aware Scheduler with queue admission control
+    scheduler.submitRun(run).catch(console.error);
     res.status(201).json(run);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/system/info', (req, res) => {
+  res.json(getSystemInfo());
+});
+
+app.get('/api/database/health', (req, res) => {
+  try {
+    res.json(db.getDatabaseHealth());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/scheduler/status', (req, res) => {
+  try {
+    res.json(scheduler.getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/proxy-pool/status', (req, res) => {
+  try {
+    const { getProxyPool } = require('./src/proxy');
+    res.json(getProxyPool().getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/apify-tokens/status', (req, res) => {
+  try {
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    res.json(getApifyTokenPool().getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.delete('/api/runs/:id', (req, res) => {
   try {
     const run = db.getRunById(parseInt(req.params.id, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
+
+    // UI-BUG-03: this is the only "Cancel/Stop" affordance the UI has for an
+    // active job — it used to just delete the DB row while the real
+    // scraper/browser/backend call kept running unattended in the
+    // background. Send a real abort to the current attempt's token (if any)
+    // before removing the row, reusing the same ExecutionControlRegistry
+    // StuckDetector already uses — no new abort mechanism.
+    if (run.status === 'running' || run.status === 'queued' || run.status === 'pending') {
+      try {
+        const options = typeof run.input_options === 'string' ? JSON.parse(run.input_options || '{}') : {};
+        if (options.executionToken) abortExecution(options.executionToken, 'USER_CANCELLED');
+      } catch (_e) { /* best-effort abort; deletion still proceeds below */ }
+    }
+
     db.deleteRun(run.id);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Items (latest snapshots)
+// Live-Readiness Round #14: read-path cutover behind a reversible feature
+// flag. READ_MODEL_V2=true only changes what these two GET routes read from —
+// legacy `snapshots` writes are untouched either way (dual-write continues
+// regardless), so flipping this flag back is always safe and instant.
+const READ_MODEL_V2 = process.env.READ_MODEL_V2 === 'true';
+
+function mapProductCurrentToItemShape(p) {
+  let richMeta = {};
+  try {
+    if (p.last_run_id) {
+      const run = db.getRunById(p.last_run_id);
+      if (run?.result_items_json) {
+        const items = JSON.parse(run.result_items_json);
+        const match = items.find(it => it.item_uid === p.item_uid);
+        if (match) {
+          richMeta = {
+            startDate: match.startDate || '',
+            endDate: match.endDate || '',
+            isActive: match.isActive !== undefined ? match.isActive : true,
+            publisherPlatforms: match.publisherPlatforms || [],
+            fanpageLikes: match.fanpageLikes || p.current_likes || 0,
+            cta: match.cta || '',
+            landingUrl: match.landingUrl || '',
+            subreddit: match.subreddit || ''
+          };
+        }
+      }
+    }
+  } catch {}
+
+  return {
+    item_uid: p.item_uid,
+    platform: p.platform,
+    query: p.query,
+    title: p.title,
+    url: p.url,
+    image: p.image,
+    author: p.author,
+    price: p.current_price,
+    prev_price: p.prev_price,
+    rating: p.current_rating,
+    prev_rating: p.prev_rating,
+    reviews: p.current_reviews,
+    prev_reviews: p.prev_reviews,
+    sold_count: p.current_sold,
+    prev_sold: p.prev_sold,
+    likes: p.current_likes,
+    prev_likes: p.prev_likes,
+    comments: p.current_comments,
+    shares: p.current_shares,
+    views: p.current_views,
+    status: p.status,
+    created_at: p.last_crawled_at,
+    ...richMeta,
+    growth: {
+      likes: p.delta_likes || 0,
+      comments: p.delta_comments || 0,
+      shares: p.delta_shares || 0,
+      views: p.delta_views || 0,
+      soldCount: p.delta_sold || 0,
+      reviews: p.delta_reviews || 0,
+      rating: p.delta_rating || 0,
+      priceChange: p.delta_price || 0
+    }
+  };
+}
+
 app.get('/api/items', (req, res) => {
   try {
+    if (READ_MODEL_V2) {
+      const current = db.getProductCurrent({ platform: req.query.platform || null, search: req.query.search || null, limit: req.query.limit ? Number(req.query.limit) : 100 });
+      return res.json(current.map(mapProductCurrentToItemShape));
+    }
+
     const snapshots = db.getLatestSnapshots({
       search: req.query.search,
       platform: req.query.platform,
@@ -367,6 +728,22 @@ app.get('/api/items', (req, res) => {
     });
     // Add growth data
     const items = snapshots.map((s) => {
+      let rawMeta = {};
+      if (s.raw_data) {
+        try {
+          const r = JSON.parse(s.raw_data);
+          rawMeta = {
+            startDate: r.startDateFormatted || (r.startDate ? new Date(r.startDate * 1000).toISOString() : '') || r.firstSeenAt || '',
+            endDate: r.endDateFormatted || (r.endDate ? new Date(r.endDate * 1000).toISOString() : '') || '',
+            isActive: r.isActive !== undefined ? r.isActive : true,
+            publisherPlatforms: r.publisherPlatform || r.publisherPlatforms || r.snapshot?.publisherPlatform || [],
+            fanpageLikes: r.snapshot?.pageLikeCount || r.pageLikeCount || r.likes || s.likes || 0,
+            cta: r.cta || r.ctaText || r.snapshot?.ctaText || '',
+            landingUrl: r.landingUrl || r.snapshot?.linkUrl || ''
+          };
+        } catch {}
+      }
+
       let growth = { likes: 0, comments: 0, shares: 0, views: 0, soldCount: 0, reviews: 0, priceChange: 0 };
       if (s.prev_snapshot_id) {
         const prev = db.getSnapshotHistory(s.item_uid);
@@ -383,7 +760,7 @@ app.get('/api/items', (req, res) => {
           };
         }
       }
-      return { ...s, growth };
+      return { ...s, ...rawMeta, growth };
     });
     res.json(items);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -392,8 +769,61 @@ app.get('/api/items', (req, res) => {
 // Item history (timeline)
 app.get('/api/items/:uid/history', (req, res) => {
   try {
-    const history = db.getSnapshotHistory(decodeURIComponent(req.params.uid));
+    const uid = decodeURIComponent(req.params.uid);
+    if (READ_MODEL_V2) {
+      const history = db.getProductHistoryWithMetadata(uid, 365);
+      if (history && history.length > 0) {
+        return res.json(history);
+      }
+      const current = db.getProductCurrentByUid(uid);
+      if (current) {
+        return res.json([{
+          item_uid: current.item_uid,
+          platform: current.platform,
+          title: current.title,
+          url: current.url,
+          image: current.image,
+          author: current.author,
+          price: current.current_price,
+          rating: current.current_rating,
+          reviews: current.current_reviews,
+          sold_count: current.current_sold,
+          likes: current.current_likes,
+          comments: current.current_comments,
+          shares: current.current_shares,
+          views: current.current_views,
+          status: current.status,
+          created_at: current.last_seen_at || current.first_seen_at || new Date().toISOString()
+        }]);
+      }
+      return res.json([]);
+    }
+    const history = db.getSnapshotHistory(uid);
     res.json(history);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete single item by UID
+app.delete('/api/items/:uid', (req, res) => {
+  try {
+    const uid = decodeURIComponent(req.params.uid);
+    const result = db.deleteItem(uid);
+    res.json({ success: true, message: `Item ${uid} deleted`, changes: result.changes });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete all items (or filtered by platform/query)
+app.delete('/api/items', (req, res) => {
+  try {
+    const { platform, query } = req.query;
+    const result = db.deleteAllItems({ platform, query });
+    res.json({ success: true, message: 'All items deleted successfully', changes: result.changes });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/database/parity', (req, res) => {
+  try {
+    res.json({ readModelV2Enabled: READ_MODEL_V2, ...db.checkV2Parity() });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -443,18 +873,15 @@ app.post('/api/toidispy/run', async (req, res) => {
     const { keyword, section, filters, maxItems, cdpUrl } = req.body;
     if (!keyword?.trim()) return res.status(400).json({ error: 'keyword is required' });
 
-    // Create a run record
-    const run = db.createRun({
-      platform: 'toidispy',
-      query: keyword,
-      maxItems: parseInt(maxItems) || 100,
-    });
+    const options = { section: section || 'posts', filters: filters || {}, cdpUrl, maxItems: parseInt(maxItems) || 100 };
+    // Goes through the shared Resource Scheduler (CDP pool + cdp:9222 lock),
+    // like every other crawl workload — toidispy already has a real channel
+    // entry, so this is the same path as POST /api/runs.
+    const run = db.createRun({ platform: 'toidispy', query: keyword, maxItems: options.maxItems, options });
+    scheduler.submitRun(run).catch(console.error);
 
-    const options = { section: section || 'posts', filters: filters || {}, cdpUrl };
-    executeRun(run.id, 'toidispy', keyword, { ...options, maxItems: run.maxItems }).catch(console.error);
-
-    // Return immediately — client polls /api/runs/:id for status
-    res.status(202).json({ runId: run.id, status: 'running', keyword, section, filters });
+    // Return immediately — client polls /api/runs/:id for status (unchanged contract).
+    res.status(202).json({ runId: run.id, status: 'queued', keyword, section, filters });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -519,10 +946,27 @@ app.get('/api/export/:runId', (req, res) => {
   try {
     const run = db.getRunById(parseInt(req.params.runId, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
-    const snapshots = db.getSnapshotsByRunId(run.id);
+    // §6.2: never depends on legacy `snapshots` existing for a post-cutover Run.
+    const snapshots = db.getRunItems(run.id);
     const items = snapshots.map((s) => {
       let growth = { soldCount: 0, reviews: 0, likes: 0, priceChange: 0 };
-      if (s.prev_snapshot_id || s.item_uid) {
+      if (READ_MODEL_V2) {
+        // §11 (Final Architecture Closure Round): read growth from the V2
+        // source of truth (product_current's already-computed delta_* —
+        // vs the immediately previous crawl for this item, the same
+        // semantics the legacy branch below used), never from legacy
+        // snapshots — a post-cutover Run must not silently degrade to
+        // growth=0 just because legacy history stopped growing.
+        const current = s.item_uid ? db.getProductCurrentByUid(s.item_uid) : null;
+        if (current) {
+          growth = {
+            soldCount: current.delta_sold || 0,
+            reviews: current.delta_reviews || 0,
+            likes: current.delta_likes || 0,
+            priceChange: Number((current.delta_price || 0).toFixed(2))
+          };
+        }
+      } else if (s.prev_snapshot_id || s.item_uid) {
         const prev = db.getSnapshotHistory(s.item_uid);
         if (prev && prev.length >= 2) {
           const older = prev[prev.length - 2];
@@ -555,7 +999,7 @@ app.get('/api/export/:runId', (req, res) => {
       const escapeCsv = (val) => `"${String(val ?? '').replace(/"/g, '""')}"`;
       const headerLine = headers.join(',');
       const rows = items.map(i => [
-        escapeCsv(i.createdAt), escapeCsv(run.platform), escapeCsv(i.title),
+        escapeCsv(db.formatVietnamTime(i.createdAt)), escapeCsv(run.platform), escapeCsv(i.title),
         escapeCsv(i.author), escapeCsv(i.price), escapeCsv(i.growth?.priceChange || 0),
         escapeCsv(i.soldCount), escapeCsv(i.growth?.soldCount || 0),
         escapeCsv(i.reviews), escapeCsv(i.growth?.reviews || 0),
@@ -583,7 +1027,19 @@ process.on('unhandledRejection', (reason) => console.error('[FATAL]', reason));
 
 // ==================== Start ====================
 
-app.listen(PORT, '0.0.0.0', () => {
+const serverInstance = app.listen(PORT, '0.0.0.0', () => {
+  const info = getSystemInfo();
   console.log(`Apify Collector running at http://0.0.0.0:${PORT}`);
+  console.log(`[SystemInfo] pid=${info.pid} startedAt=${info.serverStartedAt} version=${info.appVersion} commit=${info.gitCommit || 'n/a'} cwd=${info.workingDirectory}`);
   if (!process.env.APIFY_TOKEN) console.warn('⚠️  APIFY_TOKEN not set');
+});
+
+serverInstance.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[FATAL] Port ${PORT} is already in use by another process. This server (pid=${process.pid}) will not start.`);
+    console.error(`[FATAL] Check what's listening: another crawler-POD instance may still be running from an earlier session. This process will NOT automatically kill it.`);
+    process.exit(1);
+  }
+  console.error('[FATAL] Server failed to start:', err);
+  process.exit(1);
 });

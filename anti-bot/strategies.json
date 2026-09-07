@@ -13,8 +13,8 @@
     "url": "https://www.ebay.com/sch/i.html",
     "selector": ".s-item",
     "delay": { "min": 2000, "max": 5000 },
-    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 2000 },
-    "proxy": { "required": true, "type": "us" }
+    "retry": { "maxAttempts": 1, "backoff": "exponential", "baseDelay": 2000 },
+    "proxy": { "required": false }
   },
   "shopify": {
     "method": "api",
@@ -27,8 +27,8 @@
     "url": "https://www.etsy.com/search",
     "selector": "[data-listing-id]",
     "delay": { "min": 2000, "max": 5000 },
-    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 2000 },
-    "proxy": { "required": true, "type": "us" }
+    "retry": { "maxAttempts": 3, "backoff": "exponential", "baseDelay": 2000 },
+    "proxy": { "required": false }
   },
   "pinterest": {
     "method": "playwright",

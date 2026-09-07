@@ -1,62 +1,235 @@
 /**
  * eBay Scraper
- * Free-first order:
- *   1. SearXNG search discovery for public eBay item pages.
- *   2. Public search page fallback through Playwright.
+ *
+ * CloakBrowser-primary, multi-tier REAL fallback:
+ *   1. CloakBrowser — a real browser searching eBay's Sold/Completed items directly,
+ *      paginating until maxItems unique listings are found or source runs out. PRIMARY.
+ *   2. SearXNG — SUPPLEMENT ONLY. Only called if Tier 1 is still short of
+ *      maxItems (or failed outright); only ADDS listings for IDs Tier 1
+ *      doesn't already have. Never overwrites a Tier-1 listing.
+ *   3. Database historical snapshot matching — supplement/last resort.
  */
 
-const { launchStealth } = require('../../anti-bot/stealth-launcher');
-const { discoverMarketplaceItems } = require('./search-discovery');
+const { discoverEbayListingsViaCloakBrowser } = require('./ebay-cloakbrowser');
 
-async function scrapePublic(query, options) {
-  options = options || {};
-  const limit = options.limit || 30;
-  const proxyUrl = options.proxyUrl || process.env.EBAY_PROXY || null;
-  const browser = await launchStealth({ proxyUrl, headless: true, cdpUrl: options.cdpUrl || null });
-
-  try {
-    const page = browser.page;
-    const url = 'https://www.ebay.com/sch/i.html?_nkw=' + encodeURIComponent(query) + '&LH_Sold=1&LH_Complete=1&_sop=13';
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(2500);
-
-    const blocked = await page.locator('text=/Pardon Our Interruption|robot|captcha|access denied/i').count();
-    if (blocked) throw new Error('BLOCKED_IP: eBay bot challenge');
-
-    await page.waitForSelector('.s-item', { timeout: 15000 });
-
-    const items = await page.$$eval('.s-item', (els, max) => els.slice(0, max + 5).map(el => {
-      const title = el.querySelector('.s-item__title')?.textContent?.trim() || '';
-      const link = el.querySelector('.s-item__link')?.href || '';
-      const priceText = el.querySelector('.s-item__price')?.textContent?.trim() || '';
-      const image = el.querySelector('.s-item__image img')?.src || '';
-      const seller = el.querySelector('.s-item__seller-info-text')?.textContent?.trim() || '';
-      const shipping = el.querySelector('.s-item__shipping, .s-item__logisticsCost')?.textContent?.trim() || '';
-      const sold = el.querySelector('.s-item__quantitySold')?.textContent?.trim() || '';
-      const price = parseFloat((priceText.match(/[\d,.]+/) || ['0'])[0].replace(/,/g, '')) || 0;
-      return { platform: 'ebay', title, url: link, price, priceText, image, seller, shipping, sold, likes: 0, comments: 0, shares: 0, views: 0 };
-    }), limit);
-
-    const clean = items.filter(i => i.title && i.title !== 'Shop on eBay' && i.url).slice(0, limit);
-    if (!clean.length) throw new Error('EMPTY_RESULT: no eBay items parsed');
-    return { items: clean };
-  } finally {
-    await browser.close();
+class EbayAllSourcesFailedError extends Error {
+  constructor(query) {
+    super(`EBAY_ALL_SOURCES_FAILED: no real data available for "${query}" (CloakBrowser, SearXNG, and historical cache all unavailable/empty)`);
+    this.name = 'EbayAllSourcesFailedError';
+    this.code = 'EBAY_ALL_SOURCES_FAILED';
   }
 }
 
-async function scrape(query, options) {
+const ITEM_ID_PATTERN = /ebay\.[a-z.]+\/itm\/(\d+)|itm\/(\d+)/i;
+
+function itemIdOf(item) {
+  if (item.itemId) return String(item.itemId);
+  if (item.listingId) return String(item.listingId);
+  const match = String(item.url || '').match(ITEM_ID_PATTERN);
+  return match ? (match[1] || match[2]) : null;
+}
+
+/**
+ * Merge `newItems` into `merged` (Map keyed by itemId), WITHOUT
+ * overwriting anything already present — a later/lower-priority tier may
+ * only ADD listings for IDs the higher-priority tier didn't already find.
+ * @returns number of items actually added
+ */
+function mergeSupplement(merged, newItems) {
+  let added = 0;
+  for (const item of newItems) {
+    const id = itemIdOf(item);
+    if (!id || merged.has(id)) continue;
+    merged.set(id, item);
+    added++;
+  }
+  return added;
+}
+
+async function scrape(query, options = {}) {
+  const maxItems = Number(options.maxItems || options.limit || 30);
+  const merged = new Map(); // itemId -> item
+
+  const debug = {
+    cloakBrowserDiscovered: 0,
+    cloakBrowserPagesVisited: 0,
+    cloakBrowserBlocked: false,
+    searxngCalled: false,
+    searxngSupplemented: 0,
+    cacheSupplemented: 0,
+  };
+
+  // Tier 1: CloakBrowser — PRIMARY. Real browser against eBay Sold listings.
   try {
-    const discovered = await discoverMarketplaceItems('ebay', query, options || {});
-    // SearXNG occasionally returns a result page without an accessible image.
-    // Use the rendered eBay search fallback so image-only collection still
-    // returns usable product cards instead of empty image placeholders.
-    if (discovered.items.some((item) => item.image)) return discovered;
-    return await scrapePublic(query, options);
+    const result = await discoverEbayListingsViaCloakBrowser({
+      query,
+      maxItems,
+      signal: options.signal,
+      proxy: options.proxyUrl || null,
+      sessionKey: options.executionToken || null,
+    });
+    debug.cloakBrowserPagesVisited = result.pagesVisited;
+    debug.cloakBrowserBlocked = result.blocked;
+    mergeSupplement(merged, result.items);
+    debug.cloakBrowserDiscovered = merged.size;
   } catch (err) {
-    if (!/SearXNG|EMPTY_RESULT|fetch failed|ECONNREFUSED/i.test(err.message || '')) throw err;
-    return scrapePublic(query, options);
+    if (options.signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
+      throw err;
+    }
+    console.warn('[eBay Scraper] CloakBrowser discovery failed:', err.message);
+  }
+
+  // Tier 2: SearXNG — SUPPLEMENT ONLY. Only called if Tier 1 is short of maxItems.
+  if (merged.size < maxItems) {
+    if (options.signal?.aborted) throw new Error('ABORTED: execution cancelled');
+    try {
+      debug.searxngCalled = true;
+      const { discoverMarketplaceItems } = require('./search-discovery');
+      const result = await discoverMarketplaceItems('ebay', query, { ...options, limit: maxItems });
+      if (result && Array.isArray(result.items)) {
+        debug.searxngSupplemented = mergeSupplement(merged, result.items);
+      }
+    } catch (err) {
+      if (options.signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
+        throw err;
+      }
+      console.warn('[eBay Scraper] SearXNG supplement failed:', err.message);
+    }
+  }
+
+  // Tier 3: Database historical snapshots — supplement / last resort.
+  if (merged.size < maxItems) {
+    if (options.signal?.aborted) throw new Error('ABORTED: execution cancelled');
+    try {
+      const Database = require('better-sqlite3');
+      const sqlite = new Database('./data/collector.db', { readonly: true });
+      const existingSnapshots = sqlite.prepare(
+        `SELECT DISTINCT title, url, image, author, price, rating, reviews, sold_count
+         FROM snapshots
+         WHERE platform = 'ebay' AND (author LIKE ? OR query LIKE ? OR title LIKE ?)
+         LIMIT ?`
+      ).all(`%${query}%`, `%${query}%`, `%${query}%`, maxItems - merged.size);
+      sqlite.close();
+
+      if (existingSnapshots.length > 0) {
+        const cacheItems = existingSnapshots.map(s => ({
+          title: s.title,
+          url: s.url,
+          price: s.price,
+          priceText: `$${s.price}`,
+          image: s.image,
+          author: s.author,
+          seller: s.author,
+          rating: s.rating,
+          reviews: s.reviews,
+          soldCount: s.sold_count,
+          _fromCache: true,
+        }));
+        debug.cacheSupplemented = mergeSupplement(merged, cacheItems);
+      }
+    } catch (err) {
+      if (options.signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
+        throw err;
+      }
+      console.warn('[eBay Scraper] DB fallback search failed:', err.message);
+    }
+  }
+
+  if (merged.size === 0) {
+    throw new EbayAllSourcesFailedError(query);
+  }
+
+  const isLive = !(debug.cacheSupplemented > 0 && debug.cloakBrowserDiscovered === 0 && debug.searxngSupplemented === 0);
+
+  const rawItems = Array.from(merged.values());
+  await enrichEbayImagesWithTaskPool(rawItems, options, debug);
+
+  const items = rawItems.map((item) => ({
+    platform: 'ebay',
+    title: item.title,
+    url: item.url,
+    price: item.price || 0,
+    priceText: item.priceText || `$${item.price || 0}`,
+    currency: item.currency || 'USD',
+    image: item.image || '',
+    description: item.description || '',
+    author: item.author || item.seller || 'eBay Seller',
+    seller: item.seller || item.author || 'eBay Seller',
+    listingId: itemIdOf(item) || '',
+    itemId: itemIdOf(item) || '',
+    rating: item.rating || 0,
+    reviews: item.reviews || 0,
+    soldCount: item.soldCount || 0,
+    views: item.views || 0,
+    likes: item.likes || 0,
+    comments: item.comments || 0,
+    shares: item.shares || 0,
+    listingStatus: 'sold_or_completed',
+    status: 'new',
+    source: item.source || 'mixed',
+    isLive
+  }));
+
+  return { items, source: 'mixed', isLive, _debug: debug };
+}
+
+/**
+ * Product-level image enrichment using InternalTaskPool + computeInternalConcurrency.
+ */
+async function enrichEbayImagesWithTaskPool(items, options, debug) {
+  const needsImage = items.filter((it) => !it.image);
+  if (needsImage.length === 0) {
+    debug.productTasksCreated = 0;
+    debug.peakConcurrentTasks = 0;
+    debug.internalConcurrencySource = 'n/a (no items needed image enrichment)';
+    debug.ramReservedMB = 0;
+    return;
+  }
+
+  const { getScheduler } = require('../scheduler/scheduler');
+  const { InternalTaskPool, computeInternalConcurrency } = require('../scheduler/internal-task-pool');
+  const { imageFromProductPage } = require('./search-discovery');
+
+  let monitor = null;
+  try {
+    monitor = getScheduler()?.monitor;
+  } catch (_) {}
+
+  const reservationKey = `${options.executionToken || 'ebay-standalone'}:image-enrich:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+
+  let concurrency = 2;
+  let taskCostMB = 8;
+  if (monitor) {
+    const { effectiveHeadroomMB } = monitor.getSnapshot();
+    const computed = computeInternalConcurrency({
+      executionClass: 'LOCAL_HTTP',
+      runBaseCostMB: 0,
+      effectiveHeadroomMB,
+    });
+    concurrency = computed.concurrency;
+    taskCostMB = computed.taskCostMB;
+    monitor.reserve(reservationKey, concurrency * taskCostMB);
+  }
+
+  debug.productTasksCreated = needsImage.length;
+  debug.peakConcurrentTasks = Math.min(concurrency, needsImage.length);
+  debug.internalConcurrencySource = 'InternalTaskPool + computeInternalConcurrency (RAM-aware)';
+  debug.ramReservedMB = concurrency * taskCostMB;
+  debug.productTasksFailed = 0;
+
+  try {
+    const pool = new InternalTaskPool({ concurrency, signal: options.signal });
+    const results = await pool.run(needsImage, async (item) => {
+      item.image = await imageFromProductPage(item.url);
+      return item;
+    });
+    debug.productTasksFailed = results.filter((r) => r.status === 'rejected').length;
+  } finally {
+    if (monitor) {
+      monitor.release(reservationKey);
+    }
+    debug.ramReleased = true;
   }
 }
 
-module.exports = { scrape };
+module.exports = { scrape, EbayAllSourcesFailedError };

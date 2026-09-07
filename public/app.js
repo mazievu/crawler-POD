@@ -23,18 +23,21 @@ async function loadData() {
   try {
     const [platforms, items, stats] = await Promise.all([
       apiFetch('/api/platforms'),
-      apiFetch('/api/items?limit=200'),
-      apiFetch('/api/stats').catch(() => ({ totalRuns: 0 })),
+      apiFetch('/api/items?limit=100'),
+      apiFetch('/api/stats').catch(() => ({ totalRuns: 0, totalSnapshots: 0, platformCounts: {} })),
     ]);
     allPlatforms = platforms;
     allItems = items;
 
-    const counts = {};
+    const counts = { ...(stats.platformCounts || {}) };
     for (const item of allItems) {
-      counts[item.platform] = (counts[item.platform] || 0) + 1;
+      if (counts[item.platform] === undefined) {
+        counts[item.platform] = (counts[item.platform] || 0) + 1;
+      }
     }
     renderFilterPills(platforms, counts);
-    document.getElementById('stat-total').textContent = `${stats.totalRuns} runs / ${allItems.length} items`;
+    const totalCount = stats.totalSnapshots || Object.values(counts).reduce((a, b) => a + b, 0) || allItems.length;
+    document.getElementById('stat-total').textContent = `${stats.totalRuns || 0} runs / ${totalCount} items`;
     renderItems(allItems);
   } catch (err) { console.error('Load failed:', err); }
 }
@@ -93,7 +96,7 @@ async function applyFilters() {
     case 'price-asc': filtered.sort((a, b) => a.price - b.price); break;
     case 'price-desc': filtered.sort((a, b) => b.price - a.price); break;
     case 'growth': filtered.sort((a, b) => ((b.growth?.likes || 0) + (b.growth?.comments || 0)) - ((a.growth?.likes || 0) + (a.growth?.comments || 0))); break;
-    default: filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); break;
+    default: filtered.sort((a, b) => parseServerTimestamp(b.created_at) - parseServerTimestamp(a.created_at)); break;
   }
   renderItems(filtered);
 }
@@ -114,7 +117,7 @@ function renderItems(items) {
     const icon = config?.icon || '🔗';
     const platformLabel = config?.displayName || item.platform;
     const cardImage = item.image
-      ? `<img src="${escapeAttr(item.image)}" alt="${escapeAttr(item.title || platformLabel)}" style="width:100%;height:100%;object-fit:cover" onerror="this.replaceWith(Object.assign(document.createElement('div'), { className: 'item-img-placeholder', textContent: 'No image' }))">`
+      ? `<img src="${escapeAttr(item.image)}" alt="${escapeAttr(item.title || platformLabel)}" style="width:100%;height:100%;object-fit:cover" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('div'), { className: 'item-img-placeholder', textContent: 'No image' }))">`
       : '<div class="item-img-placeholder">No image</div>';
 
     // Status badge
@@ -122,6 +125,61 @@ function renderItems(items) {
 
     // Growth indicators
     const growthHtml = renderGrowth(item.growth);
+    const isTiktokShop = item.platform === 'tiktok_shop';
+    const isTwitter = item.platform === 'twitter';
+    const isEcommerce = ['amazon', 'ebay', 'etsy', 'shopify', 'google_shopping', 'tiktok_shop'].includes(item.platform);
+
+    const priceHtml = item.price > 0
+      ? `<div class="item-price">$${item.price.toFixed(2)} ${growthHtml.priceChange}</div>`
+      : '';
+
+    const isFacebookAds = item.platform === 'facebook_ads';
+    const isReddit = item.platform === 'reddit';
+
+    const platformsList = Array.isArray(item.publisherPlatforms) && item.publisherPlatforms.length > 0 ? item.publisherPlatforms : ['FACEBOOK'];
+    const platformBadgesHtml = isFacebookAds
+      ? `<div class="mt-1 d-flex flex-wrap gap-1">${platformsList.map(p => `<span class="badge bg-secondary-subtle text-dark" style="font-size:10px">${p.replace(/_/g, ' ')}</span>`).join('')}</div>`
+      : '';
+
+    const startStr = isFacebookAds && item.startDate ? parseServerTimestamp(item.startDate).toLocaleDateString() : '';
+    const dateHtml = startStr ? `<div class="fs-11 text-muted mt-1">📅 Bắt đầu: ${startStr}</div>` : '';
+
+    const engagementHtml = isTiktokShop
+      ? `<div class="item-engagement">
+          <div class="engagement-stat" title="Số Lượng Đã Bán"><i data-feather="shopping-bag"></i><span class="eng-val">${formatNum(item.sold_count || item.soldCount || 0)}</span> <span class="fs-10 text-muted">đã bán</span>${growthHtml.soldCount}</div>
+          <div class="engagement-stat" title="Điểm Đánh Giá"><i data-feather="star"></i><span class="eng-val">${item.rating > 0 ? `★ ${Number(item.rating).toFixed(1)}` : '—'}</span>${growthHtml.rating}</div>
+          <div class="engagement-stat commented" title="Số Lượng Review"><i data-feather="message-square"></i><span class="eng-val">${formatNum(item.reviews || item.reviewCount || 0)}</span> <span class="fs-10 text-muted">reviews</span>${growthHtml.reviews}</div>
+        </div>`
+      : isTwitter
+      ? `<div class="item-engagement">
+          <div class="engagement-stat liked" title="Số Likes"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes || 0)}</span> <span class="fs-10 text-muted">likes</span>${growthHtml.likes}</div>
+          <div class="engagement-stat commented" title="Số Replies"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments || 0)}</span> <span class="fs-10 text-muted">replies</span>${growthHtml.comments}</div>
+          <div class="engagement-stat" title="Số Views"><i data-feather="eye"></i><span class="eng-val">${formatNum(item.views || 0)}</span> <span class="fs-10 text-muted">views</span>${growthHtml.views}</div>
+        </div>`
+      : isEcommerce
+      ? `<div class="item-engagement">
+          <div class="engagement-stat liked" title="Yêu thích / Likes"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes || item.reviews || 0)}</span>${growthHtml.likes}</div>
+          <div class="engagement-stat" title="Tổng số Review"><i data-feather="message-square"></i><span class="eng-val">${formatNum(item.reviews || 0)}</span>${growthHtml.reviews}</div>
+          <div class="engagement-stat" title="Điểm Đánh Giá / Feedback Score"><i data-feather="star"></i><span class="eng-val">${item.rating > 0 ? (item.rating > 5 ? `★ ${Number(item.rating).toFixed(1)}%` : `★ ${Number(item.rating).toFixed(1)}`) : '—'}</span>${growthHtml.rating}</div>
+          ${(item.sold_count > 0 || item.soldCount > 0) ? `<div class="engagement-stat" title="Lượt Bán"><i data-feather="shopping-bag"></i><span class="eng-val">${formatNum(item.sold_count || item.soldCount)}</span>${growthHtml.soldCount}</div>` : ''}
+        </div>`
+      : isFacebookAds
+      ? `<div class="item-engagement">
+          <div class="engagement-stat liked" title="Lượt Thích Fanpage"><i data-feather="thumbs-up"></i><span class="eng-val">${formatNum(item.fanpageLikes || item.likes || 0)}</span> <span class="fs-10 text-muted">Fanpage Likes</span></div>
+          ${item.cta ? `<div class="engagement-stat"><span class="badge bg-primary text-white" style="font-size:10px">${escapeHtml(item.cta)}</span></div>` : ''}
+        </div>`
+      : isReddit
+      ? `<div class="item-engagement">
+          <div class="engagement-stat" title="Subreddit"><i data-feather="hash"></i><span class="eng-val">${item.subreddit ? 'r/' + escapeHtml(item.subreddit) : '—'}</span></div>
+          <div class="engagement-stat commented" title="Tổng số Comment"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments || 0)}</span>${growthHtml.comments}</div>
+          <div class="engagement-stat liked" title="Upvote Score"><i data-feather="arrow-up"></i><span class="eng-val">${formatNum(item.likes || 0)}</span>${growthHtml.likes}</div>
+        </div>`
+      : `<div class="item-engagement">
+          <div class="engagement-stat liked" title="Likes / Reactions"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes || 0)}</span>${growthHtml.likes}</div>
+          <div class="engagement-stat commented" title="Comments"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments || 0)}</span>${growthHtml.comments}</div>
+          <div class="engagement-stat shared" title="Shares / Repins"><i data-feather="share-2"></i><span class="eng-val">${formatNum(item.shares || 0)}</span>${growthHtml.shares}</div>
+          <div class="engagement-stat" title="Views"><i data-feather="eye"></i><span class="eng-val">${formatNum(item.views || 0)}</span>${growthHtml.views}</div>
+        </div>`;
 
     return `
       <div class="item-card" onclick="showItemDetail('${escapeAttr(item.item_uid)}')">
@@ -129,19 +187,19 @@ function renderItems(items) {
           ${cardImage}
           <span class="platform-tag ${tagClass}">${platformLabel}</span>
           ${statusBadge}
+          <button class="btn-card-delete" onclick="deleteSingleItem(event, '${escapeAttr(item.item_uid)}')" title="Xóa sản phẩm này">
+            <i data-feather="trash-2" style="width:14px;height:14px"></i>
+          </button>
         </div>
         <div class="item-body">
           <div class="item-title" title="${escapeAttr(item.title)}">${escapeHtml(item.title) || '<em>No title</em>'}</div>
-          ${item.author ? `<div class="item-source">${escapeHtml(item.author)}</div>` : ''}
-          ${item.price > 0 ? `<div class="item-price">$${item.price.toFixed(2)}</div>` : ''}
+          ${item.author ? `<div class="item-source fw-bold">${escapeHtml(item.author)}</div>` : ''}
+          ${priceHtml}
           ${renderProductMetrics(item)}
+          ${platformBadgesHtml}
+          ${dateHtml}
         </div>
-        <div class="item-engagement">
-          <div class="engagement-stat liked"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes)}</span>${growthHtml.likes}</div>
-          <div class="engagement-stat commented"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments)}</span>${growthHtml.comments}</div>
-          <div class="engagement-stat shared"><i data-feather="share-2"></i><span class="eng-val">${formatNum(item.shares)}</span>${growthHtml.shares}</div>
-          ${item.views > 0 ? `<div class="engagement-stat"><i data-feather="eye"></i><span class="eng-val">${formatNum(item.views)}</span></div>` : ''}
-        </div>
+        ${engagementHtml}
       </div>`;
   }).join('');
   feather.replace();
@@ -157,19 +215,36 @@ function getStatusBadge(status) {
 }
 
 function renderGrowth(growth) {
-  if (!growth) return { likes: '', comments: '', shares: '' };
+  if (!growth) return { likes: '', comments: '', shares: '', views: '', priceChange: '', rating: '', reviews: '', soldCount: '' };
   return {
     likes: growth.likes > 0 ? `<span class="growth-up">+${growth.likes}</span>` : growth.likes < 0 ? `<span class="growth-down">${growth.likes}</span>` : '',
     comments: growth.comments > 0 ? `<span class="growth-up">+${growth.comments}</span>` : growth.comments < 0 ? `<span class="growth-down">${growth.comments}</span>` : '',
     shares: growth.shares > 0 ? `<span class="growth-up">+${growth.shares}</span>` : growth.shares < 0 ? `<span class="growth-down">${growth.shares}</span>` : '',
+    views: growth.views > 0 ? `<span class="growth-up">+${growth.views}</span>` : growth.views < 0 ? `<span class="growth-down">${growth.views}</span>` : '',
+    priceChange: growth.priceChange > 0 ? `<span class="growth-down ms-1">+${growth.priceChange.toFixed(2)}</span>` : growth.priceChange < 0 ? `<span class="growth-up ms-1">${growth.priceChange.toFixed(2)}</span>` : '',
+    rating: growth.rating > 0 ? `<span class="growth-up ms-1">+${growth.rating.toFixed(1)}</span>` : growth.rating < 0 ? `<span class="growth-down ms-1">${growth.rating.toFixed(1)}</span>` : '',
+    reviews: growth.reviews > 0 ? `<span class="growth-up ms-1">+${growth.reviews}</span>` : growth.reviews < 0 ? `<span class="growth-down ms-1">${growth.reviews}</span>` : '',
+    soldCount: growth.soldCount > 0 ? `<span class="growth-up ms-1">+${growth.soldCount}</span>` : growth.soldCount < 0 ? `<span class="growth-down ms-1">${growth.soldCount}</span>` : '',
   };
 }
 
 function renderProductMetrics(item) {
+  if (item.platform === 'facebook_ads') return '';
+  const g = renderGrowth(item.growth);
   const metrics = [];
-  if (item.rating > 0) metrics.push(`<span title="Rating">★ ${Number(item.rating).toFixed(1)}</span>`);
-  if (item.reviews > 0) metrics.push(`<span title="Reviews">${formatNum(item.reviews)} reviews</span>`);
-  if (item.sold_count > 0 || item.soldCount > 0) metrics.push(`<span title="Sold">${formatNum(item.sold_count || item.soldCount)} sold</span>`);
+  if (item.platform === 'tiktok_shop') {
+    metrics.push(`<span title="Số lượng đã bán">📦 ${formatNum(item.sold_count || item.soldCount || 0)} đã bán${g.soldCount}</span>`);
+    metrics.push(`<span title="Điểm đánh giá">★ ${item.rating > 0 ? Number(item.rating).toFixed(1) : '—'}${g.rating}</span>`);
+    metrics.push(`<span title="Tổng số review">💬 ${formatNum(item.reviews || item.reviewCount || 0)} reviews${g.reviews}</span>`);
+    return `<div class="item-product-metrics">${metrics.join('<span class="metric-separator">·</span>')}</div>`;
+  }
+  if (item.rating > 0) {
+    const rLabel = item.rating > 5 ? `★ ${Number(item.rating).toFixed(1)}%` : `★ ${Number(item.rating).toFixed(1)}`;
+    metrics.push(`<span title="${item.platform === 'ebay' ? 'Điểm đánh giá tích cực' : 'Điểm đánh giá trung bình'}">${rLabel}${g.rating}</span>`);
+  }
+  if (item.reviews > 0) metrics.push(`<span title="${item.platform === 'ebay' ? 'Feedback / Phản hồi' : 'Tổng số review'}">${formatNum(item.reviews)} ${item.platform === 'ebay' ? 'feedback' : 'reviews'}${g.reviews}</span>`);
+  if (item.sold_count > 0 || item.soldCount > 0) metrics.push(`<span title="Số lượng đã bán">📦 ${formatNum(item.sold_count || item.soldCount)} sold${g.soldCount}</span>`);
+  if (item.likes > 0) metrics.push(`<span title="Số tym / Watchers">❤️ ${formatNum(item.likes)}${g.likes}</span>`);
   return metrics.length ? `<div class="item-product-metrics">${metrics.join('<span class="metric-separator">·</span>')}</div>` : '';
 }
 
@@ -182,6 +257,7 @@ async function showItemDetail(itemUid) {
 
     const latest = history[history.length - 1];
     const config = allPlatforms.find((p) => p.name === latest.platform);
+    const isEcommerce = ['amazon', 'ebay', 'etsy', 'shopify', 'google_shopping', 'tiktok_shop'].includes(latest.platform);
 
     document.getElementById('item-modal-title').innerHTML = `
       ${config?.icon || '🔗'} ${escapeHtml(latest.title || 'Untitled')}
@@ -189,67 +265,206 @@ async function showItemDetail(itemUid) {
     `;
 
     // Timeline chart data
-    const timelineHtml = renderTimeline(history);
-    const statsHtml = renderHistoryStats(history);
+    const timelineHtml = renderTimeline(history, isEcommerce);
+    const statsHtml = renderHistoryStats(history, isEcommerce);
 
     document.getElementById('item-modal-body').innerHTML = `
       <div class="row g-3">
-        ${latest.image ? `<div class="col-md-5"><img src="${escapeAttr(latest.image)}" class="w-100 rounded" style="max-height:300px;object-fit:cover"></div>` : ''}
+        ${latest.image ? `<div class="col-md-5"><img src="${escapeAttr(latest.image)}" class="w-100 rounded" style="max-height:300px;object-fit:cover" referrerpolicy="no-referrer" onerror="this.parentElement.style.display='none'"></div>` : ''}
         <div class="${latest.image ? 'col-md-7' : 'col-12'}">
           <div class="mb-2">
             <span class="badge bg-primary me-1">${config?.displayName || latest.platform}</span>
-            ${latest.author ? `<span class="badge bg-light text-dark">${escapeHtml(latest.author)}</span>` : ''}
+            ${latest.subreddit ? `<span class="badge bg-danger-subtle text-danger border border-danger-subtle me-1">r/${escapeHtml(latest.subreddit)}</span>` : ''}
+            ${latest.author ? `<span class="badge bg-light text-dark">${latest.platform === 'reddit' ? 'u/' : ''}${escapeHtml(latest.author.replace(/^u\//, ''))}</span>` : ''}
             ${getStatusBadge(latest.status)}
           </div>
           <h6 class="fw-bold">${escapeHtml(latest.title)}</h6>
-          ${latest.price > 0 ? `<p class="fs-4 fw-bold text-success mb-2">$${latest.price.toFixed(2)}</p>` : ''}
+          ${latest.price > 0 ? `<p class="fs-4 fw-bold text-success mb-2">$${Number(latest.price).toFixed(2)}</p>` : ''}
           ${renderProductMetrics(latest)}
-          ${latest.url ? `<a href="${escapeAttr(latest.url)}" target="_blank" class="btn btn-outline-primary btn-sm mb-3">View Source →</a>` : ''}
+          <div class="mt-2 mb-3">
+            ${latest.url ? `<a href="${escapeAttr(latest.url)}" target="_blank" class="btn btn-outline-primary btn-sm me-2">${latest.platform === 'facebook_ads' ? 'Xem trong Meta Ad Library ↗' : 'View Source →'}</a>` : ''}
+            ${latest.landingUrl && latest.landingUrl !== latest.url ? `<a href="${escapeAttr(latest.landingUrl)}" target="_blank" class="btn btn-outline-secondary btn-sm">Website Đích ↗</a>` : ''}
+          </div>
+          ${latest.platform === 'tiktok_shop' ? `
+            <div class="p-3 bg-light rounded mb-3 border fs-13">
+              <div class="d-flex flex-wrap gap-3">
+                <div><span class="fw-bold">📦 Số Lượng Đã Bán:</span> <span class="fw-bold text-success">${formatNum(latest.sold_count || latest.soldCount || 0)}</span></div>
+                <div><span class="fw-bold">⭐ Đánh Giá (Rating):</span> <span class="fw-bold text-warning">${latest.rating > 0 ? `★ ${Number(latest.rating).toFixed(1)}` : '★ —'}</span></div>
+                <div><span class="fw-bold">💬 Tổng Reviews:</span> <span class="fw-bold text-primary">${formatNum(latest.reviews || latest.reviewCount || 0)}</span></div>
+              </div>
+            </div>
+          ` : ''}
+          ${latest.platform === 'twitter' ? `
+            <div class="p-3 bg-light rounded mb-3 border fs-13">
+              <div class="d-flex flex-wrap gap-3">
+                <div><span class="fw-bold">❤️ Số Likes:</span> <span class="fw-bold text-danger">${formatNum(latest.likes || 0)}</span></div>
+                <div><span class="fw-bold">💬 Số Replies:</span> <span class="fw-bold text-primary">${formatNum(latest.comments || 0)}</span></div>
+                <div><span class="fw-bold">👁️ Số Views:</span> <span class="fw-bold text-success">${formatNum(latest.views || 0)}</span></div>
+              </div>
+            </div>
+          ` : ''}
+          ${latest.platform === 'reddit' ? `
+            <div class="p-3 bg-light rounded mb-3 border fs-13">
+              <div class="d-flex flex-wrap gap-3">
+                <div><span class="fw-bold">📁 Subreddit:</span> <span class="text-danger fw-bold">${latest.subreddit ? 'r/' + escapeHtml(latest.subreddit) : '—'}</span></div>
+                <div><span class="fw-bold">🔺 Upvote Score:</span> <span class="fw-bold text-primary">${formatNum(latest.likes || 0)}</span></div>
+                <div><span class="fw-bold">💬 Tổng Comments:</span> <span class="fw-bold text-success">${formatNum(latest.comments || 0)}</span></div>
+              </div>
+            </div>
+          ` : ''}
+          ${latest.platform === 'facebook_ads' ? `
+            <div class="p-3 bg-light rounded mb-3 border">
+              <div class="d-flex align-items-center mb-2">
+                <span class="fw-bold me-2">👥 Lượt Thích Fanpage:</span>
+                <span class="badge bg-primary fs-12">${formatNum(latest.fanpageLikes || latest.likes || 0)} likes</span>
+              </div>
+              <div class="mb-2">
+                <span class="fw-bold me-2">📱 Nền Tảng Meta:</span>
+                ${(Array.isArray(latest.publisherPlatforms) && latest.publisherPlatforms.length > 0 ? latest.publisherPlatforms : ['FACEBOOK']).map(p => `<span class="badge bg-dark text-white me-1">${p.replace(/_/g, ' ')}</span>`).join('')}
+              </div>
+              <div class="mb-2">
+                <span class="fw-bold me-2">📅 Thời Gian Chạy:</span>
+                <span>Bắt đầu: <strong>${latest.startDate ? parseServerTimestamp(latest.startDate).toLocaleDateString() : 'N/A'}</strong></span>
+                <span class="ms-2">| Trạng thái: <span class="badge ${latest.isActive ? 'bg-success' : 'bg-secondary'}">${latest.isActive ? 'Đang chạy (Active)' : 'Đã kết thúc'}</span></span>
+              </div>
+              ${latest.cta ? `<div class="mt-2"><span class="fw-bold me-2">🔘 Nút CTA:</span><span class="badge bg-info text-dark">${escapeHtml(latest.cta)}</span></div>` : ''}
+            </div>
+          ` : ''}
         </div>
       </div>
       <hr>
-      <h6 class="fw-bold mb-2">📊 Engagement Over Time</h6>
+      <h6 class="fw-bold mb-2">📊 ${isEcommerce ? 'Biến Động Theo Thời Gian' : 'Engagement Over Time'}</h6>
       ${statsHtml}
       <div class="timeline-chart mb-3">${timelineHtml}</div>
       <hr>
-      <h6 class="fw-bold mb-2">History (${history.length} snapshots)</h6>
+      <h6 class="fw-bold mb-2">Lịch Sử Biến Động (${history.length} lần cào)</h6>
       <div class="table-responsive">
-        <table class="table table-sm fs-13">
-          <thead><tr><th>Date</th><th>Status</th><th>❤️ Likes</th><th>💬 Comments</th><th>🔄 Shares</th><th>👁️ Views</th><th>Growth</th></tr></thead>
+        <table class="table table-sm fs-13 align-middle">
+          <thead>
+            ${isEcommerce
+              ? '<tr><th>Thời Gian</th><th>Trạng Thái</th><th>💵 Giá Hiện Tại</th><th>⭐ Điểm Đánh Giá</th><th>💬 Feedback / Reviews</th><th>📦 Đã Bán</th><th>❤️ Likes / Tym</th><th>Biến Động So Lượt Trước</th></tr>'
+              : latest.platform === 'reddit'
+              ? '<tr><th>Thời Gian</th><th>Trạng Thái</th><th>Subreddit</th><th>🔺 Upvote Score</th><th>💬 Comments</th><th>Biến Động</th></tr>'
+              : latest.platform === 'twitter'
+              ? '<tr><th>Thời Gian</th><th>Trạng Thái</th><th>❤️ Likes</th><th>💬 Replies</th><th>👁️ Views</th><th>Biến Động</th></tr>'
+              : '<tr><th>Thời Gian</th><th>Trạng Thái</th><th>❤️ Likes</th><th>💬 Comments</th><th>🔄 Shares</th><th>👁️ Views</th><th>Biến Động</th></tr>'
+            }
+          </thead>
           <tbody>${history.map((h, i) => {
             const prev = i > 0 ? history[i - 1] : null;
-            const g = prev ? { l: h.likes - prev.likes, c: h.comments - prev.comments, s: h.shares - prev.shares } : null;
-            return `<tr>
-              <td>${new Date(h.run_date || h.created_at).toLocaleDateString()}</td>
-              <td>${getStatusBadge(h.status)}</td>
-              <td>${h.likes}</td><td>${h.comments}</td><td>${h.shares}</td><td>${h.views}</td>
-              <td>${g ? `<span class="${(g.l + g.c + g.s) > 0 ? 'text-success' : (g.l + g.c + g.s) < 0 ? 'text-danger' : 'text-muted'}">${g.l > 0 ? '+' : ''}${g.l} / ${g.c > 0 ? '+' : ''}${g.c} / ${g.s > 0 ? '+' : ''}${g.s}</span>` : '—'}</td>
-            </tr>`;
+            if (isEcommerce) {
+              const gp = prev ? Number((h.price - prev.price).toFixed(2)) : 0;
+              const gr = prev ? Number((h.rating - prev.rating).toFixed(1)) : 0;
+              const grev = prev ? (h.reviews - prev.reviews) : 0;
+              const gsold = prev ? ((h.sold_count || 0) - (prev.sold_count || 0)) : 0;
+              const gl = prev ? (h.likes - prev.likes) : 0;
+              const deltas = [];
+              if (gp !== 0) deltas.push(`<span class="${gp < 0 ? 'text-success' : 'text-danger'}">Giá: ${gp > 0 ? '+' : ''}$${gp.toFixed(2)}</span>`);
+              if (gr !== 0) deltas.push(`<span class="${gr > 0 ? 'text-success' : 'text-danger'}">Sao: ${gr > 0 ? '+' : ''}${gr.toFixed(1)}</span>`);
+              if (grev !== 0) deltas.push(`<span class="${grev > 0 ? 'text-success' : 'text-danger'}">${h.platform === 'ebay' ? 'Feedback' : 'Reviews'}: ${grev > 0 ? '+' : ''}${grev}</span>`);
+              if (gsold !== 0) deltas.push(`<span class="${gsold > 0 ? 'text-success' : 'text-danger'}">Đã bán: ${gsold > 0 ? '+' : ''}${gsold}</span>`);
+              if (gl !== 0) deltas.push(`<span class="${gl > 0 ? 'text-success' : 'text-danger'}">Tym: ${gl > 0 ? '+' : ''}${gl}</span>`);
+
+              return `<tr>
+                <td>${parseServerTimestamp(h.run_date || h.created_at).toLocaleString()}</td>
+                <td>${getStatusBadge(h.status)}</td>
+                <td class="fw-bold">${h.price > 0 ? `$${Number(h.price).toFixed(2)}` : '—'}</td>
+                <td>${h.rating > 0 ? (h.rating > 5 ? `★ ${Number(h.rating).toFixed(1)}%` : `★ ${Number(h.rating).toFixed(1)}`) : '—'}</td>
+                <td>${h.reviews > 0 ? formatNum(h.reviews) : '0'}</td>
+                <td>${(h.sold_count || 0) > 0 ? formatNum(h.sold_count) : '0'}</td>
+                <td>${h.likes > 0 ? formatNum(h.likes) : '0'}</td>
+                <td>${deltas.length ? deltas.join(' · ') : (i === 0 ? '<span class="text-muted">Lượt cào đầu tiên</span>' : '<span class="text-muted">Không đổi</span>')}</td>
+              </tr>`;
+            } else if (latest.platform === 'reddit') {
+              const gl = prev ? (h.likes - prev.likes) : 0;
+              const gc = prev ? (h.comments - prev.comments) : 0;
+              const deltas = [];
+              if (gl !== 0) deltas.push(`<span class="${gl > 0 ? 'text-success' : 'text-danger'}">Upvotes: ${gl > 0 ? '+' : ''}${gl}</span>`);
+              if (gc !== 0) deltas.push(`<span class="${gc > 0 ? 'text-success' : 'text-danger'}">Comments: ${gc > 0 ? '+' : ''}${gc}</span>`);
+              return `<tr>
+                <td>${parseServerTimestamp(h.run_date || h.created_at).toLocaleString()}</td>
+                <td>${getStatusBadge(h.status)}</td>
+                <td><span class="text-danger fw-bold">${h.subreddit ? 'r/' + escapeHtml(h.subreddit) : (latest.subreddit ? 'r/' + escapeHtml(latest.subreddit) : '—')}</span></td>
+                <td>${formatNum(h.likes || 0)}</td>
+                <td>${formatNum(h.comments || 0)}</td>
+                <td>${deltas.length ? deltas.join(' · ') : (i === 0 ? '<span class="text-muted">Lượt cào đầu tiên</span>' : '<span class="text-muted">Không đổi</span>')}</td>
+              </tr>`;
+            } else if (latest.platform === 'twitter') {
+              const gl = prev ? (h.likes - prev.likes) : 0;
+              const gc = prev ? (h.comments - prev.comments) : 0;
+              const gv = prev ? (h.views - prev.views) : 0;
+              const deltas = [];
+              if (gl !== 0) deltas.push(`<span class="${gl > 0 ? 'text-success' : 'text-danger'}">Likes: ${gl > 0 ? '+' : ''}${gl}</span>`);
+              if (gc !== 0) deltas.push(`<span class="${gc > 0 ? 'text-success' : 'text-danger'}">Replies: ${gc > 0 ? '+' : ''}${gc}</span>`);
+              if (gv !== 0) deltas.push(`<span class="${gv > 0 ? 'text-success' : 'text-danger'}">Views: ${gv > 0 ? '+' : ''}${gv}</span>`);
+              return `<tr>
+                <td>${parseServerTimestamp(h.run_date || h.created_at).toLocaleString()}</td>
+                <td>${getStatusBadge(h.status)}</td>
+                <td>${formatNum(h.likes || 0)}</td>
+                <td>${formatNum(h.comments || 0)}</td>
+                <td>${formatNum(h.views || 0)}</td>
+                <td>${deltas.length ? deltas.join(' · ') : (i === 0 ? '<span class="text-muted">Lượt cào đầu tiên</span>' : '<span class="text-muted">Không đổi</span>')}</td>
+              </tr>`;
+            } else {
+              const g = prev ? { l: h.likes - prev.likes, c: h.comments - prev.comments, s: h.shares - prev.shares } : null;
+              return `<tr>
+                <td>${parseServerTimestamp(h.run_date || h.created_at).toLocaleString()}</td>
+                <td>${getStatusBadge(h.status)}</td>
+                <td>${h.likes}</td><td>${h.comments}</td><td>${h.shares}</td><td>${h.views}</td>
+                <td>${g ? `<span class="${(g.l + g.c + g.s) > 0 ? 'text-success' : (g.l + g.c + g.s) < 0 ? 'text-danger' : 'text-muted'}">${g.l > 0 ? '+' : ''}${g.l} / ${g.c > 0 ? '+' : ''}${g.c} / ${g.s > 0 ? '+' : ''}${g.s}</span>` : '—'}</td>
+              </tr>`;
+            }
           }).join('')}</tbody>
         </table>
+      </div>
+      <div class="d-flex justify-content-between align-items-center mt-3 pt-3 border-top">
+        <span class="text-muted fs-12 font-monospace">${escapeHtml(latest.item_uid || '')}</span>
+        <button class="btn btn-outline-danger btn-sm px-3 d-flex align-items-center gap-1" onclick="deleteFromModal('${escapeAttr(latest.item_uid)}')">
+          <i data-feather="trash-2" style="width:14px"></i> Xóa Sản Phẩm Này
+        </button>
       </div>
     `;
 
     const modal = new bootstrap.Modal(document.getElementById('item-modal'));
     modal.show();
+    feather.replace();
   } catch (err) { console.error('Detail failed:', err); }
 }
 
-function renderHistoryStats(history) {
-  if (history.length < 2) return '<p class="text-muted fs-13 mb-3">First snapshot — compare after next collection run.</p>';
+function renderHistoryStats(history, isEcommerce = false) {
+  if (history.length < 2) return '<p class="text-muted fs-13 mb-3">Lượt cào đầu tiên — hệ thống sẽ hiển thị biểu đồ và bảng so sánh biến động ở các lần cào tiếp theo.</p>';
   const first = history[0];
   const last = history[history.length - 1];
+  const days = Math.max(1, Math.round((parseServerTimestamp(last.run_date || last.created_at) - parseServerTimestamp(first.run_date || first.created_at)) / 86400000));
+
+  if (isEcommerce) {
+    const priceDiff = Number((last.price - first.price).toFixed(2));
+    const ratingDiff = Number((last.rating - first.rating).toFixed(1));
+    const reviewsDiff = last.reviews - first.reviews;
+    const soldDiff = (last.sold_count || 0) - (first.sold_count || 0);
+
+    return `<div class="row g-2 mb-3">
+      <div class="col-3"><div class="info-card"><div class="label">Lần đầu thấy</div><div class="value fs-13">${parseServerTimestamp(first.run_date || first.created_at).toLocaleDateString()}</div></div></div>
+      <div class="col-3"><div class="info-card"><div class="label">Lần cào mới nhất</div><div class="value fs-13">${parseServerTimestamp(last.run_date || last.created_at).toLocaleDateString()}</div></div></div>
+      <div class="col-3"><div class="info-card"><div class="label">Số lượt quan sát</div><div class="value">${history.length}</div></div></div>
+      <div class="col-3"><div class="info-card"><div class="label">💵 Biến động Giá</div><div class="value ${priceDiff < 0 ? 'text-success' : priceDiff > 0 ? 'text-danger' : ''}">${priceDiff !== 0 ? (priceDiff > 0 ? '+' : '') + '$' + priceDiff.toFixed(2) : '0'}</div></div></div>
+      <div class="col-3"><div class="info-card"><div class="label">⭐ Biến động Sao</div><div class="value ${ratingDiff > 0 ? 'text-success' : ratingDiff < 0 ? 'text-danger' : ''}">${ratingDiff !== 0 ? (ratingDiff > 0 ? '+' : '') + ratingDiff.toFixed(1) : '0'}</div></div></div>
+      <div class="col-3"><div class="info-card"><div class="label">💬 Tăng Reviews</div><div class="value ${reviewsDiff > 0 ? 'text-success' : reviewsDiff < 0 ? 'text-danger' : ''}">${reviewsDiff > 0 ? '+' : ''}${reviewsDiff}</div></div></div>
+      <div class="col-3"><div class="info-card"><div class="label">📦 Tăng Đã bán</div><div class="value ${soldDiff > 0 ? 'text-success' : soldDiff < 0 ? 'text-danger' : ''}">${soldDiff > 0 ? '+' : ''}${soldDiff}</div></div></div>
+      <div class="col-3"><div class="info-card"><div class="label">❤️ Likes/Tym</div><div class="value text-primary">${formatNum(last.likes || last.reviews || 0)}</div></div></div>
+    </div>`;
+  }
+
   const totalGrowth = {
     likes: last.likes - first.likes,
     comments: last.comments - first.comments,
     shares: last.shares - first.shares,
     views: last.views - first.views,
   };
-  const days = Math.max(1, Math.round((new Date(last.run_date || last.created_at) - new Date(first.run_date || first.created_at)) / 86400000));
 
   return `<div class="row g-2 mb-3">
-    <div class="col-3"><div class="info-card"><div class="label">First Seen</div><div class="value fs-13">${new Date(first.run_date || first.created_at).toLocaleDateString()}</div></div></div>
-    <div class="col-3"><div class="info-card"><div class="label">Last Seen</div><div class="value fs-13">${new Date(last.run_date || last.created_at).toLocaleDateString()}</div></div></div>
+    <div class="col-3"><div class="info-card"><div class="label">First Seen</div><div class="value fs-13">${parseServerTimestamp(first.run_date || first.created_at).toLocaleDateString()}</div></div></div>
+    <div class="col-3"><div class="info-card"><div class="label">Last Seen</div><div class="value fs-13">${parseServerTimestamp(last.run_date || last.created_at).toLocaleDateString()}</div></div></div>
     <div class="col-3"><div class="info-card"><div class="label">Days Tracked</div><div class="value">${days}</div></div></div>
     <div class="col-3"><div class="info-card"><div class="label">Snapshots</div><div class="value">${history.length}</div></div></div>
     <div class="col-3"><div class="info-card"><div class="label">❤️ Growth</div><div class="value ${totalGrowth.likes > 0 ? 'text-success' : totalGrowth.likes < 0 ? 'text-danger' : ''}">${totalGrowth.likes > 0 ? '+' : ''}${totalGrowth.likes}</div></div></div>
@@ -259,18 +474,36 @@ function renderHistoryStats(history) {
   </div>`;
 }
 
-function renderTimeline(history) {
-  if (history.length < 2) return '<p class="text-muted fs-13">Run collection again to see engagement trend chart.</p>';
+function renderTimeline(history, isEcommerce = false) {
+  if (history.length < 2) return '<p class="text-muted fs-13">Thực hiện cào lại lần 2 để xem biểu đồ tăng trưởng.</p>';
+
+  if (isEcommerce) {
+    const maxReviews = Math.max(...history.map((h) => h.reviews || h.likes || 1), 1);
+    return `<div style="display:flex;align-items:flex-end;gap:4px;height:80px;padding:8px 0">
+      ${history.map((h) => {
+        const hR = ((h.reviews || h.likes || 0) / maxReviews) * 100;
+        const date = parseServerTimestamp(h.run_date || h.created_at).toLocaleDateString('en', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px" title="${date}: $${h.price} | ★${h.rating} | ${h.reviews} reviews">
+          <div style="display:flex;gap:1px;align-items:flex-end;width:100%;height:100%">
+            <div style="flex:1;background:var(--primary);height:${Math.max(hR, 5)}%;border-radius:2px 2px 0 0;opacity:0.85"></div>
+          </div>
+          <span style="font-size:9px;color:var(--text-3);white-space:nowrap">${date}</span>
+        </div>`;
+      }).join('')}
+    </div>
+    <div class="d-flex gap-3 fs-12 text-muted">
+      <span><span style="display:inline-block;width:8px;height:8px;background:var(--primary);border-radius:2px"></span> Reviews / Engagement</span>
+    </div>`;
+  }
 
   const maxVal = Math.max(...history.map((h) => Math.max(h.likes, h.comments, h.shares)), 1);
-  const barWidth = Math.max(100 / history.length, 5);
 
   return `<div style="display:flex;align-items:flex-end;gap:2px;height:80px;padding:8px 0">
     ${history.map((h, i) => {
       const hL = (h.likes / maxVal) * 100;
       const hC = (h.comments / maxVal) * 100;
       const hS = (h.shares / maxVal) * 100;
-      const date = new Date(h.run_date || h.created_at).toLocaleDateString('en', { month: 'short', day: 'numeric' });
+      const date = parseServerTimestamp(h.run_date || h.created_at).toLocaleDateString('en', { month: 'short', day: 'numeric' });
       return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:1px" title="${date}: ❤️${h.likes} 💬${h.comments} 🔄${h.shares}">
         <div style="display:flex;gap:1px;align-items:flex-end;width:100%;height:100%">
           <div style="flex:1;background:var(--primary);height:${Math.max(hL, 2)}%;border-radius:2px 2px 0 0;opacity:0.8"></div>
@@ -311,7 +544,9 @@ async function showCollectModal() {
 }
 
 function renderPlatformGrid() {
-  document.getElementById('platform-grid').innerHTML = allPlatforms.map((p) => {
+  document.getElementById('platform-grid').innerHTML = allPlatforms
+    .filter((p) => p.name !== 'toidispy')
+    .map((p) => {
     let healthBadge = '';
     let isFailed = false;
     if (doctorReport && doctorReport.channels && doctorReport.channels[p.name]) {
@@ -608,56 +843,30 @@ async function loadJobs() {
       const config = allPlatforms.find((p) => p.name === j.platform);
       const icon = config?.icon || '🔗';
       const pName = config?.displayName || j.platform;
-      const statusBadge = 
-        j.status === 'done' ? '<span class="badge bg-success">Done</span>' :
-        j.status === 'running' ? '<span class="badge bg-primary">Running</span>' :
-        j.status === 'failed' ? '<span class="badge bg-danger">Failed</span>' :
-        '<span class="badge bg-secondary">Pending</span>';
-
-      let errorDetails = '';
-      if (j.status === 'failed' && j.health_snapshot) {
-        try {
-          const snapshot = typeof j.health_snapshot === 'string' ? JSON.parse(j.health_snapshot) : j.health_snapshot;
-          if (snapshot.error) {
-            errorDetails = `<div class="mt-2 p-2 bg-light border rounded text-danger" style="font-size:12px; max-width: 400px; white-space: pre-wrap; word-break: break-word;">
-              <strong>Error:</strong> ${escapeHtml(snapshot.error)}<br>`;
-            if (snapshot.code === 'TOIDISPY_LOGIN_REQUIRED' || snapshot.error.includes('TOIDISPY_LOGIN_REQUIRED')) {
-              errorDetails = `<div class="mt-2 p-2 bg-light border rounded text-danger" style="font-size:12px; max-width: 400px; white-space: pre-wrap; word-break: break-word;">
-              <strong>Error:</strong> Toidispy login required. Open Chrome CDP profile, login to Toidispy, then retry.<br>`;
-            }
-            const url = snapshot.stderrDiagnostic?.currentUrl || snapshot.stdoutJson?.error?.currentUrl;
-            const title = snapshot.stderrDiagnostic?.title || snapshot.stdoutJson?.error?.title || 'Unknown Title';
-            if (url) {
-              errorDetails += `<strong>Page:</strong> <a href="${escapeAttr(url)}" target="_blank">${escapeHtml(title)}</a><br>`;
-            }
-            if (snapshot.actions && snapshot.actions.length) {
-              errorDetails += `<strong>Action:</strong> ${escapeHtml(snapshot.actions.join(' / '))}<br>`;
-            }
-            if (snapshot.stderrDiagnostic?.screenshotPath) {
-               errorDetails += `<strong>Debug:</strong> ${escapeHtml(snapshot.stderrDiagnostic.screenshotPath)}`;
-            }
-            errorDetails += `</div>`;
-          }
-        } catch(e) {}
-      }
+      const statusBadge =
+        j.status === 'done' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-success py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để xem chi tiết kết quả"><i data-feather="check-circle" style="width: 12px;"></i> Done &nearr;</a>` :
+        j.status === 'running' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-primary py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để theo dõi tiến trình"><i data-feather="loader" style="width: 12px;"></i> Running &nearr;</a>` :
+        j.status === 'failed' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-danger py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để xem chi tiết nguyên nhân lỗi"><i data-feather="alert-octagon" style="width: 12px;"></i> Failed &nearr;</a>` :
+        j.status === 'stuck' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-danger py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để xem chi tiết lỗi kẹt"><i data-feather="alert-triangle" style="width: 12px;"></i> Stuck &nearr;</a>` :
+        `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-secondary py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm">Pending &nearr;</a>`;
 
       return `<tr>
         <td>#${j.id}</td>
         <td>${icon} ${pName}</td>
         <td style="max-width:300px;">
           <div class="text-truncate" title="${escapeAttr(j.query)}">${escapeHtml(j.query)}</div>
-          ${errorDetails}
         </td>
         <td>${j.active_backend ? `<span class="badge bg-secondary">${j.active_backend}</span>` : '-'}</td>
         <td>${statusBadge}</td>
         <td>${j.items_count}</td>
-        <td>${new Date(j.created_at).toLocaleString()}</td>
+        <td>${parseServerTimestamp(j.created_at).toLocaleString()}</td>
         <td>
           <a href="/api/export/${j.id}?format=csv" class="btn btn-sm btn-outline-primary py-0 px-2 fs-12 me-1" target="_blank">Export CSV</a>
           <button class="btn btn-sm btn-outline-danger py-0 px-2 fs-12" onclick="deleteJob(${j.id})">Delete</button>
         </td>
       </tr>`;
     }).join('');
+    if (window.feather) feather.replace();
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="8" class="text-center py-4 text-danger">Error: ${err.message}</td></tr>`;
   }
@@ -692,6 +901,26 @@ async function apiFetch(endpoint, options = {}) {
 
 function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t || ''; return d.innerHTML; }
 function escapeAttr(t) { return String(t || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+
+// UI-BUG-04: the API returns SQLite's default CURRENT_TIMESTAMP format —
+// "YYYY-MM-DD HH:MM:SS", UTC, but with NO 'Z'/offset marker. Passed straight
+// to `new Date(...)`, browsers parse a space-separated (non-'T') timestamp
+// with no timezone marker as LOCAL time, not UTC — so a UTC value gets
+// re-interpreted as if it were already local, shifting every displayed
+// timestamp by the viewer's UTC offset (e.g. -7h for ICT/Vietnam). Every
+// place in this file that turns a server timestamp into a Date must go
+// through this one helper instead of calling `new Date(...)` directly on
+// the raw string, so the whole UI stays consistent.
+function parseServerTimestamp(value) {
+  if (!value) return new Date(NaN);
+  const str = String(value);
+  // Already has a 'T'+timezone marker (ISO 8601) or is otherwise explicit —
+  // leave it alone. Only the bare "YYYY-MM-DD HH:MM:SS" shape is ambiguous.
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(str)) {
+    return new Date(str.replace(' ', 'T') + 'Z');
+  }
+  return new Date(str);
+}
 function formatNum(n) { if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'; if (n >= 1000) return (n / 1000).toFixed(1) + 'K'; return String(n); }
 
 // ==================== Marketplace Sessions + HTML Capture ====================
@@ -709,15 +938,28 @@ async function showMarketplaceAccountsModal() {
   feather.replace();
 }
 
+// UI-BUG-05: this hint used to be hardcoded to "Một cookie Etsy được tự gán
+// domain .etsy.com", regardless of which platform is actually selected in
+// the dropdown right above it — misleading for Amazon/eBay accounts.
+const MARKETPLACE_COOKIE_DOMAINS = { amazon: '.amazon.com', ebay: '.ebay.com', etsy: '.etsy.com' };
+function updateMarketplaceCookieHint(platform) {
+  const hint = document.getElementById('marketplace-account-cookie-hint');
+  if (!hint) return;
+  const domain = MARKETPLACE_COOKIE_DOMAINS[platform] || `.${platform}.com`;
+  const label = allPlatforms?.find((p) => p.name === platform)?.displayName || platform;
+  hint.innerHTML = `Một cookie ${escapeHtml(label)} được tự gán domain <code>${escapeHtml(domain)}</code>; không cần dán cả storage state.`;
+}
+
 async function loadMarketplaceAccounts() {
   const platform = document.getElementById('marketplace-account-platform').value;
+  updateMarketplaceCookieHint(platform);
   const list = document.getElementById('marketplace-accounts-list');
   list.textContent = 'Loading...';
   try {
     const accounts = await apiFetch(`/api/marketplace-accounts?platform=${encodeURIComponent(platform)}`);
     list.innerHTML = accounts.length ? accounts.map((account) => `
       <div class="border rounded p-2 mb-2">
-        <div class="d-flex justify-content-between align-items-start gap-2"><span><strong>${escapeHtml(account.label)}</strong><br><span class="text-muted">${escapeHtml(account.platform)} · saved ${new Date(account.updated_at).toLocaleString()}</span></span><button class="btn btn-outline-danger btn-sm" onclick="deleteMarketplaceAccount(${Number(account.id)})">Remove</button></div>
+        <div class="d-flex justify-content-between align-items-start gap-2"><span><strong>${escapeHtml(account.label)}</strong><br><span class="text-muted">${escapeHtml(account.platform)} · saved ${parseServerTimestamp(account.updated_at).toLocaleString()}</span></span><button class="btn btn-outline-danger btn-sm" onclick="deleteMarketplaceAccount(${Number(account.id)})">Remove</button></div>
         <div class="d-flex gap-2 align-items-center mt-2"><select id="marketplace-account-proxy-${Number(account.id)}" class="form-select form-select-sm">${marketplaceProxyOptions(account.proxy_id)}</select><button class="btn btn-outline-primary btn-sm text-nowrap" onclick="assignMarketplaceAccountProxy(${Number(account.id)})">Use proxy</button></div>
       </div>`).join('') : '<span class="text-muted">No saved accounts for this platform.</span>';
   } catch (err) { list.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`; }
@@ -951,7 +1193,7 @@ async function showSavedCapturesModal() {
       const metrics = capture.parsedData?.metrics || {};
       const title = metrics.title || 'Untitled product';
       const mode = capture.variant_mode === 'all' ? `All variants (${Number(capture.max_variants)})` : 'Base product';
-      return `<tr><td>${escapeHtml(capture.platform)}</td><td><strong>${escapeHtml(title)}</strong><br><a href="${escapeAttr(capture.url)}" target="_blank" rel="noreferrer" class="text-muted text-break">${escapeHtml(capture.url)}</a></td><td>${escapeHtml(mode)}</td><td>${escapeHtml(new Date(capture.created_at).toLocaleString())}</td><td><button class="btn btn-outline-primary btn-sm" onclick="window.open('/api/html-captures/${Number(capture.id)}', '_blank')">Open data</button></td></tr>`;
+      return `<tr><td>${escapeHtml(capture.platform)}</td><td><strong>${escapeHtml(title)}</strong><br><a href="${escapeAttr(capture.url)}" target="_blank" rel="noreferrer" class="text-muted text-break">${escapeHtml(capture.url)}</a></td><td>${escapeHtml(mode)}</td><td>${escapeHtml(parseServerTimestamp(capture.created_at).toLocaleString())}</td><td><button class="btn btn-outline-primary btn-sm" onclick="window.open('/api/html-captures/${Number(capture.id)}', '_blank')">Open data</button></td></tr>`;
     }).join('');
     list.innerHTML = `<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr><th>Platform</th><th>Product</th><th>Capture</th><th>Saved</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
   } catch (err) {
@@ -960,16 +1202,58 @@ async function showSavedCapturesModal() {
   finally { feather.replace(); }
 }
 
+function onSchedulePlatformChange() {
+  const platform = document.getElementById('marketplace-schedule-platform').value;
+  const isEtsy = platform === 'etsy';
+  const accountWrap = document.getElementById('marketplace-schedule-account-wrap');
+  const variantWrap = document.getElementById('marketplace-schedule-variant-wrap');
+  const maxVariantsWrap = document.getElementById('marketplace-schedule-max-variants-wrap');
+  
+  if (accountWrap) accountWrap.classList.toggle('d-none', !isEtsy);
+  if (variantWrap) variantWrap.classList.toggle('d-none', !isEtsy);
+  if (maxVariantsWrap) {
+    const isAll = isEtsy && document.getElementById('marketplace-schedule-variant-mode')?.value === 'all';
+    maxVariantsWrap.classList.toggle('d-none', !isAll);
+  }
+
+  const keywordLabel = document.getElementById('marketplace-schedule-keyword-label');
+  const keywordInput = document.getElementById('marketplace-schedule-keyword');
+  if (platform === 'shopify') {
+    keywordLabel.textContent = 'Store Domain / URL hoặc Từ khóa';
+    keywordInput.placeholder = 'e.g. colourpop.com hoặc gymshark.com';
+  } else {
+    keywordLabel.textContent = 'Từ khóa tìm kiếm (Keyword / Query)';
+    keywordInput.placeholder = 'e.g. vintage hoodie, custom mug, shoes...';
+  }
+}
+
+function updateScheduleVariantControls() {
+  const isEtsy = document.getElementById('marketplace-schedule-platform').value === 'etsy';
+  const mode = document.getElementById('marketplace-schedule-variant-mode').value;
+  const maxVariantsWrap = document.getElementById('marketplace-schedule-max-variants-wrap');
+  if (maxVariantsWrap) {
+    maxVariantsWrap.classList.toggle('d-none', !isEtsy || mode !== 'all');
+  }
+}
+
 async function showMarketplaceSchedulesModal() {
   document.getElementById('marketplace-schedule-keyword').value = '';
   document.getElementById('marketplace-schedule-status').textContent = '';
+  document.getElementById('marketplace-schedule-max-items').value = '30';
   updateMarketplaceScheduleTimeFields();
+  onSchedulePlatformChange();
   new bootstrap.Modal(document.getElementById('marketplace-schedules-modal')).show();
+  
   const accountSelect = document.getElementById('marketplace-schedule-account');
-  accountSelect.innerHTML = '<option value="">Public / no login</option>';
-  try {
-    for (const account of await apiFetch('/api/marketplace-accounts?platform=etsy')) accountSelect.add(new Option(account.label, account.id));
-  } catch (err) { console.error('Could not load Etsy accounts:', err); }
+  if (accountSelect) {
+    accountSelect.innerHTML = '<option value="">Public / no login</option>';
+    try {
+      for (const account of await apiFetch('/api/marketplace-accounts?platform=etsy')) {
+        accountSelect.add(new Option(account.label, account.id));
+      }
+    } catch (err) { console.error('Could not load Etsy accounts:', err); }
+  }
+
   await loadMarketplaceSchedules();
   feather.replace();
 }
@@ -985,41 +1269,162 @@ function updateMarketplaceScheduleTimeFields() {
 
 async function saveMarketplaceSchedule() {
   const status = document.getElementById('marketplace-schedule-status');
+  const platform = document.getElementById('marketplace-schedule-platform').value;
+  const keyword = document.getElementById('marketplace-schedule-keyword').value.trim();
+  const maxItems = Number(document.getElementById('marketplace-schedule-max-items').value) || 30;
+  const accountId = document.getElementById('marketplace-schedule-account')?.value || null;
+  const everyHours = Number(document.getElementById('marketplace-schedule-every-hours').value) || 3;
+  const scheduleType = document.getElementById('marketplace-schedule-type').value;
+  const dailyTime = document.getElementById('marketplace-schedule-daily-time').value;
+  const runAt = document.getElementById('marketplace-schedule-once-datetime').value;
+  const variantMode = platform === 'etsy' ? (document.getElementById('marketplace-schedule-variant-mode')?.value || 'base') : 'base';
+  const maxVariants = Number(document.getElementById('marketplace-schedule-max-variants')?.value) || 150;
+
+  if (!keyword) {
+    status.innerHTML = '<span class="text-danger">Vui lòng nhập từ khóa tìm kiếm.</span>';
+    return;
+  }
+
   try {
-    await apiFetch('/api/marketplace-capture-schedules', { method: 'POST', body: JSON.stringify({
-      platform: 'etsy', keyword: document.getElementById('marketplace-schedule-keyword').value,
-      accountId: document.getElementById('marketplace-schedule-account').value || null,
-      everyHours: Number(document.getElementById('marketplace-schedule-every-hours').value),
-      scheduleType: document.getElementById('marketplace-schedule-type').value,
-      dailyTime: document.getElementById('marketplace-schedule-daily-time').value,
-      runAt: document.getElementById('marketplace-schedule-once-datetime').value,
-      variantMode: document.getElementById('marketplace-schedule-variant-mode').value,
-      maxVariants: Number(document.getElementById('marketplace-schedule-max-variants').value), maxListings: 30,
-    }) });
-    status.innerHTML = '<span class="text-success">Schedule saved.</span>';
+    await apiFetch('/api/marketplace-capture-schedules', {
+      method: 'POST',
+      body: JSON.stringify({
+        platform,
+        keyword,
+        maxItems,
+        maxListings: maxItems,
+        accountId: platform === 'etsy' ? accountId : null,
+        everyHours,
+        scheduleType,
+        dailyTime,
+        runAt,
+        variantMode,
+        maxVariants
+      })
+    });
+    status.innerHTML = '<span class="text-success fw-bold">✓ Đã lưu lịch crawl thành công!</span>';
     document.getElementById('marketplace-schedule-keyword').value = '';
     await loadMarketplaceSchedules();
-  } catch (err) { status.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`; }
+  } catch (err) {
+    status.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`;
+  }
+}
+
+async function toggleMarketplaceSchedule(id) {
+  try {
+    await apiFetch(`/api/marketplace-capture-schedules/${Number(id)}/toggle`, { method: 'POST' });
+    await loadMarketplaceSchedules();
+  } catch (err) {
+    alert(`Không thể đổi trạng thái lịch: ${err.message}`);
+  }
+}
+
+async function runMarketplaceScheduleNow(id) {
+  if (!confirm('Bạn có muốn kích hoạt cào ngay theo lịch này không?')) return;
+  try {
+    await apiFetch(`/api/marketplace-capture-schedules/${Number(id)}/run-now`, { method: 'POST' });
+    alert('Đã gửi lệnh cào vào bộ điều phối ResourceScheduler thành công!');
+    await loadMarketplaceSchedules();
+  } catch (err) {
+    alert(`Không thể kích hoạt lịch cào: ${err.message}`);
+  }
 }
 
 async function loadMarketplaceSchedules() {
   const list = document.getElementById('marketplace-schedules-list');
   try {
     const schedules = await apiFetch('/api/marketplace-capture-schedules');
-    list.innerHTML = schedules.length ? schedules.map((schedule) => {
-      const timing = schedule.schedule_type === 'daily' ? `daily at ${schedule.daily_time} (Vietnam)` : schedule.schedule_type === 'once' ? `one time at ${schedule.run_at} (Vietnam)` : `every ${Number(schedule.every_minutes) / 60}h`;
-      const next = schedule.enabled ? `next ${new Date(schedule.next_run_at).toLocaleString()}` : 'completed';
-      const latest = schedule.last_run_at ? `Last run ${new Date(schedule.last_run_at).toLocaleString()}: ${formatMarketplaceScheduleSummary(schedule.last_summary)}` : 'No completed runs yet.';
+    if (!schedules.length) {
+      list.innerHTML = '<div class="alert alert-light border text-muted py-2 mb-0">Chưa có lịch crawl nào được thiết lập. Hãy tạo lịch mới ở trên!</div>';
+      return;
+    }
+
+    const platformLabels = {
+      amazon: '📦 Amazon',
+      ebay: '🏷️ eBay Sold',
+      etsy: '🧶 Etsy',
+      shopify: '🛍️ Shopify',
+      tiktok_shop: '🎵 TikTok Shop',
+      google_shopping: '🛒 Google Shopping',
+      facebook_ads: '📢 Facebook Ads',
+      facebook_posts: '👥 Facebook Posts',
+      instagram: '📷 Instagram',
+      pinterest: '📌 Pinterest',
+      reddit: '🔴 Reddit',
+      twitter: '🐦 X / Twitter'
+    };
+
+    list.innerHTML = schedules.map((schedule) => {
+      const timing = schedule.schedule_type === 'daily'
+        ? `Hàng ngày lúc ${schedule.daily_time} (VN)`
+        : schedule.schedule_type === 'once'
+          ? `Chạy 1 lần lúc ${schedule.run_at} (VN)`
+          : `Lặp lại mỗi ${Number(schedule.every_minutes) / 60} giờ`;
+      
+      const isEnabled = Boolean(schedule.enabled);
+      const statusBadge = isEnabled
+        ? '<span class="badge bg-success">ĐANG CHẠY</span>'
+        : '<span class="badge bg-secondary">TẠM DỪNG</span>';
+
+      const next = isEnabled
+        ? `Lần chạy kế tiếp: ${parseServerTimestamp(schedule.next_run_at).toLocaleString()}`
+        : 'Lịch đang tạm dừng';
+
+      const latest = schedule.last_run_at
+        ? `Lần chạy gần nhất (${parseServerTimestamp(schedule.last_run_at).toLocaleString()}): ${formatMarketplaceScheduleSummary(schedule.last_summary)}`
+        : 'Chưa có lượt chạy nào.';
+
       const id = Number(schedule.id);
-      return `<div class="border rounded p-2 mb-2"><div class="d-flex justify-content-between gap-2"><span><strong>${escapeHtml(schedule.keyword)}</strong><br><span class="text-muted">Etsy · up to 30 listings · ${escapeHtml(timing)} · ${escapeHtml(next)}</span><br><span class="text-muted">${escapeHtml(latest)}</span></span><div class="d-flex gap-1 align-items-start"><button class="btn btn-outline-primary btn-sm" onclick="toggleMarketplaceScheduleRunHistory(${id})">Run history</button><button class="btn btn-outline-danger btn-sm" onclick="deleteMarketplaceSchedule(${id})">Remove</button></div></div><div id="marketplace-schedule-run-history-${id}" class="d-none mt-2"></div></div>`;
-    }).join('') : 'No schedules saved.';
-  } catch (err) { list.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`; }
+      const platformDisplay = platformLabels[schedule.platform] || schedule.platform.toUpperCase();
+
+      return `<div class="card border mb-2 shadow-sm">
+        <div class="card-body p-3">
+          <div class="d-flex justify-content-between align-items-start gap-2">
+            <div>
+              <div class="d-flex align-items-center gap-2 mb-1">
+                <span class="badge bg-primary px-2 py-1">${escapeHtml(platformDisplay)}</span>
+                <strong class="text-dark fs-6">${escapeHtml(schedule.keyword)}</strong>
+                ${statusBadge}
+              </div>
+              <div class="text-muted small">
+                <span>Số lượng: <strong>${schedule.max_listings || 30} items</strong></span> · 
+                <span>${escapeHtml(timing)}</span> · 
+                <span class="text-primary">${escapeHtml(next)}</span>
+              </div>
+              <div class="text-muted small mt-1">
+                <i data-feather="activity" style="width:12px" class="me-1"></i>${escapeHtml(latest)}
+              </div>
+            </div>
+            <div class="d-flex gap-1 align-items-center">
+              <button class="btn btn-sm btn-outline-success" title="Chạy ngay" onclick="runMarketplaceScheduleNow(${id})">
+                <i data-feather="zap" style="width:13px"></i> Chạy ngay
+              </button>
+              <button class="btn btn-sm ${isEnabled ? 'btn-outline-warning' : 'btn-outline-primary'}" onclick="toggleMarketplaceSchedule(${id})">
+                ${isEnabled ? 'Tạm dừng' : 'Kích hoạt'}
+              </button>
+              <button class="btn btn-sm btn-outline-secondary" onclick="toggleMarketplaceScheduleRunHistory(${id})">
+                Lịch sử
+              </button>
+              <button class="btn btn-sm btn-outline-danger" title="Xóa lịch" onclick="deleteMarketplaceSchedule(${id})">
+                <i data-feather="trash-2" style="width:13px"></i>
+              </button>
+            </div>
+          </div>
+          <div id="marketplace-schedule-run-history-${id}" class="d-none mt-3 pt-2 border-top"></div>
+        </div>
+      </div>`;
+    }).join('');
+
+    feather.replace();
+  } catch (err) {
+    list.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`;
+  }
 }
 
 function formatMarketplaceScheduleSummary(summary) {
-  if (!summary) return 'No result summary.';
-  const result = `found ${Number(summary.discovered) || 0}, saved ${Number(summary.captured) || 0}, blocked ${Number(summary.blocked) || 0}, failed ${Number(summary.failed) || 0}`;
-  return summary.error ? `${result} (${summary.error})` : result;
+  if (!summary) return 'Chưa có tóm tắt kết quả.';
+  const result = `Tìm thấy ${Number(summary.discovered) || 0} items, Đã lưu ${Number(summary.captured) || 0} items`;
+  return summary.error ? `${result} (Lỗi: ${summary.error})` : result;
 }
 
 async function toggleMarketplaceScheduleRunHistory(id) {
@@ -1030,19 +1435,23 @@ async function toggleMarketplaceScheduleRunHistory(id) {
     return;
   }
   panel.classList.remove('d-none');
-  panel.textContent = 'Loading run history...';
+  panel.textContent = 'Đang tải lịch sử chạy...';
   try {
     const runs = await apiFetch(`/api/marketplace-capture-schedules/${Number(id)}/runs`);
-    panel.innerHTML = runs.length ? `<div class="table-responsive"><table class="table table-sm mb-0"><thead><tr><th>Completed</th><th>Found</th><th>Saved</th><th>Blocked</th><th>Failed</th><th>Details</th></tr></thead><tbody>${runs.map((run) => `<tr><td>${escapeHtml(new Date(run.completed_at).toLocaleString())}</td><td>${Number(run.summary?.discovered) || 0}</td><td>${Number(run.summary?.captured) || 0}</td><td>${Number(run.summary?.blocked) || 0}</td><td>${Number(run.summary?.failed) || 0}</td><td>${escapeHtml(run.summary?.error || '')}</td></tr>`).join('')}</tbody></table></div>` : '<span class="text-muted">No completed runs yet.</span>';
+    panel.innerHTML = runs.length ? `<div class="table-responsive"><table class="table table-sm table-bordered mb-0"><thead><tr class="table-light"><th>Thời Gian Hoàn Tất</th><th>Tìm Thấy</th><th>Đã Lưu</th><th>Thất Bại</th><th>Chi Tiết</th></tr></thead><tbody>${runs.map((run) => `<tr><td>${escapeHtml(parseServerTimestamp(run.completed_at).toLocaleString())}</td><td>${Number(run.summary?.discovered) || 0}</td><td>${Number(run.summary?.captured) || 0}</td><td>${Number(run.summary?.failed) || 0}</td><td>${escapeHtml(run.summary?.error || 'Thành công')}</td></tr>`).join('')}</tbody></table></div>` : '<span class="text-muted">Chưa có lượt chạy nào hoàn tất.</span>';
   } catch (err) {
     panel.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`;
   }
 }
 
 async function deleteMarketplaceSchedule(id) {
-  if (!confirm('Remove this scheduled capture?')) return;
-  try { await apiFetch(`/api/marketplace-capture-schedules/${Number(id)}`, { method: 'DELETE' }); await loadMarketplaceSchedules(); }
-  catch (err) { alert(`Could not remove schedule: ${err.message}`); }
+  if (!confirm('Bạn có chắc chắn muốn xóa lịch crawl này không?')) return;
+  try {
+    await apiFetch(`/api/marketplace-capture-schedules/${Number(id)}`, { method: 'DELETE' });
+    await loadMarketplaceSchedules();
+  } catch (err) {
+    alert(`Không thể xóa lịch: ${err.message}`);
+  }
 }
 
 function updateCaptureVariantOptions() {
@@ -1214,3 +1623,47 @@ async function waitForCaptureJob(jobId, statusElement) {
     statusElement.innerHTML = '<span class="text-muted">Capturing each Etsy variant… this can take a few minutes. You can keep this dialog open while it finishes.</span>';
   }
 }
+
+// ==================== Product Deletion Handlers ====================
+
+async function deleteSingleItem(event, itemUid) {
+  if (event) event.stopPropagation();
+  if (!confirm('Bạn có chắc chắn muốn xóa sản phẩm này khỏi cơ sở dữ liệu?')) return;
+  try {
+    await apiFetch(`/api/items/${encodeURIComponent(itemUid)}`, { method: 'DELETE' });
+    await loadData();
+    await loadJobs();
+  } catch (err) {
+    alert('Xóa sản phẩm thất bại: ' + err.message);
+  }
+}
+
+async function deleteFromModal(itemUid) {
+  if (!confirm('Bạn có chắc chắn muốn xóa sản phẩm này khỏi cơ sở dữ liệu?')) return;
+  try {
+    await apiFetch(`/api/items/${encodeURIComponent(itemUid)}`, { method: 'DELETE' });
+    const modalEl = document.getElementById('item-modal');
+    const modalInstance = bootstrap.Modal.getInstance(modalEl);
+    if (modalInstance) modalInstance.hide();
+    await loadData();
+    await loadJobs();
+  } catch (err) {
+    alert('Xóa sản phẩm thất bại: ' + err.message);
+  }
+}
+
+async function deleteAllProducts() {
+  const p = currentFilter === 'all' ? '' : `?platform=${currentFilter}`;
+  const msg = currentFilter === 'all'
+    ? 'Bạn có chắc chắn muốn xóa TOÀN BỘ sản phẩm đã cào không?'
+    : `Bạn có chắc chắn muốn xóa tất cả sản phẩm của ${currentFilter.toUpperCase()} không?`;
+  if (!confirm(msg)) return;
+  try {
+    await apiFetch(`/api/items${p}`, { method: 'DELETE' });
+    await loadData();
+    await loadJobs();
+  } catch (err) {
+    alert('Xóa toàn bộ sản phẩm thất bại: ' + err.message);
+  }
+}
+

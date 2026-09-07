@@ -136,6 +136,7 @@ async function discoverMarketplaceItems(platform, query, options = {}) {
   const result = await search(siteQuery, {
     engines: options.engines || 'google,bing,duckduckgo',
     categories: 'general',
+    signal: options.signal
   });
 
   const seen = new Set();
@@ -179,8 +180,15 @@ async function discoverMarketplaceItems(platform, query, options = {}) {
   }
 
   if (!items.length) throw new Error('EMPTY_RESULT: no ' + platform + ' items found via search discovery');
-  await enrichImages(items);
+  // Google Shopping RAM-control round: additive, opt-in flag only. When NOT
+  // passed (every existing caller — Etsy's Tier-2 SearXNG supplement, eBay's
+  // discovery tier), behavior is byte-for-byte unchanged: enrichImages()
+  // still runs here with its existing hardcoded concurrency. Only a caller
+  // that explicitly asks to skip this (google_shopping.js, which then runs
+  // its own RAM-aware InternalTaskPool enrichment afterward) gets different
+  // behavior — see google_shopping.js for why.
+  if (!options.skipImageEnrichment) await enrichImages(items);
   return { items };
 }
 
-module.exports = { discoverMarketplaceItems, imageFromSearchResult, isMerchantResult };
+module.exports = { discoverMarketplaceItems, imageFromSearchResult, isMerchantResult, imageFromProductPage };

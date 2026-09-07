@@ -33,7 +33,7 @@ module.exports = {
       kind: BACKEND_KIND.APIFY,
       priority: 20,
       enabled: true,
-      actorId: 'apify/instagram-search-scraper',
+      actorId: 'apify/instagram-scraper',
       requiresEnv: ['APIFY_TOKEN'],
       actorEntitlement: "unverified",
       availabilityMode: 'token_plus_actor_entitlement'

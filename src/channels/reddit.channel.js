@@ -40,7 +40,7 @@ module.exports = {
       enabled: true,
       actorId: 'automation-lab/reddit-scraper',
       requiresEnv: ['APIFY_TOKEN'],
-      actorEntitlement: "unverified",
+      actorEntitlement: "verified",
       availabilityMode: 'token_plus_actor_entitlement'
     }
   ],

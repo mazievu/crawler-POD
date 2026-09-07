@@ -35,7 +35,7 @@ module.exports = {
       enabled: true,
       actorId: 'automation-lab/amazon-scraper',
       requiresEnv: ['APIFY_TOKEN'],
-      actorEntitlement: "unverified",
+      actorEntitlement: "verified",
       availabilityMode: 'token_plus_actor_entitlement'
     }
   ],

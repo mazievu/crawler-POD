@@ -16,12 +16,14 @@ async function captureViaEverbeeHost({
   variantMode = 'base',
   maxVariants = 150,
   executorUrl = process.env.EVERBEE_HOST_EXECUTOR_URL,
+  signal = null,
   fetchImpl = fetch,
 } = {}) {
   const captureUrl = assertMarketplaceUrl(platform, url);
   if (!executorUrl) throw new Error('Everbee host executor URL is not configured');
   const endpoint = new URL('/v1/captures', executorUrl).toString();
   const response = await fetchImpl(endpoint, {
+    signal,
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -49,6 +51,7 @@ async function discoverMarketplaceListingsViaEverbeeHost({
   proxy = null,
   limit = 30,
   executorUrl = process.env.EVERBEE_HOST_EXECUTOR_URL,
+  signal = null,
   fetchImpl = fetch,
 } = {}) {
   if (platform !== 'etsy') throw new Error('CloakBrowser discovery currently supports Etsy only');
@@ -57,6 +60,7 @@ async function discoverMarketplaceListingsViaEverbeeHost({
   if (!executorUrl) throw new Error('Everbee host executor URL is not configured');
   const endpoint = new URL('/v1/discoveries', executorUrl).toString();
   const response = await fetchImpl(endpoint, {
+    signal,
     method: 'POST',
     headers: {
       'content-type': 'application/json',

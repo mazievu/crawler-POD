@@ -218,10 +218,16 @@ test('insertSnapshots handles empty items', () => {
 
 test('insertSnapshots inserts items', () => {
   const run = db.createRun({ platform: 'test', query: 'items', maxItems: 3 });
+  // §12: item_uid is derived from platform+url (see generateUid()), and this
+  // suite runs against the real persistent data/collector.db (no per-test
+  // isolation) — hardcoded URLs would already exist in product_current after
+  // the first run ever, correctly reporting 'active' on every run since. Use
+  // a unique suffix per execution so "new" is actually being exercised.
+  const suffix = Date.now();
   const items = [
-    { title: 'Item 1', url: 'https://example.com/1', likes: 10 },
-    { title: 'Item 2', url: 'https://example.com/2', likes: 20 },
-    { title: 'Item 3', url: 'https://example.com/3', likes: 30 },
+    { title: 'Item 1', url: `https://example.com/insert-test-${suffix}/1`, likes: 10 },
+    { title: 'Item 2', url: `https://example.com/insert-test-${suffix}/2`, likes: 20 },
+    { title: 'Item 3', url: `https://example.com/insert-test-${suffix}/3`, likes: 30 },
   ];
   const result = db.insertSnapshots(run.id, 'test', 'items', items);
   assert.strictEqual(result.newItems, 3);

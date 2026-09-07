@@ -32,6 +32,26 @@ class CDPBackend extends BaseBackend {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       if (!data.Browser && !data.webSocketDebuggerUrl) throw new Error('Invalid CDP response');
+      
+      try {
+        const pagesRes = await fetch(`${cdpUrl}/json`, { signal: controller.signal });
+        const pages = await pagesRes.json();
+        const toidispyPage = pages.find(p => /toidispy\.com/i.test(p.url || ''));
+        if (!toidispyPage) {
+          return { name: 'cdp', status: 'warn', executionMode: null, version: '1.0.0', checkedUrl,
+            missing: ['TOIDISPY_SESSION'],
+            warnings: ['CDP browser is running but no toidispy.com tab found — may need login'],
+            healthState: 'CDP_READY_NOT_AUTHENTICATED' };
+        }
+        if (/login|signin|checkpoint/i.test(toidispyPage.url || '') || /login|signin/i.test(toidispyPage.title || '')) {
+          return { name: 'cdp', status: 'warn', executionMode: null, version: '1.0.0', checkedUrl,
+            missing: ['TOIDISPY_LOGIN'],
+            warnings: ['CDP browser has toidispy.com tab but it shows a login page — session expired'],
+            healthState: 'LOGIN_REQUIRED' };
+        }
+      } catch (err) {
+        // ignore fetch errors for /json
+      }
     } catch (e) {
       return {
         name: 'cdp',
@@ -52,16 +72,43 @@ class CDPBackend extends BaseBackend {
       const section = options.section || 'posts';
       const filterArgs = JSON.stringify(options.filters || {});
 
-      const child = child_process.spawn('node', [
+      const spawnArgs = [
         scriptPath, 
         '--output', 'stdout', 
         '--query', query, 
         '--section', section, 
-        '--filters', filterArgs
-        , '--cdp-url', options.cdpUrl || process.env.CDP_URL || 'http://localhost:9222'
-      ], {
+        '--filters', filterArgs,
+        '--cdp-url', options.cdpUrl || process.env.CDP_URL || 'http://localhost:9222'
+      ];
+      if (options.maxItems) {
+        spawnArgs.push('--max-items', String(options.maxItems));
+      }
+
+      const child = child_process.spawn('node', spawnArgs, {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
+
+      // Gap #4 closure (Final Gap Closure Round): this child process can
+      // outlive the parent Node process on an unclean crash. Report its PID
+      // so RestartRecovery can probe (never blindly kill) it on next boot.
+      if (typeof options.reportExternalExecution === 'function' && child.pid) {
+        options.reportExternalExecution({ executionClass: 'CDP', externalExecutionId: String(child.pid) });
+      }
+
+      // Gap #2 closure (Final Gap Closure Round): kills ONLY the child this
+      // execution spawned — never a sibling/shared resource — the moment its
+      // AbortSignal fires (e.g. StuckDetector's abortExecution()). Without
+      // this, a stuck Toidispy child kept running to natural completion
+      // regardless of any DB-level recovery.
+      let settledExternally = false;
+      const onAbort = () => {
+        if (settledExternally) return;
+        try { child.kill(); } catch (_e) { /* already exited */ }
+      };
+      if (options.signal) {
+        if (options.signal.aborted) onAbort();
+        else options.signal.addEventListener('abort', onAbort, { once: true });
+      }
 
       let stdout = '';
       let stderr = '';
@@ -69,6 +116,8 @@ class CDPBackend extends BaseBackend {
       child.stderr.on('data', (d) => { stderr += d.toString(); });
 
       child.on('close', (code) => {
+        settledExternally = true;
+        if (options.signal) options.signal.removeEventListener('abort', onAbort);
         let stdoutJson = null;
         try {
           if (stdout.trim()) stdoutJson = JSON.parse(stdout);
