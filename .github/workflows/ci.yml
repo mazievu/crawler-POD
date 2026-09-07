@@ -28,6 +28,7 @@ jobs:
       PGUSER: crawler
       PGPASSWORD: crawler
       PGDATABASE: crawler_pod
+      CREDENTIAL_ENCRYPTION_KEY: g+lhSWcOGt2W+idgijBJl3OrnHgboxx37+YlWBZPgTw=
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
