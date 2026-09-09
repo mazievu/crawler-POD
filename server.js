@@ -722,6 +722,72 @@ app.get('/api/apify-tokens/status', (req, res) => {
   }
 });
 
+app.get('/api/apify-tokens', (req, res) => {
+  try {
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    res.json(getApifyTokenPool().getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/apify-tokens', (req, res) => {
+  try {
+    const { token, tokens, label } = req.body || {};
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    const pool = getApifyTokenPool();
+
+    const toAdd = [];
+    if (tokens && typeof tokens === 'string') {
+      toAdd.push(...tokens.split(/[,;\r\n]+/).map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean));
+    } else if (Array.isArray(tokens)) {
+      toAdd.push(...tokens.map((s) => (typeof s === 'string' ? s.trim().replace(/^['"]|['"]$/g, '') : (s.token || '').trim())).filter(Boolean));
+    } else if (token && typeof token === 'string') {
+      toAdd.push(...token.split(/[,;\r\n]+/).map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean));
+    }
+
+    if (toAdd.length === 0) {
+      return res.status(400).json({ error: 'Vui lòng cung cấp ít nhất một Apify API token hợp lệ.' });
+    }
+
+    const added = [];
+    for (const t of toAdd) {
+      const rec = pool.addAndPersistToken(t, label || null);
+      if (rec) added.push({ id: rec.id, label: rec.label, state: rec.state });
+    }
+
+    res.json({ success: true, count: added.length, added, status: pool.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/apify-tokens/cleanup', (req, res) => {
+  try {
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    const pool = getApifyTokenPool();
+    const removedCount = pool.clearNonHealthyTokens();
+    res.json({ success: true, removedCount, status: pool.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/apify-tokens/:id', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    const pool = getApifyTokenPool();
+    const removed = pool.removeToken(id);
+    if (!removed) {
+      return res.status(404).json({ error: 'Token không tồn tại trong pool.' });
+    }
+    res.json({ success: true, id, status: pool.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.delete('/api/runs/:id', async (req, res) => {
   try {
     const run = await db.getRunById(parseInt(req.params.id, 10));
@@ -741,6 +807,7 @@ app.delete('/api/runs/:id', async (req, res) => {
     }
 
     await db.deleteRun(run.id);
+    if (typeof invalidateRunCache === 'function') invalidateRunCache(run.id);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -752,36 +819,77 @@ app.delete('/api/runs/:id', async (req, res) => {
 // regardless), so flipping this flag back is always safe and instant.
 const READ_MODEL_V2 = process.env.READ_MODEL_V2 === 'true';
 
+// High-performance In-Memory LRU cache for parsed run items.
+// Prevents repeatedly querying 48MB result_items_json and running JSON.parse
+// 100 times in parallel, which frozen the Node.js event loop for 13-60+ seconds.
+const RUN_ITEMS_CACHE_LIMIT = 20;
+const runItemsCache = new Map();
+
+function invalidateRunCache(runId) {
+  if (runId) runItemsCache.delete(Number(runId));
+}
+
+async function getRunRichMetaMap(runId) {
+  if (!runId) return null;
+  const numId = Number(runId);
+  if (runItemsCache.has(numId)) {
+    // Refresh LRU position
+    const data = runItemsCache.get(numId);
+    runItemsCache.delete(numId);
+    runItemsCache.set(numId, data);
+    return data;
+  }
+
+  try {
+    const run = await db.getRunById(numId);
+    if (!run?.result_items_json) {
+      runItemsCache.set(numId, new Map());
+      return runItemsCache.get(numId);
+    }
+    const items = JSON.parse(run.result_items_json);
+    const itemMap = new Map();
+    if (Array.isArray(items)) {
+      for (const match of items) {
+        if (!match || !match.item_uid) continue;
+        itemMap.set(match.item_uid, {
+          startDate: match.startDate || '',
+          endDate: match.endDate || '',
+          isActive: match.isActive !== undefined ? match.isActive : true,
+          publisherPlatforms: match.publisherPlatforms || [],
+          fanpageLikes: match.fanpageLikes || null,
+          cta: match.cta || '',
+          landingUrl: match.landingUrl || '',
+          subreddit: match.subreddit || '',
+          mediaItems: Array.isArray(match.mediaItems) ? match.mediaItems : [],
+          mediaCount: match.mediaCount || 0,
+          adCount: match.adCount === undefined ? null : match.adCount,
+          activeCountries: Array.isArray(match.activeCountries) ? match.activeCountries : []
+        });
+      }
+    }
+
+    if (runItemsCache.size >= RUN_ITEMS_CACHE_LIMIT) {
+      const oldestKey = runItemsCache.keys().next().value;
+      runItemsCache.delete(oldestKey);
+    }
+    runItemsCache.set(numId, itemMap);
+    return itemMap;
+  } catch (_err) {
+    return new Map();
+  }
+}
+
 async function mapProductCurrentToItemShape(p) {
   let richMeta = {};
   try {
     if (p.last_run_id) {
-      const run = await db.getRunById(p.last_run_id);
-      if (run?.result_items_json) {
-        const items = JSON.parse(run.result_items_json);
-        const match = items.find(it => it.item_uid === p.item_uid);
-        if (match) {
-          richMeta = {
-            startDate: match.startDate || '',
-            endDate: match.endDate || '',
-            isActive: match.isActive !== undefined ? match.isActive : true,
-            publisherPlatforms: match.publisherPlatforms || [],
-            fanpageLikes: match.fanpageLikes || p.current_likes || 0,
-            cta: match.cta || '',
-            landingUrl: match.landingUrl || '',
-            subreddit: match.subreddit || '',
-            // mediaItems is the per-media breakdown (carousel children, each
-            // with its own type/image/video). It lives only in the run's packed
-            // items, never as a product_current column, so this lookup is the
-            // only place it can come from.
-            mediaItems: Array.isArray(match.mediaItems) ? match.mediaItems : [],
-            mediaCount: match.mediaCount || 0,
-            // Task 4: adCount stays null when the provider reported none — the
-            // UI renders that as SOURCE_NOT_AVAILABLE rather than as 0 ads.
-            adCount: match.adCount === undefined ? null : match.adCount,
-            activeCountries: Array.isArray(match.activeCountries) ? match.activeCountries : []
-          };
-        }
+      const runMetaMap = await getRunRichMetaMap(p.last_run_id);
+      if (runMetaMap && runMetaMap.has(p.item_uid)) {
+        const match = runMetaMap.get(p.item_uid);
+        richMeta = {
+          ...match,
+          fanpageLikes: match.fanpageLikes || p.current_likes || 0
+        };
       }
     }
   } catch {}
@@ -905,10 +1013,10 @@ app.get('/api/items', async (req, res) => {
         conditions,
         orderBy,
       });
-      // mapProductCurrentToItemShape is async (it reads the run's stored items
-      // for rich metadata), so this map yields Promises. Without Promise.all,
-      // res.json() serialises each one as {} and the dashboard shows a full
-      // grid of "UNDEFINED / No title / No image" cards.
+      // Pre-warm the run items cache for all unique runIds in parallel
+      const uniqueRunIds = [...new Set(current.map((p) => p.last_run_id).filter(Boolean))];
+      await Promise.all(uniqueRunIds.map((runId) => getRunRichMetaMap(runId)));
+
       return res.json(await Promise.all(current.map(mapProductCurrentToItemShape)));
     }
 

@@ -263,6 +263,72 @@
           <hr>
           <h6 class="fw-bold">Saved accounts</h6>
           <div id="marketplace-accounts-list" class="small text-muted">Loading...</div>
+          <hr>
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="fw-bold mb-0"><i data-feather="cpu" class="me-1 text-primary" style="width:16px;height:16px"></i> Apify API Tokens (Pool &amp; Auto-Failover)</h6>
+            <span id="apify-pool-summary-badge" class="badge bg-secondary">0 tokens</span>
+          </div>
+          <p class="small text-muted mb-2">Hệ thống xoay vòng và fallback token tự động khi một token hết quota hoặc bị rate-limit.</p>
+
+          <!-- Tab switch: Đơn lẻ / Hàng loạt -->
+          <ul class="nav nav-pills nav-fill mb-2" id="apify-token-tabs" role="tablist">
+            <li class="nav-item" role="presentation">
+              <button class="nav-link active py-1 small" id="tab-apify-single-btn" data-bs-toggle="pill" data-bs-target="#tab-apify-single" type="button"><i data-feather="plus" style="width:13px"></i> Thêm Đơn Lẻ</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link py-1 small" id="tab-apify-bulk-btn" data-bs-toggle="pill" data-bs-target="#tab-apify-bulk" type="button"><i data-feather="upload-cloud" style="width:13px"></i> Up Hàng Loạt (Bulk Upload)</button>
+            </li>
+          </ul>
+
+          <div class="tab-content border rounded p-3 mb-3 bg-light">
+            <!-- Tab 1: Single Token -->
+            <div class="tab-pane fade show active" id="tab-apify-single">
+              <div class="row g-2">
+                <div class="col-md-4">
+                  <label class="filter-label">Nhãn / Ghi chú (tùy chọn)</label>
+                  <input id="apify-token-label" class="form-control form-control-sm" maxlength="100" placeholder="e.g. Backup Account 1">
+                </div>
+                <div class="col-md-8">
+                  <label class="filter-label">Apify API Token</label>
+                  <div class="input-group input-group-sm">
+                    <input id="apify-token-input" class="form-control font-monospace" placeholder="apify_api_...">
+                    <button class="btn btn-primary" onclick="saveApifyToken()"><i data-feather="plus" style="width:14px"></i> Thêm Token</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab 2: Bulk Import -->
+            <div class="tab-pane fade" id="tab-apify-bulk">
+              <div class="d-flex justify-content-between align-items-center mb-1">
+                <label class="filter-label mb-0 fw-bold">Dán danh sách token (mỗi dòng 1 token hoặc cách nhau bởi dấu phẩy)</label>
+                <span class="text-muted small" id="apify-bulk-count-hint">0 token phát hiện</span>
+              </div>
+              <textarea id="apify-bulk-tokens" class="form-control font-monospace mb-2" rows="5" placeholder="apify_api_token_1...&#10;apify_api_token_2...&#10;apify_api_token_3..." oninput="updateBulkTokenCountHint()"></textarea>
+              <div class="d-flex flex-wrap gap-2 justify-content-between align-items-center">
+                <div class="d-flex align-items-center gap-2">
+                  <label class="btn btn-outline-primary btn-sm mb-0">
+                    <i data-feather="file-text" style="width:14px"></i> Chọn file (.txt, .json, .csv)
+                    <input type="file" id="apify-token-file" class="d-none" accept=".txt,.json,.csv" onchange="handleApifyTokenFile(event)">
+                  </label>
+                  <span id="apify-file-name" class="small text-muted"></span>
+                </div>
+                <div class="d-flex gap-2">
+                  <button class="btn btn-outline-secondary btn-sm" onclick="clearBulkApifyInput()">Xóa ô nhập</button>
+                  <button class="btn btn-success btn-sm" onclick="saveBulkApifyTokens()"><i data-feather="upload-cloud" style="width:14px"></i> Tải Lên Hàng Loạt Vào Pool</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <span class="small fw-bold text-muted">Danh Sách Token Trong Pool</span>
+            <button class="btn btn-outline-warning btn-sm py-0 px-2 small" onclick="cleanupApifyTokens()" title="Dọn dẹp các token đã cạn kiệt hoặc lỗi">
+              <i data-feather="refresh-cw" style="width:12px"></i> Dọn token lỗi/hết hạn
+            </button>
+          </div>
+          <div id="apify-token-status" class="small mb-2"></div>
+          <div id="apify-tokens-list" class="small text-muted">Đang tải danh sách token...</div>
         </div>
       </div>
     </div>

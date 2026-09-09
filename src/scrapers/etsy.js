@@ -84,7 +84,13 @@ async function scrape(query, options = {}) {
     mergeSupplement(merged, result.items);
     debug.cloakBrowserDiscovered = merged.size;
   } catch (err) {
-    if (options.signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
+    if (options.signal?.aborted) {
+      const abortErr = new Error('ABORTED: execution cancelled');
+      abortErr.name = 'AbortError';
+      abortErr.code = 'ABORTED';
+      throw abortErr;
+    }
+    if (err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
       throw err;
     }
     console.warn('[Etsy Scraper] CloakBrowser discovery failed:', err.message);
@@ -105,7 +111,13 @@ async function scrape(query, options = {}) {
         debug.searxngSupplemented = mergeSupplement(merged, result.items);
       }
     } catch (err) {
-      if (options.signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
+      if (options.signal?.aborted) {
+        const abortErr = new Error('ABORTED: execution cancelled');
+        abortErr.name = 'AbortError';
+        abortErr.code = 'ABORTED';
+        throw abortErr;
+      }
+      if (err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
         throw err;
       }
       console.warn('[Etsy Scraper] SearXNG supplement failed:', err.message);
@@ -127,7 +139,13 @@ async function scrape(query, options = {}) {
         debug.everbeeHostSupplemented = mergeSupplement(merged, everbeeResult.items);
       }
     } catch (err) {
-      if (options.signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
+      if (options.signal?.aborted) {
+        const abortErr = new Error('ABORTED: execution cancelled');
+        abortErr.name = 'AbortError';
+        abortErr.code = 'ABORTED';
+        throw abortErr;
+      }
+      if (err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
         throw err;
       }
       console.warn('[Etsy Scraper] Everbee host discovery unavailable:', err.message);
@@ -161,7 +179,13 @@ async function scrape(query, options = {}) {
         debug.cacheSupplemented = mergeSupplement(merged, cacheItems);
       }
     } catch (err) {
-      if (options.signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
+      if (options.signal?.aborted) {
+        const abortErr = new Error('ABORTED: execution cancelled');
+        abortErr.name = 'AbortError';
+        abortErr.code = 'ABORTED';
+        throw abortErr;
+      }
+      if (err?.name === 'AbortError' || err?.code === 'ABORTED' || /ABORT/i.test(err?.message || '')) {
         throw err;
       }
       console.warn('[Etsy Scraper] DB fallback search failed:', err.message);

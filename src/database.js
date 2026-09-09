@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Database Module â€” Snapshot-based tracking
  * Each collection run creates snapshots. Comparing snapshots shows:
  * - New items (appeared since last run)
@@ -18,6 +18,8 @@ const { cleanImageUrl, extractImage, sanitizeForStorage } = require('./image-uti
 const { createProductCurrentOps } = require('./database/product-current');
 const { createDailyHistoryOps, normalizeLegacyUtcTimestamp } = require('./database/daily-history');
 const { createWeeklySummaryOps } = require('./database/weekly-summary');
+
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 // Â§14/Â§16 DB Cutover flags â€” controlled via .env, default keeps legacy behavior.
 const LEGACY_SNAPSHOT_WRITE = (process.env.LEGACY_SNAPSHOT_WRITE || 'true').toLowerCase() !== 'false';

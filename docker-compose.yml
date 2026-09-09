@@ -10,6 +10,7 @@ services:
     environment:
       PORT: 3000
       SEARXNG_URL: http://searxng:8080
+      PGHOST: ${DOCKER_PGHOST:-172.18.0.1}
       # Everbee-style persistent browser profiles run inside this server
       # container. No client or host Chrome/CDP connection is required.
       EVERBEE_HEADLESS: "true"

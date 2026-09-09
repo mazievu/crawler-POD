@@ -69,7 +69,7 @@ const TOOLS = [
       'Overall health of crawler-POD: PostgreSQL size and row counts, whether the HTTP server is responding, and the scheduler snapshot it reports.',
     inputSchema: {
       type: 'object',
-      properties: { port: { type: 'number', description: 'Port the app listens on (default 3000).' } },
+      properties: { port: { type: 'number', description: 'Port the app listens on (default 9999).' } },
     },
   },
   {
@@ -179,7 +179,7 @@ async function httpJson(url, timeoutMs = 4000) {
 }
 
 const handlers = {
-  async health({ port = 3000 }) {
+  async health({ port = Number(process.env.PORT) || 9999 } = {}) {
     const database = await db();
     const dbHealth = await database.getDatabaseHealth();
     const scheduler = await httpJson(`http://127.0.0.1:${port}/api/scheduler/status`);
@@ -255,7 +255,7 @@ const handlers = {
     return text(await database.getMarketplaceCaptureSchedules());
   },
 
-  async server_control({ action, port = 3000 }) {
+  async server_control({ action, port = Number(process.env.PORT) || 9999 }) {
     if (action === 'status') {
       const probe = await httpJson(`http://127.0.0.1:${port}/api/platforms`);
       const pid = fs.existsSync(PID_FILE) ? fs.readFileSync(PID_FILE, 'utf8').trim() : null;

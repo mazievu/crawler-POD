@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const path = require('path');
 const Database = require('better-sqlite3');
 const { execFileSync } = require('node:child_process');
+process.env.LEGACY_SNAPSHOT_WRITE = 'true';
 const db = require('../src/database');
 
 const PROJECT_ROOT = path.join(__dirname, '..');

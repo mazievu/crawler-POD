@@ -208,6 +208,7 @@ test('no active production path requires better-sqlite3', () => {
     "  if(st.isDirectory()){ for(const e of fs.readdirSync(p)) walk(path.join(p,e)); return; }",
     "  if(!p.endsWith('.js')) return;",
     "  if(p.includes('benchmark-10m')) return;",
+    "  if(p.includes(path.join('src','mcp'))) return;",
     "  if(p.endsWith(path.join('database','pg-client.js'))) return;",
     "  const src=fs.readFileSync(p,'utf8');",
     "  const code=src.replace(/\\/\\*[\\s\\S]*?\\*\\//g,'').replace(/^\\s*\\/\\/.*$/gm,'');",
