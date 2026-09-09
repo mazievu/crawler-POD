@@ -71,6 +71,14 @@ async function initDatabase() {
       await backfillSnapshotImages();
       await backfillSnapshotProductMetrics();
     })();
+    // A failed init must not be cached: with the rejected promise memoised,
+    // one unreachable-database moment at boot made every later call fail
+    // instantly until the process was restarted, even after Postgres came
+    // back. Clearing it lets the next caller retry from scratch.
+    initPromise = initPromise.catch((err) => {
+      initPromise = null;
+      throw err;
+    });
   }
   return initPromise;
 }
@@ -350,7 +358,15 @@ async function deleteItem(itemUid) {
     const snapResult = await db.prepare('DELETE FROM snapshots WHERE item_uid = ?').run(uid);
     try { await db.prepare('DELETE FROM product_current WHERE item_uid = ?').run(uid); } catch (_) {}
     try { await db.prepare('DELETE FROM daily_packed_history WHERE item_uid = ?').run(uid); } catch (_) {}
-    try { await db.prepare('DELETE FROM weekly_product_summary WHERE item_uid = ?').run(uid); } catch (_) {}
+    // The table is `weekly_summary` (pg-schema.sql). Against the old name
+    // PostgreSQL raised 42P01, and that is not survivable inside a transaction
+    // however hard the catch tries: one failed statement puts the whole
+    // transaction into aborted state, so the two DELETEs above were rolled back
+    // on COMMIT. deleteItem() then reported success:true with changes:0 while
+    // the product_current row was still there — which is exactly the symptom
+    // that was filed. Deleting by platform never touched this table, which is
+    // why that path worked.
+    try { await db.prepare('DELETE FROM weekly_summary WHERE item_uid = ?').run(uid); } catch (_) {}
     return { changes: snapResult.changes };
   });
   return await tx(itemUid);
@@ -520,7 +536,11 @@ async function insertSnapshots(runId, platform, query, items) {
         v2Result = await productCurrentOps.upsertItem(v2Payload, runId);
         // Â§4: runId gives this observation a stable identity (run:<runId>:<itemUid>)
         // so a retried insertSnapshots() call for the same run never duplicates it.
-        dailyHistoryOps.appendObservation(v2Payload, new Date(), { runId });
+        // appendObservation became async with the cutover. Without the await it
+        // ran detached: the write escaped the surrounding transaction, so a
+        // failure could neither roll back nor be reported, and the row could
+        // land after the transaction it belonged to had already committed.
+        await dailyHistoryOps.appendObservation(v2Payload, new Date(), { runId });
         // weekly_summary is deprecated from the core write path (Simplification
         // Round #13/#14): the table and its historical rows are preserved for
         // read/rollback, but nothing writes to it anymore. Core data model is
@@ -890,10 +910,14 @@ async function assignMarketplaceAccountProxy(accountId, proxyId = null) {
   return await stmt.findMarketplaceAccount.get(Number(accountId));
 }
 
-function deleteMarketplaceProxy(id) {
+// Declared async so the export wrapper below recognises it: that wrapper only
+// awaits initDatabase() for functions whose constructor is AsyncFunction, and
+// this one returned a promise from a plain function, so it slipped through and
+// could run against an uninitialised `db`.
+async function deleteMarketplaceProxy(id) {
   const normalizedId = Number(id);
   if (!Number.isInteger(normalizedId) || normalizedId < 1) return false;
-  return db.transaction(async () => {
+  return await db.transaction(async () => {
     await stmt.clearMarketplaceProxyAssignments.run(normalizedId);
     return (await stmt.deleteMarketplaceProxy.run(normalizedId)).changes > 0;
   })();
@@ -1344,7 +1368,7 @@ async function repairPendingV2WriteFailures() {
       // Â§4.1: migrated observations use legacy:<snapshot_id> identity â€” a
       // re-run of this migration for the same legacy row replaces its own
       // prior entry instead of duplicating it (Â§4.2 idempotency).
-      dailyHistoryOps.appendObservation(v2Item, snap.created_at, { legacySnapshotId: snap.id });
+      await dailyHistoryOps.appendObservation(v2Item, snap.created_at, { legacySnapshotId: snap.id });
       await db.prepare("UPDATE v2_write_failures SET status = 'repaired' WHERE id = ?").run(failure.id);
       repaired++;
     } catch (_err) {
@@ -1396,7 +1420,7 @@ async function backfillSnapshotsToV2() {
       // Â§4.1: migrated observations use legacy:<snapshot_id> identity â€” a
       // re-run of this migration for the same legacy row replaces its own
       // prior entry instead of duplicating it (Â§4.2 idempotency).
-      dailyHistoryOps.appendObservation(v2Item, normalizedTs, { legacySnapshotId: snap.id });
+      await dailyHistoryOps.appendObservation(v2Item, normalizedTs, { legacySnapshotId: snap.id });
       // weekly_summary deprecated from backfill too â€” see note in insertSnapshots.
       maxId = Math.max(maxId, snap.id);
       migrated++;
@@ -1716,7 +1740,12 @@ async function getDatabaseHealth() {
   ) || 0;
 
   const productCurrentRows = (await db.prepare('SELECT COUNT(*) c FROM product_current').get()).c;
-  const dailyHistoryStats = await db.prepare('SELECT COUNT(*) c, AVG(observation_count) avgObs, MAX(observation_count) maxObs, SUM(observation_count) totalObs FROM daily_packed_history').get();
+  // The aliases are quoted because PostgreSQL folds unquoted identifiers to
+  // lower case: `AS avgObs` came back as `avgobs`, so `stats.avgObs` was
+  // undefined and `(undefined || 0).toFixed(2)` reported a confident 0. All
+  // three observation metrics have read "no history at all" since the cutover,
+  // while the table actually held 134 rows averaging 1.26 observations.
+  const dailyHistoryStats = await db.prepare('SELECT COUNT(*) c, AVG(observation_count) AS "avgObs", MAX(observation_count) AS "maxObs", SUM(observation_count) AS "totalObs" FROM daily_packed_history').get();
   const legacySnapshotRows = (await db.prepare('SELECT COUNT(*) c FROM snapshots').get()).c;
   const weeklySummaryRows = (await db.prepare('SELECT COUNT(*) c FROM weekly_summary').get()).c;
   // Â§15: pending V2 repair count â€” dual-write failures recorded by
@@ -1773,7 +1802,13 @@ async function reserveSocialBotWindow(botKey, scheduledWindow, queryKey) {
     const info = await socialBotStmt.reserveWindow.run({ botKey, scheduledWindow, queryKey });
     return info.lastInsertRowid;
   } catch (err) {
-    if (String(err.code || '').startsWith('SQLITE_CONSTRAINT')) return null; // Already reserved.
+    // "Already reserved" is the expected outcome of a concurrent tick, not a
+    // fault. PostgreSQL reports the UNIQUE violation as SQLSTATE 23505, not as
+    // the SQLITE_CONSTRAINT_* string this used to match — so after the cutover
+    // every lost race threw instead of returning null, taking down the social
+    // bot tick that should simply have skipped the slot.
+    const code = String(err.code || '');
+    if (code === '23505' || code.startsWith('SQLITE_CONSTRAINT')) return null;
     throw err;
   }
 }

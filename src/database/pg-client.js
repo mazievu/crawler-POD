@@ -42,17 +42,41 @@
  */
 
 const path = require('path');
-const { Pool, types } = require('pg');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { Pool, types: pgTypes } = require('pg');
 
-// better-sqlite3 trả COUNT()/SUM() là number; node-postgres mặc định parse
-// int8 (OID 20) và numeric (OID 1700) thành string, khiến getStats() v.v.
-// trả "1" thay vì 1. Lỗi chỉ lộ trên PostgreSQL server thật — PGlite tự parse
-// thành number nên test local không bắt được. Giữ hành vi cũ của hệ thống
-// (toàn bộ call sites đã được await hoá theo contract better-sqlite3).
-// ponytail: Number() mất chính xác trên bigint > 2^53; khi cần đếm lớn hơn
-// vậy mới đổi sang đọc string + BigInt có điều kiện.
-types.setTypeParser(20, (v) => (v === null ? null : Number(v)));
-types.setTypeParser(1700, (v) => (v === null ? null : Number(v)));
+/*
+ * PostgreSQL returns int8 (what COUNT/SUM produce) and numeric (what AVG
+ * produces) as STRINGS, because both can exceed what a JS number represents
+ * exactly. Every caller here was written against better-sqlite3, which returned
+ * numbers, so the strings do not throw — they silently corrupt arithmetic:
+ * getStats() handed the dashboard "27" instead of 27, and
+ * `Object.values(counts).reduce((a, b) => a + b, 0)` then CONCATENATED the
+ * per-platform counts into "0271158" instead of summing them.
+ *
+ * PGlite hides the int8 half (it already yields numbers) but not the numeric
+ * half, so this only surfaced against a real server — CI on PostgreSQL 16
+ * caught it as `'string' !== 'number'` at test/test.js:241.
+ *
+ * Converting once here is what keeps every call site honest. The precision
+ * Postgres is protecting does not apply to this schema: the int8 values are row
+ * counts and the numeric values are prices, ratings and observation averages —
+ * all far inside Number.MAX_SAFE_INTEGER.
+ */
+const PG_OID_INT8 = 20;
+const PG_OID_NUMERIC = 1700;
+const toNumberOrNull = (value) => (value === null || value === undefined ? null : Number(value));
+
+pgTypes.setTypeParser(PG_OID_INT8, toNumberOrNull);
+pgTypes.setTypeParser(PG_OID_NUMERIC, toNumberOrNull);
+
+/** Same two parsers, in the shape PGlite's per-query `parsers` option wants. */
+const PG_NUMERIC_PARSERS = { [PG_OID_INT8]: toNumberOrNull, [PG_OID_NUMERIC]: toNumberOrNull };
+
+/** PGlite exposes exec() for multi-statement scripts; a pg Pool/Client does not. */
+function isPgliteDriver(driver) {
+  return !!driver && typeof driver.exec === 'function' && typeof driver.connect !== 'function';
+}
 
 // Tables whose primary key is not a column named `id`; `RETURNING id` must not
 // be appended for these, and lastInsertRowid is meaningless for them.
@@ -68,21 +92,61 @@ function insertTargetTable(sql) {
  * Rewrite SQLite dialect to PostgreSQL, preserving observable behavior.
  * String literals are protected first so nothing inside quotes is rewritten.
  */
-function translateDialect(sql) {
+/**
+ * Masks string literals and `--` line comments in ONE left-to-right scan, so
+ * each is recognised in the context of the other. Both regex-pass orderings
+ * are wrong in a different direction:
+ *
+ *   comments first  a `--` INSIDE a string ('https://a/foo--bar') eats the
+ *                   rest of the statement, and the `?` after it vanishes;
+ *   strings first   an apostrophe INSIDE a comment ("PostgreSQL's") opens a
+ *                   phantom string and swallows the statement — the bug the
+ *                   old comment-first order was chosen to avoid.
+ *
+ * A scanner has no ordering problem: whichever starts first wins, exactly as
+ * the PostgreSQL parser reads it. Placeholders use  sentinels, which
+ * cannot appear in SQL — the old ` L<n> ` form collided with any identifier
+ * that happened to be named L0, L1, …
+ */
+function maskLiteralsAndComments(sql) {
   const literals = [];
-  // Stash `--` line comments FIRST. An apostrophe inside a comment (for
-  // example "PostgreSQL's") would otherwise read as the start of a string
-  // literal and swallow the rest of the statement, silently turning bound
-  // parameters into bare identifiers (column "likes" does not exist).
-  let out = sql.replace(/--.*/g, (c) => {
-    literals.push(c);
-    return ` L${literals.length - 1} `;
-  });
-  // Then stash single-quoted literals (with '' escapes).
-  out = out.replace(/'(?:[^']|'')*'/g, (lit) => {
-    literals.push(lit);
-    return ` L${literals.length - 1} `;
-  });
+  let out = '';
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i];
+    if (ch === "'") {
+      // String literal, honouring '' escapes. Unterminated: take the rest.
+      let j = i + 1;
+      while (j < sql.length) {
+        if (sql[j] === "'") {
+          if (sql[j + 1] === "'") { j += 2; continue; }
+          break;
+        }
+        j += 1;
+      }
+      const end = j < sql.length ? j + 1 : sql.length;
+      literals.push(sql.slice(i, end));
+      out += `${literals.length - 1}`;
+      i = end;
+    } else if (ch === '-' && sql[i + 1] === '-') {
+      // Line comment: runs to end of line, never across it.
+      let j = sql.indexOf('\n', i);
+      if (j === -1) j = sql.length;
+      literals.push(sql.slice(i, j));
+      out += `${literals.length - 1}`;
+      i = j;
+    } else {
+      out += ch;
+      i += 1;
+    }
+  }
+  const restore = (text) => text.replace(/(\d+)/g, (_m, k) => literals[Number(k)]);
+  return { masked: out, restore };
+}
+
+function translateDialect(sql) {
+  const { masked, restore } = maskLiteralsAndComments(sql);
+  let out = masked;
 
   const hadOrIgnore = /\bINSERT\s+OR\s+IGNORE\s+INTO\b/i.test(out);
   out = out.replace(/\bINSERT\s+OR\s+IGNORE\s+INTO\b/gi, 'INSERT INTO');
@@ -107,9 +171,7 @@ function translateDialect(sql) {
 
   if (hadOrIgnore && !/ON\s+CONFLICT/i.test(out)) out = `${out.trimEnd()} ON CONFLICT DO NOTHING`;
 
-  // Restore literals.
-  out = out.replace(/ ?L(\d+) ?/g, (_m, i) => literals[Number(i)]);
-  return out;
+  return restore(out);
 }
 
 /**
@@ -122,18 +184,10 @@ function translateParams(sql) {
   const seen = new Map();
   let positional = 0;
 
-  const literals = [];
-  // Same comment-first masking as translateDialect: an apostrophe inside a
-  // '--' comment would otherwise be read as an opening quote and hide the
-  // parameters that follow it.
-  let out = sql.replace(/--.*/g, (c) => {
-    literals.push(c);
-    return ` L${literals.length - 1} `;
-  });
-  out = out.replace(/'(?:[^']|'')*'/g, (lit) => {
-    literals.push(lit);
-    return ` L${literals.length - 1} `;
-  });
+  // Same single-pass masking as translateDialect — see maskLiteralsAndComments
+  // for why neither regex-pass ordering is safe here.
+  const { masked, restore } = maskLiteralsAndComments(sql);
+  let out = masked;
 
   // Named parameters: @foo. Repeated names reuse the same $n, matching
   // better-sqlite3, where one object key can fill several occurrences.
@@ -151,7 +205,7 @@ function translateParams(sql) {
     return `$${names.length}`;
   });
 
-  out = out.replace(/ ?L(\d+) ?/g, (_m, i) => literals[Number(i)]);
+  out = restore(out);
   return { text: out, names };
 }
 
@@ -257,7 +311,23 @@ class PgDatabase {
   constructor(poolOrClient, { owned = false } = {}) {
     this._pool = poolOrClient;
     this._owned = owned;
-    this._txClient = null;
+    // The active transaction's client is scoped to the async execution context,
+    // NOT stored on the instance. This class is a singleton in practice, and an
+    // instance field meant two concurrent transactions overwrote each other:
+    // tx2 re-pointed the field mid-flight so tx1's statements ran on tx2's
+    // connection, and tx1's `finally` nulled it so tx2's remaining statements
+    // escaped onto the plain pool — no isolation, no atomicity, no error.
+    // AsyncLocalStorage gives each transaction its own view of "my client".
+    this._txStorage = new AsyncLocalStorage();
+    // Single-connection drivers (PGlite) have only one session, so two
+    // interleaved BEGIN/COMMIT pairs would corrupt each other; transactions on
+    // such drivers queue on this promise chain instead of interleaving.
+    this._txLock = Promise.resolve();
+  }
+
+  /** The transaction client of the CURRENT async context, if one is active. */
+  _txClientForContext() {
+    return this._txStorage.getStore() || null;
   }
 
   /** The driver may be supplied as a promise (PGlite is ESM-only and has to be
@@ -270,8 +340,13 @@ class PgDatabase {
   /** Routes through the transaction client when one is active, so statements
    *  prepared at module load participate in whatever transaction is running. */
   async query(text, values) {
-    if (this._txClient) return this._txClient.query(text, values);
-    const driver = await this._driver();
+    const driver = this._txClientForContext() || await this._driver();
+    // PGlite does not read pg's global type registry, so the int8/numeric
+    // parsers set at the top of this file have to be handed to it per query.
+    // Probed against @electric-sql/pglite: without them AVG() comes back as
+    // "2.0000000000000000"; with them, 2. node-postgres must NOT get a third
+    // argument here — it would be taken as a callback.
+    if (isPgliteDriver(driver)) return driver.query(text, values, { parsers: PG_NUMERIC_PARSERS });
     return driver.query(text, values);
   }
 
@@ -285,7 +360,7 @@ class PgDatabase {
     // through the simple query protocol, but some drivers (PGlite) only accept
     // a single statement via query() and expose a separate exec() for scripts.
     const driver = await this._driver();
-    if (!this._txClient && typeof driver.exec === 'function') {
+    if (!this._txClientForContext() && typeof driver.exec === 'function') {
       await driver.exec(translated);
       return;
     }
@@ -306,38 +381,49 @@ class PgDatabase {
    */
   transaction(fn) {
     return async (...args) => {
-      if (this._txClient) return fn(...args);
+      // A nested call joins the transaction of ITS OWN async context. Reading
+      // this from AsyncLocalStorage (not an instance field) is what keeps two
+      // concurrent transactions from seeing each other.
+      if (this._txClientForContext()) return fn(...args);
       const driver = await this._driver();
-      if (typeof driver.connect !== 'function') {
-        // Single-connection drivers (e.g. PGlite in tests) have no pool to
-        // check out from; run the transaction on the driver itself.
-        await this.query('BEGIN');
+
+      const runInTx = async (client) => {
+        await client.query('BEGIN');
         try {
           const result = await fn(...args);
-          await this.query('COMMIT');
+          await client.query('COMMIT');
           return result;
         } catch (err) {
-          try { await this.query('ROLLBACK'); } catch (_) { /* keep original error */ }
+          try { await client.query('ROLLBACK'); } catch (_) { /* keep original error */ }
           throw err;
+        }
+      };
+
+      if (typeof driver.connect !== 'function') {
+        // Single-connection drivers (e.g. PGlite) have no pool to check out
+        // from — everyone shares one session, so concurrent transactions must
+        // QUEUE. Without this, two overlapping calls interleaved their
+        // BEGIN/COMMIT pairs on the same connection: the first COMMIT ended
+        // both, and the second transaction's tail ran outside any transaction.
+        let release;
+        const held = new Promise((resolve) => { release = resolve; });
+        const previous = this._txLock;
+        this._txLock = previous.then(() => held);
+        await previous;
+        try {
+          return await this._txStorage.run(driver, () => runInTx(driver));
+        } finally {
+          release();
         }
       }
 
       const client = await driver.connect();
-      this._txClient = client;
       try {
-        await client.query('BEGIN');
-        const result = await fn(...args);
-        await client.query('COMMIT');
-        return result;
-      } catch (err) {
-        try {
-          await client.query('ROLLBACK');
-        } catch (_) {
-          /* rollback failure must not mask the original error */
-        }
-        throw err;
+        // Everything fn() does — however deep the call chain — sees this
+        // client via _txClientForContext(), and ONLY this transaction's
+        // context does. No shared field to overwrite, nothing to null out.
+        return await this._txStorage.run(client, () => runInTx(client));
       } finally {
-        this._txClient = null;
         client.release();
       }
     };

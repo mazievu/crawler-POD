@@ -35,6 +35,7 @@
 
 import express from 'express';
 import { spawn } from 'node:child_process';
+import { timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -282,10 +283,18 @@ const handlers = {
   },
 
   async restart_crawler({ port = CRAWLER_PORT }) {
+    // stop_crawler does not always answer in JSON: its failure paths (no pid
+    // file, a stale pid whose process is already gone) return a plain text
+    // message. Parsing that blindly threw SyntaxError and failed the whole
+    // restart even though starting was still possible — so non-JSON answers
+    // are carried through as-is instead of being parsed.
+    const asResult = (handlerText) => {
+      try { return JSON.parse(handlerText); } catch { return { message: handlerText }; }
+    };
     const stopped = fs.existsSync(PID_FILE)
-      ? JSON.parse((await handlers.stop_crawler()).content[0].text)
+      ? asResult((await handlers.stop_crawler()).content[0].text)
       : { skipped: 'was not running' };
-    const started = JSON.parse((await handlers.start_crawler({ port })).content[0].text);
+    const started = asResult((await handlers.start_crawler({ port })).content[0].text);
     return text({ stop: stopped, start: started });
   },
 
@@ -367,7 +376,14 @@ app.use((req, res, next) => {
   if (!TOKEN) return next();
   const header = req.headers.authorization || '';
   const supplied = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (supplied !== TOKEN) {
+  // Constant-time comparison: `!==` short-circuits on the first differing
+  // byte, which lets a caller on the LAN measure response times to recover
+  // the token prefix by prefix. Length still leaks (timingSafeEqual requires
+  // equal lengths), which reveals nothing useful on its own.
+  const suppliedBuf = Buffer.from(supplied || '', 'utf8');
+  const tokenBuf = Buffer.from(TOKEN, 'utf8');
+  const authorized = suppliedBuf.length === tokenBuf.length && timingSafeEqual(suppliedBuf, tokenBuf);
+  if (!authorized) {
     return res.status(401).json({
       jsonrpc: '2.0',
       error: { code: -32001, message: 'Unauthorized: send Authorization: Bearer <MCP_HTTP_TOKEN>' },

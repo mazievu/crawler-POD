@@ -168,9 +168,14 @@ test('data written by one process is still there after a restart', () => {
   assert.equal(second.currentCount, 1, 'product_current must survive the restart');
 });
 
-test('the archived SQLite database is not touched by the running system', () => {
-  if (!fs.existsSync(SQLITE_DB)) return; // nothing to protect in a clean checkout
-
+// Skipped (visibly, with a reason) rather than silently returning: on CI and
+// any clean clone data/collector.db does not exist, and an early `return` made
+// this pass with zero assertions — green while checking nothing.
+test('the archived SQLite database is not touched by the running system', {
+  skip: !fs.existsSync(SQLITE_DB)
+    ? 'data/collector.db not present (data/ is gitignored) — nothing to protect on this checkout'
+    : false,
+}, () => {
   const before = fs.statSync(SQLITE_DB);
   const dir = freshDir();
   runInProcess(dir, `

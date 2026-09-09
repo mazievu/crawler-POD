@@ -20,17 +20,21 @@ const CHECKPOINT_DIR = path.join(__dirname, '..', 'data', 'captures', 'journey_a
 // ============================================================
 // Test A — real saved Amazon checkpoints (Run #1966), no new crawl.
 // ============================================================
-test('Test A: real Amazon checkpoints (product_1..3_detail.html) yield title/price/rating/reviews/image all present', () => {
-  // Checkpoints của Run #1966 là dữ liệu cục bộ, không commit vào repo
-  // (data/ bị .gitignore) — trên CI sạch không có gì để test. Bỏ qua thay
-  // vì fail; Test B/C dưới đây dùng HTML inline và vẫn phủ parser.
-  const files = [1, 2, 3].map((n) => path.join(CHECKPOINT_DIR, `product_${n}_detail.html`));
-  if (!files.every((f) => fs.existsSync(f))) {
-    console.log(`  ⚠️  Skip Test A: fixtures not present at ${CHECKPOINT_DIR}`);
-    return;
-  }
+// The checkpoints live under data/, which .gitignore excludes, so a clean
+// checkout — CI included — simply does not have them. Failing there reported a
+// missing fixture as a broken parser and turned the whole suite red. It is
+// SKIPPED with a reason instead of silently passing, so the TAP output says the
+// coverage was not exercised rather than pretending it was.
+const CHECKPOINT_FILES = [1, 2, 3].map((n) => path.join(CHECKPOINT_DIR, `product_${n}_detail.html`));
+const MISSING_CHECKPOINTS = CHECKPOINT_FILES.filter((file) => !fs.existsSync(file));
+
+test('Test A: real Amazon checkpoints (product_1..3_detail.html) yield title/price/rating/reviews/image all present', {
+  skip: MISSING_CHECKPOINTS.length > 0
+    ? `Run #1966 checkpoints not present (${MISSING_CHECKPOINTS.length}/3 missing under data/captures/, which is gitignored). Run the Amazon journey locally to regenerate them.`
+    : false,
+}, () => {
   for (const n of [1, 2, 3]) {
-    const file = files[n - 1];
+    const file = path.join(CHECKPOINT_DIR, `product_${n}_detail.html`);
     const html = fs.readFileSync(file, 'utf8');
     const result = parseMarketplaceHtml({ platform: 'amazon', url: 'https://www.amazon.com/dp/TESTASIN0' + n, html });
 

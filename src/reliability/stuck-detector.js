@@ -76,9 +76,18 @@ class StuckDetector {
   start() {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      void this.checkStuckRuns().catch(err => {
-        console.error('[StuckDetector] Error checking stuck runs:', err.message);
-      });
+      // Re-entrancy guard: checkStuckRuns() awaits I/O and a grace period that
+      // can outlast the 15s interval. Without the guard a slow database let
+      // ticks pile up and run concurrently, and two overlapping ticks could
+      // each decide the same run was stuck and call recoverExecution() twice.
+      // A tick that finds the previous one still working simply skips.
+      if (this._checking) return;
+      this._checking = true;
+      void this.checkStuckRuns()
+        .catch(err => {
+          console.error('[StuckDetector] Error checking stuck runs:', err.message);
+        })
+        .finally(() => { this._checking = false; });
     }, this.checkIntervalMs);
     this.timer.unref();
     console.log('[StuckDetector] Started stuck run detector');
