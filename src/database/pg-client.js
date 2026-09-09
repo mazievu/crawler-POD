@@ -42,7 +42,17 @@
  */
 
 const path = require('path');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// better-sqlite3 trả COUNT()/SUM() là number; node-postgres mặc định parse
+// int8 (OID 20) và numeric (OID 1700) thành string, khiến getStats() v.v.
+// trả "1" thay vì 1. Lỗi chỉ lộ trên PostgreSQL server thật — PGlite tự parse
+// thành number nên test local không bắt được. Giữ hành vi cũ của hệ thống
+// (toàn bộ call sites đã được await hoá theo contract better-sqlite3).
+// ponytail: Number() mất chính xác trên bigint > 2^53; khi cần đếm lớn hơn
+// vậy mới đổi sang đọc string + BigInt có điều kiện.
+types.setTypeParser(20, (v) => (v === null ? null : Number(v)));
+types.setTypeParser(1700, (v) => (v === null ? null : Number(v)));
 
 // Tables whose primary key is not a column named `id`; `RETURNING id` must not
 // be appended for these, and lastInsertRowid is meaningless for them.
