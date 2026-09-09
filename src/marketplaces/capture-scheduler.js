@@ -28,8 +28,12 @@ function normalizeScheduleInput(input = {}) {
   if (runAt) vietnamDateTimeToUtc(runAt);
   if (scheduleType === 'once' && !runAt) throw new Error('Choose a valid date and time');
   const maxListings = Math.min(Math.max(Number(input.maxListings || input.maxItems) || 30, 1), 100);
+  // Task 5.2: market selector. Kept as a plain 2-letter code so it can be
+  // handed straight to a provider that requires one (TikTok Shop's actor takes
+  // country_code); empty means "whatever the platform's own default is".
+  const country = String(input.country || '').trim().toUpperCase().slice(0, 2);
   return {
-    platform, keyword, accountId, everyMinutes: everyHours * 60,
+    platform, keyword, accountId, everyMinutes: everyHours * 60, country,
     variantMode, maxVariants: variantMode === 'all' ? normalizeMaxVariants(input.maxVariants) : 0,
     maxListings,
     scheduleType, dailyTime, runAt,

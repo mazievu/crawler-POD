@@ -309,3 +309,35 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_uid ON snapshots (item_uid);
 CREATE INDEX IF NOT EXISTS idx_social_bot_state_bot ON social_bot_state (bot_key, scheduled_window DESC);
 CREATE INDEX IF NOT EXISTS idx_weekly_summary_platform_week ON weekly_summary (platform, year_week DESC);
 CREATE INDEX IF NOT EXISTS idx_weekly_summary_uid_week ON weekly_summary (item_uid, year_week DESC);
+
+-- ==================== Additive migrations ====================
+-- This file is replayed on every boot (initDatabase -> db.exec) and every
+-- CREATE TABLE above is IF NOT EXISTS, so a table that already exists is left
+-- exactly as it is. New columns therefore have to be added explicitly here;
+-- ADD COLUMN IF NOT EXISTS keeps that replay idempotent.
+
+-- Task 1 (Instagram media): a post's media is not just one image. Video posts
+-- carry a separate direct CDN URL and carousels carry several media of mixed
+-- type, so "which media does this row have" cannot be derived from `image`.
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS video_url  TEXT NOT NULL DEFAULT '';
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS media_type TEXT NOT NULL DEFAULT '';
+
+-- Task 5 (TikTok Shop daily Top 20). return_position is the position the
+-- provider returned the product in — NOT a rank: the actor publishes no rank
+-- field and its results are not sorted by sales, so calling it rank would
+-- assert ordering semantics the provider never confirmed. prev_/delta_ mirror
+-- the pattern the other metrics already use, so "moved up 3 places since
+-- yesterday" is answerable from one row.
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS return_position       INTEGER;
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS prev_return_position  INTEGER;
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS delta_return_position INTEGER;
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS sold_30d              INTEGER;
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS gmv                   DOUBLE PRECISION;
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS shop_url              TEXT NOT NULL DEFAULT '';
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS country               TEXT NOT NULL DEFAULT '';
+
+-- Task 5.2: a schedule has to be able to say WHICH market it targets. TikTok
+-- Shop's actor requires country_code, and "press on nails / US" is a different
+-- job from "press on nails / UK" — without this column every scheduled run fell
+-- back to the actor default and the market was unspecifiable.
+ALTER TABLE marketplace_capture_schedules ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT '';

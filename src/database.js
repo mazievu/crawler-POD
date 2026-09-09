@@ -214,15 +214,15 @@ const stmt = {
     LIMIT 20
   `),
   createMarketplaceCaptureSchedule: db.prepare(`
-    INSERT INTO marketplace_capture_schedules (platform, keyword, account_id, every_minutes, schedule_type, daily_time, run_at, variant_mode, max_variants, max_listings, next_run_at)
-    VALUES (@platform, @keyword, @accountId, @everyMinutes, @scheduleType, @dailyTime, @runAt, @variantMode, @maxVariants, @maxListings, @nextRunAt)
+    INSERT INTO marketplace_capture_schedules (platform, keyword, account_id, every_minutes, schedule_type, daily_time, run_at, variant_mode, max_variants, max_listings, country, next_run_at)
+    VALUES (@platform, @keyword, @accountId, @everyMinutes, @scheduleType, @dailyTime, @runAt, @variantMode, @maxVariants, @maxListings, @country, @nextRunAt)
   `),
   findMarketplaceCaptureSchedules: db.prepare(`
-    SELECT id, platform, keyword, account_id, every_minutes, schedule_type, daily_time, run_at, variant_mode, max_variants, max_listings, enabled, next_run_at, last_run_at, last_summary, created_at
+    SELECT id, platform, keyword, account_id, every_minutes, schedule_type, daily_time, run_at, variant_mode, max_variants, max_listings, country, enabled, next_run_at, last_run_at, last_summary, created_at
     FROM marketplace_capture_schedules ORDER BY id DESC
   `),
   findDueMarketplaceCaptureSchedules: db.prepare(`
-    SELECT id, platform, keyword, account_id, every_minutes, schedule_type, daily_time, run_at, variant_mode, max_variants, max_listings
+    SELECT id, platform, keyword, account_id, every_minutes, schedule_type, daily_time, run_at, variant_mode, max_variants, max_listings, country
     FROM marketplace_capture_schedules
     WHERE enabled = 1 AND next_run_at <= @now AND (claimed_until IS NULL OR claimed_until < @now)
     ORDER BY next_run_at ASC LIMIT 5
@@ -498,6 +498,13 @@ async function insertSnapshots(runId, platform, query, items) {
         url: parsed.url,
         image: parsed.image,
         author: parsed.author,
+        video_url: parsed.videoUrl,
+        media_type: parsed.mediaType,
+        return_position: parsed.returnPosition,
+        sold_30d: parsed.sold30d,
+        gmv: parsed.gmv,
+        shop_url: parsed.shopUrl,
+        country: parsed.country,
         price: parsed.price,
         rating: parsed.rating,
         reviews: parsed.reviews,
@@ -551,6 +558,17 @@ async function insertSnapshots(runId, platform, query, items) {
         landingUrl: parsed.landingUrl,
         image: parsed.image,
         author: parsed.author,
+        videoUrl: parsed.videoUrl,
+        mediaType: parsed.mediaType,
+        mediaCount: parsed.mediaCount,
+        mediaItems: parsed.mediaItems,
+        adCount: parsed.adCount,
+        activeCountries: parsed.activeCountries,
+        returnPosition: parsed.returnPosition,
+        sold30d: parsed.sold30d,
+        gmv: parsed.gmv,
+        shopUrl: parsed.shopUrl,
+        country: parsed.country,
         price: parsed.price,
         currency: parsed.currency,
         source_price: parsed.source_price,
@@ -1072,9 +1090,12 @@ function parseItemData(item) {
   const archiveId = d.adArchiveId || d.adArchiveID || '';
   const adLibraryUrl = archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : '';
   const url = d.url || adLibraryUrl || d.permalink || d.adUrl || d.link || d.productUrl || '';
-  const author = typeof (d.author || d.advertiserName || d.advertiser || d.pageName || d.snapshot?.pageName || d.username || '') === 'object'
+  // `shopName` is what the product_listing normalizer emits for a seller, and
+  // its absence from this list is why every e-commerce row was persisted with
+  // an empty author while the shop name sat in the normalized item unused.
+  const author = typeof (d.author || d.advertiserName || d.advertiser || d.pageName || d.snapshot?.pageName || d.username || d.shopName || '') === 'object'
     ? (d.author?.name || d.author?.username || '')
-    : (d.author || d.advertiserName || d.advertiser || d.pageName || d.snapshot?.pageName || d.username || '');
+    : (d.author || d.advertiserName || d.advertiser || d.pageName || d.snapshot?.pageName || d.username || d.shopName || '');
 
   const price = parseDecimal(d.price || d.adSpend || d.product_price || d.currentPrice || 0);
   const currency = d.currency || 'USD';
@@ -1112,8 +1133,31 @@ function parseItemData(item) {
   // already carries the real total comment count â€” both reused as-is, only
   // the subreddit label itself was missing from persisted metadata.
   const subreddit = d.subreddit || '';
+  // Task 4 (Facebook Ads). adCount is deliberately null-preserving: the actor
+  // returns collationCount null for an ad that is not part of a collation, and
+  // null is not 0. activeCountries stays [] when the provider reported none.
+  const adCount = d.adCount === null || d.adCount === undefined ? null : parseNum(d.adCount);
+  const activeCountries = Array.isArray(d.activeCountries) ? d.activeCountries : [];
+  // Task 5 (TikTok Shop). null-preserving on purpose: a platform that does not
+  // report 30-day sales or GMV must not be recorded as having zero of them.
+  const returnPosition = d.returnPosition ?? d.return_position ?? null;
+  const sold30d = d.sold30d ?? d.sold_30d ?? null;
+  const gmv = d.gmv ?? null;
+  const shopUrl = d.shopUrl || d.shop_url || '';
+  const country = d.country || '';
 
-  return { title: String(title).substring(0, 200), image, url, author: String(author).substring(0, 100),
+  // Task 1: media beyond the single cover image. These arrive already resolved
+  // from the platform normalizer (src/normalize/social-post.js), the only layer
+  // that knows each provider's raw field names; the fallbacks cover items that
+  // reach here without passing through it.
+  const videoUrl = d.videoUrl || d.video_url || '';
+  const mediaType = d.mediaType || d.media_type || '';
+  const mediaCount = parseNum(d.mediaCount ?? d.media_count ?? (Array.isArray(d.mediaItems) ? d.mediaItems.length : 0));
+  const mediaItems = Array.isArray(d.mediaItems) ? d.mediaItems : [];
+
+  return { videoUrl, mediaType, mediaCount, mediaItems, adCount, activeCountries,
+    returnPosition, sold30d, gmv, shopUrl, country,
+    title: String(title).substring(0, 200), image, url, author: String(author).substring(0, 100),
     price, currency, source_price: sourcePrice, source_currency: sourceCurrency, fx_rate: fxRate, fx_at: fxAt,
     rating, reviews, soldCount, likes, comments, shares, views,
     startDate, endDate, isActive, publisherPlatforms, fanpageLikes, cta, landingUrl, subreddit };
@@ -1207,7 +1251,15 @@ async function getProductHistoryWithMetadata(itemUid, limitDays = 365) {
             fanpageLikes: match.fanpageLikes || currentItem.current_likes || 0,
             cta: match.cta || '',
             landingUrl: match.landingUrl || '',
-            subreddit: match.subreddit || ''
+            subreddit: match.subreddit || '',
+            // The detail modal renders its media from this history payload, not
+            // from /api/items, so the per-media breakdown has to travel here
+            // too — otherwise a carousel's video children are reachable through
+            // the list API but not through the view that actually plays them.
+            mediaItems: Array.isArray(match.mediaItems) ? match.mediaItems : [],
+            mediaCount: match.mediaCount || 0,
+            adCount: match.adCount === undefined ? null : match.adCount,
+            activeCountries: Array.isArray(match.activeCountries) ? match.activeCountries : []
           };
         }
       }
@@ -1220,6 +1272,8 @@ async function getProductHistoryWithMetadata(itemUid, limitDays = 365) {
         title: currentItem.title,
         url: currentItem.url,
         image: currentItem.image,
+        videoUrl: currentItem.video_url || '',
+        mediaType: currentItem.media_type || '',
         author: currentItem.author,
         status: currentItem.status,
         ...richMeta

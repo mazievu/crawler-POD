@@ -48,14 +48,16 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
 
   const insertCurrent = db.prepare(`
     INSERT INTO product_current (
-      item_uid, platform, query, title, url, image, author,
+      item_uid, platform, query, title, url, image, author, video_url, media_type,
+      return_position, sold_30d, gmv, shop_url, country,
       current_price, current_rating, current_reviews, current_sold,
       current_likes, current_comments, current_shares, current_views,
       delta_3h_likes, delta_3h_views, delta_24h_likes, delta_24h_views, delta_24h_sold,
       rank_score, status, last_run_id, observation_count,
       first_seen_at, last_seen_at, last_crawled_at
     ) VALUES (
-      @item_uid, @platform, @query, @title, @url, @image, @author,
+      @item_uid, @platform, @query, @title, @url, @image, @author, @video_url, @media_type,
+      @return_position, @sold_30d, @gmv, @shop_url, @country,
       @current_price, @current_rating, @current_reviews, @current_sold,
       @current_likes, @current_comments, @current_shares, @current_views,
       NULL, NULL, NULL, NULL, NULL,
@@ -70,6 +72,29 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
       url = @url,
       image = CASE WHEN @image != '' THEN @image ELSE image END,
       author = @author,
+      -- Same keep-what-we-had rule as the image column above: a re-crawl that
+      -- returns no media (a rate-limited page, a post whose video expired)
+      -- must not erase media an earlier crawl legitimately recorded.
+      video_url = CASE WHEN @video_url != '' THEN @video_url ELSE video_url END,
+      media_type = CASE WHEN @media_type != '' THEN @media_type ELSE media_type END,
+      -- Task 5: yesterday's position is preserved before today's overwrites it,
+      -- so "moved up / dropped N places" needs no extra query.
+      prev_return_position = return_position,
+      return_position = @return_position::int,
+      -- The ::int casts are required, not decorative. A bare parameter used only
+      -- in an IS NULL test gives PostgreSQL nothing to infer a type from, and
+      -- aborts the whole transaction with "could not determine data type of
+      -- parameter $N" — which surfaced as an entire re-crawl failing (run #584)
+      -- while the first crawl of the same items succeeded, because only the
+      -- UPDATE path reaches this statement.
+      delta_return_position = CASE
+        WHEN @return_position::int IS NULL OR return_position IS NULL THEN NULL
+        -- A SMALLER position is better, so an improvement is a POSITIVE delta.
+        ELSE return_position - @return_position::int END,
+      sold_30d = COALESCE(@sold_30d::int, sold_30d),
+      gmv = COALESCE(@gmv::double precision, gmv),
+      shop_url = CASE WHEN @shop_url != '' THEN @shop_url ELSE shop_url END,
+      country = CASE WHEN @country != '' THEN @country ELSE country END,
 
       prev_price = current_price,
       prev_rating = current_rating,
@@ -152,6 +177,13 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
         url: item.url || '',
         image: item.image || '',
         author: item.author || '',
+        video_url: item.video_url || '',
+        media_type: item.media_type || '',
+        return_position: item.return_position ?? null,
+        sold_30d: item.sold_30d ?? null,
+        gmv: item.gmv ?? null,
+        shop_url: item.shop_url || '',
+        country: item.country || '',
         current_price: price,
         current_rating: rating,
         current_reviews: reviews,
@@ -196,6 +228,13 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
         url: item.url || existing.url,
         image: item.image || existing.image,
         author: item.author || existing.author,
+        video_url: item.video_url || '',
+        media_type: item.media_type || '',
+        return_position: item.return_position ?? null,
+        sold_30d: item.sold_30d ?? null,
+        gmv: item.gmv ?? null,
+        shop_url: item.shop_url || '',
+        country: item.country || '',
         current_price: price,
         current_rating: rating,
         current_reviews: reviews,
@@ -233,8 +272,44 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
   return {
     upsertItem,
     findByUid: async (uid) => await findByUid.get(uid),
-    listCurrent: async ({ platform = null, search = null, limit = 100 } = {}) => {
-      return await listCurrent.all({ platform, search, limit });
+    /**
+     * Task 2: filtering and ranking happen HERE, in SQL, not in the browser.
+     * Paging with LIMIT means a client-side filter would only ever see the
+     * first page — "likes >= 1000" has to be able to reach a row that is not
+     * among the first 100 by rank_score.
+     *
+     * `conditions` are already parsed and whitelisted by
+     * src/filters/metric-conditions.js; only its column names reach the SQL
+     * text, and every threshold travels as a bound parameter. With none
+     * supplied this is byte-for-byte the previous prepared statement.
+     */
+    listCurrent: async ({ platform = null, search = null, limit = 100, conditions = [], orderBy = null } = {}) => {
+      if ((!conditions || conditions.length === 0) && !orderBy) {
+        return await listCurrent.all({ platform, search, limit });
+      }
+
+      const { buildSqlFilter } = require('../filters/metric-conditions');
+      const { sql: filterSql, params: filterParams } = buildSqlFilter(conditions || []);
+
+      const where = [
+        '(@platform::text IS NULL OR platform = @platform)',
+        "(@search::text IS NULL OR title LIKE '%' || @search || '%' OR query LIKE '%' || @search || '%')",
+      ];
+      if (filterSql) where.push(filterSql);
+
+      // Ranking first, then the pre-existing tie-breakers, so two rows with the
+      // same metric value keep a stable, meaningful order instead of an
+      // arbitrary one.
+      const order = orderBy
+        ? `${orderBy}, rank_score DESC, last_crawled_at DESC`
+        : 'rank_score DESC, last_crawled_at DESC';
+
+      return await db.prepare(`
+        SELECT * FROM product_current
+        WHERE ${where.join(' AND ')}
+        ORDER BY ${order}
+        LIMIT @limit
+      `).all({ platform, search, limit, ...filterParams });
     }
   };
 }

@@ -127,7 +127,15 @@ function createDailyHistoryOps(db) {
       views,
       sold,
       rating,
-      reviews
+      reviews,
+      // Task 5.5: the daily Top-20 job needs yesterday's position and yesterday's
+      // sales to report movement. These ride inside observations_json, so no
+      // column had to be added to daily_packed_history for them. null means the
+      // platform did not report the field — never 0, which would read as a real
+      // measurement of zero.
+      returnPosition: item.return_position ?? item.returnPosition ?? null,
+      sold30d: item.sold_30d ?? item.sold30d ?? null,
+      gmv: item.gmv ?? null
     };
 
     const existing = await findRow.get(item.item_uid, dateStr);

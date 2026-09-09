@@ -23,6 +23,42 @@ const { getStuckDetector } = require('./src/reliability/stuck-detector');
 const { recoverOrphanedRuns } = require('./src/reliability/restart-recovery');
 const { runManaged } = require('./src/reliability/managed-execution');
 const { abortExecution } = require('./src/reliability/execution-control');
+const {
+  parseConditions, buildSqlOrder, metricsForGroup, ECOM, SOCIAL,
+  PLATFORM_METRICS, metricsForPlatform, parseMetricSelection, buildSqlSelectionOrder,
+} = require('./src/filters/metric-conditions');
+
+/**
+ * Reads filter conditions off a query string in the two shapes a browser can
+ * realistically send:
+ *
+ *   conditions=[{"field":"likes","operator":">=","value":1000}]   (JSON array)
+ *   likes_min=1000&shares_min=100&price_max=50                     (flat pairs)
+ *
+ * Both go through the same whitelist, so neither can widen what a filter is
+ * allowed to touch.
+ */
+function parseItemConditions(query = {}) {
+  const raw = [];
+
+  if (query.conditions) {
+    try {
+      const parsed = JSON.parse(query.conditions);
+      if (Array.isArray(parsed)) raw.push(...parsed);
+      else return { conditions: [], invalid: [{ entry: query.conditions, reason: 'conditions_not_an_array' }] };
+    } catch {
+      return { conditions: [], invalid: [{ entry: query.conditions, reason: 'conditions_not_valid_json' }] };
+    }
+  }
+
+  for (const [key, value] of Object.entries(query)) {
+    const match = /^([a-z_]+)_(min|max)$/.exec(key);
+    if (!match) continue;
+    raw.push({ field: match[1], operator: match[2] === 'min' ? '>=' : '<=', value });
+  }
+
+  return parseConditions(raw);
+}
 
 /**
  * Boot sequence.
@@ -425,8 +461,12 @@ async function dispatchScheduleExecution(schedule, claimToken) {
     const platform = schedule.platform;
     const query = schedule.keyword;
     const maxItems = schedule.max_listings || 30;
-    const normalizedOptions = buildCollectionOptions(platform, { maxItems });
-    const run = await db.createRun({ platform, query, maxItems, country: null, options: normalizedOptions });
+    // Task 5.2: the schedule's market has to reach the crawl. TikTok Shop's
+    // actor takes country_code as a required input, so a US Top-20 job that
+    // dropped it here would silently crawl the actor's default market.
+    const country = schedule.country || null;
+    const normalizedOptions = buildCollectionOptions(platform, { maxItems, country });
+    const run = await db.createRun({ platform, query, maxItems, country, options: normalizedOptions });
 
     await scheduler.submitRun(run);
     const finishedRun = await scheduler.waitForCompletion(run.id, { timeoutMs: 180000 });
@@ -729,7 +769,17 @@ async function mapProductCurrentToItemShape(p) {
             fanpageLikes: match.fanpageLikes || p.current_likes || 0,
             cta: match.cta || '',
             landingUrl: match.landingUrl || '',
-            subreddit: match.subreddit || ''
+            subreddit: match.subreddit || '',
+            // mediaItems is the per-media breakdown (carousel children, each
+            // with its own type/image/video). It lives only in the run's packed
+            // items, never as a product_current column, so this lookup is the
+            // only place it can come from.
+            mediaItems: Array.isArray(match.mediaItems) ? match.mediaItems : [],
+            mediaCount: match.mediaCount || 0,
+            // Task 4: adCount stays null when the provider reported none — the
+            // UI renders that as SOURCE_NOT_AVAILABLE rather than as 0 ads.
+            adCount: match.adCount === undefined ? null : match.adCount,
+            activeCountries: Array.isArray(match.activeCountries) ? match.activeCountries : []
           };
         }
       }
@@ -744,6 +794,17 @@ async function mapProductCurrentToItemShape(p) {
     url: p.url,
     image: p.image,
     author: p.author,
+    videoUrl: p.video_url || '',
+    mediaType: p.media_type || '',
+    // Task 5. return_position is the provider's returned order, not a rank —
+    // see product-listing.js. delta is positive when the product moved UP.
+    returnPosition: p.return_position ?? null,
+    prevReturnPosition: p.prev_return_position ?? null,
+    returnPositionChange: p.delta_return_position ?? null,
+    sold30d: p.sold_30d ?? null,
+    gmv: p.gmv ?? null,
+    shopUrl: p.shop_url || '',
+    country: p.country || '',
     price: p.current_price,
     prev_price: p.prev_price,
     rating: p.current_rating,
@@ -773,10 +834,77 @@ async function mapProductCurrentToItemShape(p) {
   };
 }
 
+// Task 2: the UI builds its two filter panels from this rather than hardcoding
+// a metric list that could drift from what the server actually accepts.
+app.get('/api/item-metrics', (req, res) => {
+  // `platforms` is what both filter panels are built from: a platform's tick
+  // boxes must be the metrics that platform can actually report, so the UI
+  // never offers "shares" on an Etsy crawl. `groups` stays for the older
+  // threshold-style API surface.
+  const platforms = {};
+  for (const name of Object.keys(PLATFORM_METRICS)) platforms[name] = metricsForPlatform(name);
+
+  res.json({
+    platforms,
+    groups: [
+      { key: ECOM, label: 'E-COM', metrics: metricsForGroup(ECOM) },
+      { key: SOCIAL, label: 'SOCIAL', metrics: metricsForGroup(SOCIAL) },
+    ],
+    operators: ['>=', '>', '<=', '<', '=', '!='],
+    combine: 'AND',
+  });
+});
+
 app.get('/api/items', async (req, res) => {
   try {
     if (READ_MODEL_V2) {
-      const current = await db.getProductCurrent({ platform: req.query.platform || null, search: req.query.search || null, limit: req.query.limit ? Number(req.query.limit) : 100 });
+      // Task 2. FILTER decides membership, RANKING decides order — two separate
+      // inputs, both resolved in SQL so they apply to the whole table rather
+      // than to whatever the LIMIT happened to return.
+      //
+      //   ?conditions=[{"field":"likes","operator":">=","value":1000},
+      //                {"field":"shares","operator":">=","value":100}]
+      //   ?sort=likes&dir=desc
+      //
+      // Multiple conditions are ANDed by metric-conditions.evaluate/buildSql.
+      let { conditions, invalid } = parseItemConditions(req.query);
+      let orderBy = buildSqlOrder(req.query.sort, req.query.dir);
+
+      // Ticked-metric filter (?metrics=likes,comments&dir=desc). Ticking a
+      // metric means "only items that report it, ranked by it" — there is no
+      // threshold to type. It reuses the same whitelisted-column SQL path as
+      // `conditions` by expressing each tick as "> 0", so nothing new reaches
+      // the database.
+      if (req.query.metrics !== undefined) {
+        const { selected, invalid: badMetrics } = parseMetricSelection(req.query.metrics);
+        if (badMetrics.length) {
+          return res.status(400).json({
+            error: 'Unknown metric(s)',
+            invalid: badMetrics,
+            hint: `metric must be one of: ${Object.keys(require('./src/filters/metric-conditions').METRICS).join(', ')}`,
+          });
+        }
+        if (selected.length) {
+          conditions = conditions.concat(selected.map((field) => ({ field, operator: 'gt', value: 0 })));
+          orderBy = buildSqlSelectionOrder(selected, req.query.dir) || orderBy;
+        }
+      }
+
+      if (invalid.length) {
+        return res.status(400).json({
+          error: 'Unusable filter condition(s)',
+          invalid,
+          hint: 'field must be one of the known metrics, operator one of >= > <= < = !=, value numeric',
+        });
+      }
+
+      const current = await db.getProductCurrent({
+        platform: req.query.platform || null,
+        search: req.query.search || null,
+        limit: req.query.limit ? Number(req.query.limit) : 100,
+        conditions,
+        orderBy,
+      });
       // mapProductCurrentToItemShape is async (it reads the run's stored items
       // for rich metadata), so this map yields Promises. Without Promise.all,
       // res.json() serialises each one as {} and the dashboard shows a full

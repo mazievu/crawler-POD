@@ -182,7 +182,7 @@ test('scheduler enforces valid platform, keyword, 100 listing maximum, and hourl
     platform: 'etsy', keyword: 'press on nails', accountId: 7, everyHours: 24,
     variantMode: 'base', maxVariants: 0, maxListings: 999,
   }), {
-    platform: 'etsy', keyword: 'press on nails', accountId: 7, everyMinutes: 1440,
+    platform: 'etsy', keyword: 'press on nails', accountId: 7, everyMinutes: 1440, country: '',
     variantMode: 'base', maxVariants: 0, maxListings: 100, scheduleType: 'interval', dailyTime: '09:00', runAt: null,
   });
   assert.deepEqual(normalizeScheduleInput({ platform: 'amazon', keyword: 'x' }).platform, 'amazon');
@@ -190,8 +190,13 @@ test('scheduler enforces valid platform, keyword, 100 listing maximum, and hourl
   assert.throws(() => normalizeScheduleInput({ platform: 'etsy', keyword: '' }), /Keyword/);
   assert.throws(() => normalizeScheduleInput({ platform: 'etsy', keyword: 'x', accountId: 0 }), /Account/);
   assert.deepEqual(normalizeScheduleInput({ platform: 'etsy', keyword: 'x', everyHours: 999, variantMode: 'all', maxVariants: 999 }), {
-    platform: 'etsy', keyword: 'x', accountId: null, everyMinutes: 10080, variantMode: 'all', maxVariants: 250, maxListings: 30, scheduleType: 'interval', dailyTime: '09:00', runAt: null,
+    platform: 'etsy', keyword: 'x', accountId: null, everyMinutes: 10080, country: '', variantMode: 'all', maxVariants: 250, maxListings: 30, scheduleType: 'interval', dailyTime: '09:00', runAt: null,
   });
+  // A schedule may name the market it targets (TikTok Shop's actor requires a
+  // country_code). Empty means "use whatever the platform defaults to", and a
+  // supplied code is normalised to the 2-letter upper-case form providers expect.
+  assert.equal(normalizeScheduleInput({ platform: 'tiktok_shop', keyword: 'x', country: 'us' }).country, 'US');
+  assert.equal(normalizeScheduleInput({ platform: 'tiktok_shop', keyword: 'x' }).country, '');
 });
 
 // Gap #5 mandatory regression (Final Gap Closure Round): the final renew
@@ -286,7 +291,7 @@ test('scheduler records a failed discovery attempt so the schedule does not rema
 
 test('daily schedules accept a selected Vietnam time and calculate the next occurrence', () => {
   assert.deepEqual(normalizeScheduleInput({ platform: 'etsy', keyword: 'nails', scheduleType: 'daily', dailyTime: '08:30' }), {
-    platform: 'etsy', keyword: 'nails', accountId: null, everyMinutes: 1440, variantMode: 'base', maxVariants: 0, maxListings: 30,
+    platform: 'etsy', keyword: 'nails', accountId: null, everyMinutes: 1440, country: '', variantMode: 'base', maxVariants: 0, maxListings: 30,
     scheduleType: 'daily', dailyTime: '08:30', runAt: null,
   });
   assert.equal(nextScheduleRunAt({ schedule_type: 'daily', daily_time: '08:30' }, new Date('2026-07-22T00:00:00.000Z')).toISOString(), '2026-07-22T01:30:00.000Z');

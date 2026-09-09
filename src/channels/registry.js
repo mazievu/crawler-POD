@@ -51,8 +51,21 @@ function getPlatformCompatibilityList() {
       disabled: c.availability.status === 'disabled',
       queryField: getPlatformQueryField(c.name),
       inputFields: getPlatformInputFields(c.name),
+      metricGroup: getPlatformMetricGroup(c.normalizer),
     };
   });
+}
+
+/**
+ * Which metric panel (E-COM or SOCIAL) a platform's crawl filter should offer.
+ *
+ * Derived from the channel's own normalizer rather than a second hand-kept
+ * list, so a platform can never be offered a metric its normalizer never
+ * produces: `product_listing` emits price/rating/reviews/sold, while
+ * `social_post` and `ad_creative` emit likes/comments/shares/views.
+ */
+function getPlatformMetricGroup(normalizer) {
+  return normalizer === 'product_listing' ? 'ecom' : 'social';
 }
 
 module.exports = {

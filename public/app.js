@@ -14,6 +14,7 @@ let marketplaceProxyProfiles = [];
 document.addEventListener('DOMContentLoaded', async () => {
   feather.replace();
   await loadData();
+  await loadMetricGroups();
   setupSearch();
 });
 
@@ -65,6 +66,15 @@ function filterByPlatform(platform, el) {
   activeFilter = platform;
   document.querySelectorAll('.pill').forEach((p) => p.classList.remove('active'));
   el.classList.add('active');
+  // The metric panel is per-platform, so a pill click has to move it too —
+  // otherwise the panel keeps offering Amazon's metrics over Instagram rows.
+  // Ticks are cleared because a metric belongs to one platform's vocabulary.
+  if (platform !== 'all' && platformMetrics[platform] && platform !== metricPlatform) {
+    metricPlatform = platform;
+    const select = document.getElementById('metric-platform');
+    if (select) select.value = platform;
+    renderMetricBoxes();
+  }
   applyFilters();
 }
 
@@ -74,20 +84,175 @@ function setupSearch() {
   input.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(applyFilters, 200); });
 }
 
+// ==================== DB metric filter (Task 2) ====================
+// The filter is per-platform and tick-based: pick a platform, tick the metrics
+// that platform actually reports, choose a direction. There is no operator and
+// no threshold to type — ticking "likes" means "the ones with the most likes".
+//
+// The metric list per platform comes from /api/item-metrics, never hardcoded
+// here, so the panel can only ever offer what the server will accept and what
+// that platform's scraper genuinely produces.
+let platformMetrics = {};
+let metricPlatform = '';
+
+async function loadMetricGroups() {
+  try {
+    const spec = await apiFetch('/api/item-metrics');
+    platformMetrics = spec.platforms || {};
+  } catch (err) {
+    console.error('Could not load metric list:', err);
+    return;
+  }
+  renderMetricPlatformOptions();
+  renderMetricBoxes();
+}
+
+// Only platforms that actually hold rows are offered, so the dropdown does not
+// list twelve choices when four have data.
+function renderMetricPlatformOptions() {
+  const select = document.getElementById('metric-platform');
+  if (!select) return;
+  const available = allPlatforms
+    .filter((p) => platformMetrics[p.name])
+    .map((p) => ({ name: p.name, label: `${p.icon || ''} ${p.displayName || p.name}`.trim() }));
+  if (available.length === 0) return;
+
+  if (!metricPlatform || !available.some((p) => p.name === metricPlatform)) {
+    // Follow the platform pill when one is active; otherwise start on the first.
+    metricPlatform = available.some((p) => p.name === activeFilter) ? activeFilter : available[0].name;
+  }
+  select.innerHTML = available
+    .map((p) => `<option value="${escapeAttr(p.name)}"${p.name === metricPlatform ? ' selected' : ''}>${escapeHtml(p.label)}</option>`)
+    .join('');
+}
+
+function renderMetricBoxes() {
+  const host = document.getElementById('metric-boxes');
+  if (!host) return;
+  const metrics = platformMetrics[metricPlatform] || [];
+  if (metrics.length === 0) {
+    host.innerHTML = '<span class="metric-boxes-empty">Nền tảng này chưa khai báo chỉ số nào.</span>';
+    return;
+  }
+  host.innerHTML = metrics.map((m) => `
+    <label class="metric-box">
+      <input type="checkbox" value="${escapeAttr(m.name)}" onchange="applyMetricFilters()">
+      <span>${escapeHtml(m.label)}</span>
+    </label>`).join('');
+}
+
+// Switching platform also switches which pill is active, because a filter on
+// Etsy's metrics is meaningless while the grid is showing Instagram.
+function onMetricPlatformChange() {
+  const select = document.getElementById('metric-platform');
+  if (!select) return;
+  metricPlatform = select.value;
+  renderMetricBoxes();
+  activeFilter = metricPlatform;
+  document.querySelectorAll('.pill').forEach((pill) => {
+    pill.classList.toggle('active', (pill.getAttribute('onclick') || '').includes(`'${metricPlatform}'`));
+  });
+  applyMetricFilters();
+}
+
+function collectMetricSelection() {
+  return [...document.querySelectorAll('#metric-boxes input[type=checkbox]:checked')].map((el) => el.value);
+}
+
+function applyMetricFilters() { applyFilters(); }
+
+// Single place that writes the panel's status line, so no path can leave the
+// user without feedback after a click.
+function setMetricMessage(text, kind) {
+  const el = document.getElementById('metric-result');
+  if (!el) return;
+  el.className = `metric-result metric-result-${kind || 'info'}`;
+  el.innerHTML = text;
+}
+
+function clearMetricFilters() {
+  document.querySelectorAll('#metric-boxes input[type=checkbox]').forEach((el) => { el.checked = false; });
+  const dir = document.getElementById('metric-sort-dir');
+  if (dir) dir.value = 'desc';
+  applyFilters();
+}
+
+function toggleMetricPanel(forceOpen) {
+  const body = document.getElementById('metric-panel-body');
+  const toggle = document.getElementById('metric-toggle');
+  if (!body || !toggle) return;
+  const open = forceOpen === undefined ? body.hidden : forceOpen;
+  body.hidden = !open;
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.classList.toggle('open', open);
+  if (open) {
+    renderMetricPlatformOptions();
+    renderMetricBoxes();
+    // Opening the panel to a blank status line is what made the old one feel
+    // dead; say what it is waiting for.
+    if (!document.getElementById('metric-result')?.textContent) {
+      setMetricMessage('Tích một hoặc nhiều chỉ số để lọc.', 'info');
+    }
+  }
+}
 async function applyFilters() {
   const query = document.getElementById('search-input').value.toLowerCase().trim();
   const sort = document.getElementById('sort-select').value;
   const params = new URLSearchParams({ limit: '200' });
   if (activeFilter !== 'all') params.set('platform', activeFilter);
   if (query) params.set('search', query);
+
+  // Task 2: the ticked metrics and the direction are sent to the server, so
+  // they apply to the whole table rather than to the 200 rows this page
+  // happens to hold.
+  const selected = collectMetricSelection();
+  const dir = document.getElementById('metric-sort-dir')?.value || 'desc';
+  if (selected.length > 0) {
+    params.set('metrics', selected.join(','));
+    params.set('dir', dir);
+    // The ticked metrics belong to ONE platform's vocabulary, so the result set
+    // has to be that platform. Without this, ticking Amazon's "rating" while
+    // the pill still says All returns TikTok rows judged by Amazon's metrics.
+    if (metricPlatform) params.set('platform', metricPlatform);
+  }
   let filtered;
   try {
     filtered = await apiFetch(`/api/items?${params}`);
     allItems = filtered;
   } catch (err) {
     console.error('Search failed:', err);
+    // A rejected condition must say so instead of silently showing unfiltered
+    // data, which would look like "the filter matched everything".
+    setMetricMessage(escapeHtml(err.message || 'filter rejected'), 'error');
     return;
   }
+
+  const dirLabel = dir === 'asc' ? 'Thấp → Cao' : 'Cao → Thấp';
+  const labelFor = (name) =>
+    (platformMetrics[metricPlatform] || []).find((m) => m.name === name)?.label || name;
+
+  // Every path writes the status line — an empty one after a click is exactly
+  // what read as "the button does nothing".
+  setMetricMessage(
+    selected.length
+      ? `${selected.map((n) => escapeHtml(labelFor(n))).join(' + ')} · ${dirLabel} → <strong>${filtered.length}</strong> sản phẩm`
+      : `Chưa tích chỉ số nào — hiển thị toàn bộ <strong>${filtered.length}</strong> sản phẩm`,
+    selected.length ? 'ok' : 'info'
+  );
+
+  // Mirror the active filter onto the collapsed toggle, so closing the panel
+  // does not hide the fact that a filter is in effect.
+  const summaryEl = document.getElementById('metric-toggle-summary');
+  if (summaryEl) {
+    summaryEl.textContent = selected.length
+      ? `· ${selected.map(labelFor).join(' + ')} · ${dirLabel}`
+      : '';
+    summaryEl.classList.toggle('active', selected.length > 0);
+  }
+
+  // The server already returned the rows in the ranked order; re-sorting here
+  // would silently override it.
+  if (selected.length) { renderItems(filtered); return; }
 
   switch (sort) {
     case 'likes-desc': filtered.sort((a, b) => b.likes - a.likes); break;
@@ -116,12 +281,26 @@ function renderItems(items) {
     const tagClass = `tag-${item.platform}`;
     const icon = config?.icon || '🔗';
     const platformLabel = config?.displayName || item.platform;
+    // A post can be one image, a video, or a carousel of mixed media; the cover
+    // image alone cannot express that, so the kind (and how many) is marked.
+    const mediaCount = Number(item.mediaCount || 0);
+    // For an ad the extra media are alternate VERSIONS of the same ad, not a
+    // carousel of one post — Meta rotates which one it serves, so opening the
+    // Ad Library link twice shows two different pictures. Saying how many
+    // versions exist is what stops that looking like a broken link.
+    const mediaBadge = item.mediaType === 'video'
+      ? '<span class="item-media-badge" title="Video">▶ Video</span>'
+      : item.mediaType === 'carousel'
+        ? (item.platform === 'facebook_ads'
+          ? `<span class="item-media-badge" title="Quảng cáo này có ${mediaCount} phiên bản khác nhau. Meta xoay vòng hiển thị, nên mở link Ad Library mỗi lần có thể ra ảnh khác.">▣ ${mediaCount} phiên bản</span>`
+          : `<span class="item-media-badge" title="Carousel">▣ ${mediaCount || ''}</span>`)
+        : '';
     const cardImage = item.image
-      ? `<img src="${escapeAttr(item.image)}" alt="${escapeAttr(item.title || platformLabel)}" style="width:100%;height:100%;object-fit:cover" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('div'), { className: 'item-img-placeholder', textContent: 'No image' }))">`
-      : '<div class="item-img-placeholder">No image</div>';
+      ? `<img src="${escapeAttr(item.image)}" alt="${escapeAttr(item.title || platformLabel)}" style="width:100%;height:100%;object-fit:cover" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('div'), { className: 'item-img-placeholder', textContent: 'No image' }))">${mediaBadge}`
+      : `<div class="item-img-placeholder">No image</div>${mediaBadge}`;
 
     // Status badge
-    const statusBadge = getStatusBadge(item.status);
+    const statusBadge = getStatusBadge(item.status, item);
 
     // Growth indicators
     const growthHtml = renderGrowth(item.growth);
@@ -143,6 +322,36 @@ function renderItems(items) {
 
     const startStr = isFacebookAds && item.startDate ? parseServerTimestamp(item.startDate).toLocaleDateString() : '';
     const dateHtml = startStr ? `<div class="fs-11 text-muted mt-1">📅 Bắt đầu: ${startStr}</div>` : '';
+
+    // Task 4: ad count and active countries come straight from the provider.
+    // Both render as SOURCE_NOT_AVAILABLE when it reported nothing — Meta only
+    // publishes those for political / social-issue ads, and showing "0 ads" or
+    // the search country instead would be inventing data.
+    const adMetaHtml = isFacebookAds
+      ? `<div class="fs-11 text-muted mt-1 d-flex flex-column gap-1">
+           ${adFieldHtml('🧾', 'Số QC', adCountHtml(item))}
+           ${adFieldHtml('👁', 'Views', Number(item.views) > 0 ? `<strong>${formatNum(item.views)}</strong>` : metaNotDisclosed())}
+           ${adFieldHtml('🌍', 'Quốc gia', Array.isArray(item.activeCountries) && item.activeCountries.length
+             ? `<strong>${item.activeCountries.map((c) => escapeHtml(c)).join(', ')}</strong>`
+             : metaNotDisclosed())}
+         </div>`
+      : '';
+
+    // Task 5.6: position movement and sales growth, the two things a daily
+    // Top-20 job exists to surface. A POSITIVE returnPositionChange means the
+    // product moved UP (its position number got smaller).
+    const posChange = item.returnPositionChange;
+    const posHtml = isTiktokShop && item.returnPosition
+      ? `<div class="fs-11 text-muted mt-1">#${item.returnPosition} <span class="text-muted">return position</span>${
+          posChange === null || posChange === undefined || posChange === 0
+            ? ''
+            : posChange > 0
+              ? ` <span class="growth-up">▲ ${posChange}</span>`
+              : ` <span class="growth-down">▼ ${Math.abs(posChange)}</span>`
+        }${item.sold30d ? ` · <span title="Sold in the last 30 days">30d: ${formatNum(item.sold30d)}</span>` : ''}${
+          item.gmv ? ` · <span title="Gross merchandise value">GMV $${formatNum(item.gmv)}</span>` : ''
+        }</div>`
+      : '';
 
     const engagementHtml = isTiktokShop
       ? `<div class="item-engagement">
@@ -198,6 +407,8 @@ function renderItems(items) {
           ${renderProductMetrics(item)}
           ${platformBadgesHtml}
           ${dateHtml}
+          ${posHtml}
+          ${adMetaHtml}
         </div>
         ${engagementHtml}
       </div>`;
@@ -205,13 +416,57 @@ function renderItems(items) {
   feather.replace();
 }
 
-function getStatusBadge(status) {
+/**
+ * `status` is OUR tracking state, not the item's state at the source:
+ *
+ *   new     first time this item was seen
+ *   active  seen again in the latest crawl for this platform+query
+ *   dropped it was in the previous crawl's results and is not in the latest one
+ *
+ * With maxItems=5 against an advertiser running hundreds of ads, "not in the
+ * latest five" is routine — every crawl drops the previous crawl's five. So
+ * rendering `dropped` as "STOPPED" made a false claim about the ad: run #782's
+ * CurvLife ad showed STOPPED while Meta's own Ad Library said "Hoạt động"
+ * (Active) for the same Library ID 1549200472421776.
+ *
+ * Where the provider reports the real thing — Facebook Ads carries `isActive`
+ * straight from Meta — that is what the badge shows. The tracking state stays
+ * useful but is now labelled for what it actually is.
+ */
+function getStatusBadge(status, item) {
+  if (item && item.isActive !== undefined && item.platform === 'facebook_ads') {
+    return item.isActive
+      ? '<span class="ad-tag active-tag" title="Meta báo quảng cáo này đang chạy">ĐANG CHẠY</span>'
+      : '<span class="ad-tag dropped-tag" title="Meta báo quảng cáo này đã kết thúc">ĐÃ KẾT THÚC</span>';
+  }
   switch (status) {
     case 'active': return '<span class="ad-tag active-tag">ACTIVE</span>';
     case 'new': return '<span class="ad-tag new-tag">NEW</span>';
-    case 'dropped': return '<span class="ad-tag dropped-tag">STOPPED</span>';
+    case 'dropped':
+      return '<span class="ad-tag missing-tag" title="Không xuất hiện trong lần crawl gần nhất. Mỗi lần crawl chỉ lấy một số lượng item giới hạn, nên điều này KHÔNG có nghĩa là sản phẩm/quảng cáo đã dừng.">NGOÀI TOP</span>';
     default: return '';
   }
+}
+
+/**
+ * Thumbnail strip for a post whose media is more than one file — an Instagram
+ * carousel returns each child separately, and a child can be a video while its
+ * siblings are images. Clicking a video child swaps the main player's source so
+ * every media the crawl captured is reachable, not just the cover. Renders
+ * nothing for single media, where the main element already is that media.
+ */
+function renderMediaStrip(item) {
+  const media = Array.isArray(item.mediaItems) ? item.mediaItems.filter((m) => m && (m.imageUrl || m.videoUrl)) : [];
+  if (media.length < 2) return '';
+  const cells = media.map((m) => {
+    const thumb = m.imageUrl || '';
+    const mark = m.videoUrl ? '<span class="media-strip-play">▶</span>' : '';
+    const onclick = m.videoUrl
+      ? ` onclick="const v=this.closest('.col-md-5').querySelector('video'); if(v){v.src='${escapeAttr(m.videoUrl)}';v.play();}" style="cursor:pointer"`
+      : '';
+    return `<div class="media-strip-cell"${onclick}>${thumb ? `<img src="${escapeAttr(thumb)}" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : ''}${mark}</div>`;
+  }).join('');
+  return `<div class="media-strip mt-2" title="${media.length} media">${cells}</div>`;
 }
 
 function renderGrowth(growth) {
@@ -261,7 +516,7 @@ async function showItemDetail(itemUid) {
 
     document.getElementById('item-modal-title').innerHTML = `
       ${config?.icon || '🔗'} ${escapeHtml(latest.title || 'Untitled')}
-      ${getStatusBadge(latest.status)}
+      ${getStatusBadge(latest.status, latest)}
     `;
 
     // Timeline chart data
@@ -270,13 +525,20 @@ async function showItemDetail(itemUid) {
 
     document.getElementById('item-modal-body').innerHTML = `
       <div class="row g-3">
-        ${latest.image ? `<div class="col-md-5"><img src="${escapeAttr(latest.image)}" class="w-100 rounded" style="max-height:300px;object-fit:cover" referrerpolicy="no-referrer" onerror="this.parentElement.style.display='none'"></div>` : ''}
+        ${latest.videoUrl
+          ? `<div class="col-md-5">
+               <video src="${escapeAttr(latest.videoUrl)}" class="w-100 rounded" style="max-height:300px;object-fit:cover;background:#000" controls playsinline preload="metadata"${latest.image ? ` poster="${escapeAttr(latest.image)}"` : ''}></video>
+               ${renderMediaStrip(latest)}
+             </div>`
+          : latest.image
+            ? `<div class="col-md-5"><img src="${escapeAttr(latest.image)}" class="w-100 rounded" style="max-height:300px;object-fit:cover" referrerpolicy="no-referrer" onerror="this.parentElement.style.display='none'">${renderMediaStrip(latest)}</div>`
+            : ''}
         <div class="${latest.image ? 'col-md-7' : 'col-12'}">
           <div class="mb-2">
             <span class="badge bg-primary me-1">${config?.displayName || latest.platform}</span>
             ${latest.subreddit ? `<span class="badge bg-danger-subtle text-danger border border-danger-subtle me-1">r/${escapeHtml(latest.subreddit)}</span>` : ''}
             ${latest.author ? `<span class="badge bg-light text-dark">${latest.platform === 'reddit' ? 'u/' : ''}${escapeHtml(latest.author.replace(/^u\//, ''))}</span>` : ''}
-            ${getStatusBadge(latest.status)}
+            ${getStatusBadge(latest.status, latest)}
           </div>
           <h6 class="fw-bold">${escapeHtml(latest.title)}</h6>
           ${latest.price > 0 ? `<p class="fs-4 fw-bold text-success mb-2">$${Number(latest.price).toFixed(2)}</p>` : ''}
@@ -328,6 +590,19 @@ async function showItemDetail(itemUid) {
                 <span class="ms-2">| Trạng thái: <span class="badge ${latest.isActive ? 'bg-success' : 'bg-secondary'}">${latest.isActive ? 'Đang chạy (Active)' : 'Đã kết thúc'}</span></span>
               </div>
               ${latest.cta ? `<div class="mt-2"><span class="fw-bold me-2">🔘 Nút CTA:</span><span class="badge bg-info text-dark">${escapeHtml(latest.cta)}</span></div>` : ''}
+              <div class="mb-2 mt-2">
+                <span class="fw-bold me-2">🌐 Website Đích:</span>
+                ${latest.landingUrl
+                  ? `<a href="${escapeAttr(latest.landingUrl)}" target="_blank" rel="noopener">${escapeHtml(latest.landingUrl)}</a>`
+                  : '<span class="text-muted">—</span>'}
+              </div>
+              <!-- Task 4 additions. Rendered here as well as on the card so the
+                   detail view is not the only place missing them. -->
+              <div class="mb-2"><span class="fw-bold me-2">🧾 Số Lượng Quảng Cáo:</span>${adCountHtml(latest)}</div>
+              <div class="mb-2"><span class="fw-bold me-2">👁 Views:</span>${Number(latest.views) > 0 ? `<strong>${formatNum(latest.views)}</strong>` : metaNotDisclosed()}</div>
+              <div><span class="fw-bold me-2">🌍 Quốc Gia Đang Chạy:</span>${Array.isArray(latest.activeCountries) && latest.activeCountries.length
+                ? latest.activeCountries.map((c) => `<span class="badge bg-secondary-subtle text-dark me-1">${escapeHtml(c)}</span>`).join('')
+                : metaNotDisclosed()}</div>
             </div>
           ` : ''}
         </div>
@@ -521,6 +796,135 @@ function renderTimeline(history, isEcommerce = false) {
   </div>`;
 }
 
+// ==================== Facebook Ads fields (Task 4) ====================
+
+function adFieldHtml(icon, label, valueHtml) {
+  return `<div><span class="ad-field-label">${icon} ${label}:</span> ${valueHtml}</div>`;
+}
+
+/**
+ * Meta publishes impressions, spend and reach-by-country ONLY for political and
+ * social-issue ads; commercial ads carry none of it. Verified again on run #653
+ * (2026-09-08, dataset 13Zk7clhgR3YTA7CR): all 5 ads returned
+ * impressionsWithIndex={impressionsText:null,impressionsIndex:-1},
+ * targetedOrReachedCountries=[], reachEstimate=null, spend=null.
+ *
+ * So the field is empty at the source, not unimplemented — which is what the
+ * bare "SOURCE_NOT_AVAILABLE" tag failed to convey.
+ */
+function metaNotDisclosed() {
+  return '<span class="src-na" title="Meta chỉ công bố reach và danh sách quốc gia cho quảng cáo có phục vụ trong EU (minh bạch theo DSA). Quảng cáo chỉ chạy ngoài EU không có dữ liệu này ở nguồn.">Chỉ có với QC chạy EU</span>';
+}
+
+/**
+ * `collationCount` counts the ads sharing this creative and text. It is null
+ * when the ad belongs to no collation (collationId is null too) — the Ad
+ * Library shows such an ad on its own, i.e. exactly one ad uses this creative.
+ * That is reported as 1 and marked "riêng lẻ", so the number is never confused
+ * with a real collation of size 1 (which the provider does report, e.g. ad4 of
+ * run #653 returned collationCount=1 with a collationId).
+ */
+function adCountHtml(item) {
+  if (item.adCount === null || item.adCount === undefined || item.adCount === 0) {
+    return '<span class="src-na">chưa lấy được</span>';
+  }
+  return `<strong>${formatNum(item.adCount)}</strong> <span class="ad-field-note">QC của trang này</span>`;
+}
+
+// ==================== Crawl-time filter (Task 3) ====================
+// A "Bộ lọc" button that opens the metrics THIS platform can report, as tick
+// boxes. Ticking one means "crawl the highest by this metric"; ticking two
+// means an item has to satisfy both. There is no direction control here — the
+// crawl is always after the top, which is why only the DB filter has one.
+//
+// The server evaluates these in the pipeline (raw -> normalize -> select ->
+// persist), so a rejected item never reaches product_current at all.
+
+let crawlFilterMetrics = [];
+
+function renderCrawlFilterBoxes(platformName) {
+  const host = document.getElementById('crawl-filter-boxes');
+  const hint = document.getElementById('crawl-filter-hint');
+  if (!host) return;
+
+  crawlFilterMetrics = platformMetrics[platformName] || [];
+  const label = allPlatforms.find((p) => p.name === platformName)?.displayName || platformName;
+
+  if (crawlFilterMetrics.length === 0) {
+    host.innerHTML = '<span class="metric-boxes-empty">Nền tảng này chưa khai báo chỉ số nào.</span>';
+  } else {
+    host.innerHTML = crawlFilterMetrics.map((m) => `
+      <label class="metric-box">
+        <input type="checkbox" value="${escapeAttr(m.name)}" onchange="onCrawlFilterChange()">
+        <span>${escapeHtml(m.label)}</span>
+      </label>`).join('');
+  }
+  if (hint) {
+    hint.innerHTML = `Chỉ số của <strong>${escapeHtml(label)}</strong>. Tích ô nào thì crawl theo tiêu chí đó, lấy cao nhất trước. `
+      + 'Tích nhiều ô = sản phẩm phải đạt tất cả. Bỏ trống = crawl như bình thường.';
+  }
+  updateCrawlFilterSummary();
+  setCrawlFilterMessage('', 'info');
+}
+
+function collectCrawlSelection() {
+  return [...document.querySelectorAll('#crawl-filter-boxes input[type=checkbox]:checked')].map((el) => el.value);
+}
+
+function onCrawlFilterChange() {
+  updateCrawlFilterSummary();
+  setCrawlFilterMessage('', 'info');
+}
+
+// The count rides on the collapsed button, so closing the panel never hides
+// the fact that a filter is armed for the next crawl.
+function updateCrawlFilterSummary() {
+  const el = document.getElementById('crawl-filter-summary');
+  if (!el) return;
+  const selected = collectCrawlSelection();
+  const labelFor = (n) => crawlFilterMetrics.find((m) => m.name === n)?.label || n;
+  el.textContent = selected.length ? `· ${selected.map(labelFor).join(' + ')}` : '';
+  el.classList.toggle('active', selected.length > 0);
+}
+
+function toggleCrawlFilter(forceOpen) {
+  const body = document.getElementById('crawl-filter-body');
+  const toggle = document.getElementById('crawl-filter-toggle');
+  if (!body || !toggle) return;
+  const open = forceOpen === undefined ? body.hidden : forceOpen;
+  body.hidden = !open;
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.classList.toggle('open', open);
+}
+
+function setCrawlFilterMessage(text, kind) {
+  const el = document.getElementById('crawl-filter-msg');
+  if (!el) return;
+  el.className = `crawl-filter-msg metric-result-${kind || 'info'}`;
+  el.innerHTML = text;
+}
+
+// Reads back what the server actually did, rather than re-deriving it in the
+// browser: the run row is the record of truth.
+function renderCrawlFilterOutcome(run) {
+  let options = run?.input_options;
+  if (typeof options === 'string') { try { options = JSON.parse(options); } catch { options = null; } }
+  const outcome = options?.crawlFilter;
+  if (!outcome) return;
+
+  const labelFor = (n) => crawlFilterMetrics.find((m) => m.name === n)?.label || n;
+  const summary = (outcome.metrics || []).map((n) => escapeHtml(labelFor(n))).join(' + ');
+  const rejects = (outcome.rejectedReasons || []).slice(0, 5)
+    .map((r) => `<li>${escapeHtml(r.reasons.join('; '))}</li>`)
+    .join('');
+
+  setCrawlFilterMessage(
+    `Lọc theo <strong>${summary || 'điều kiện'}</strong>: crawl ${outcome.fetched} → giữ <strong>${outcome.kept}</strong>, loại ${outcome.rejected}.`
+    + (rejects ? `<ul class="crawl-filter-rejects">${rejects}</ul>` : ''),
+    outcome.kept > 0 ? 'ok' : 'warn'
+  );
+}
+
 // ==================== Collect ====================
 
 async function showCollectModal() {
@@ -591,6 +995,13 @@ function selectCollectPlatform(name, el) {
   document.getElementById('collect-query').type = queryField.type || 'text';
   document.getElementById('collect-query').placeholder = queryField.placeholder || 'Enter keyword...';
   renderPlatformFields(config, queryField.id);
+  // Task 3: the crawl filter offers the metric set this platform's normalizer
+  // actually produces, so an e-commerce crawl is never asked to filter on
+  // "shares" and a social crawl is never asked to filter on "sold".
+  // Task 3: the filter offers exactly the metrics this platform's normalizer
+  // produces, so an Etsy crawl is never asked to filter on "shares".
+  renderCrawlFilterBoxes(name);
+  toggleCrawlFilter(false);
   document.getElementById('collect-query').focus();
 
   const checklist = document.getElementById('toidispy-checklist');
@@ -672,6 +1083,17 @@ async function startCollect() {
   const maxItems = parseInt(document.getElementById('collect-max').value) || 20;
   const country = document.getElementById('collect-country').value;
 
+  // Task 3: a tick box cannot be half-filled, so there is nothing to refuse
+  // here — the panel just states what is about to be applied.
+  const crawlMetrics = collectCrawlSelection();
+  const crawlMetricLabel = (n) => crawlFilterMetrics.find((m) => m.name === n)?.label || n;
+  setCrawlFilterMessage(
+    crawlMetrics.length
+      ? `Sẽ chỉ lưu item có: ${crawlMetrics.map((n) => escapeHtml(crawlMetricLabel(n))).join(' + ')} (cao nhất trước)`
+      : '',
+    'info'
+  );
+
   const btn = document.getElementById('collect-start');
   const status = document.getElementById('collect-status');
   btn.disabled = true;
@@ -681,6 +1103,9 @@ async function startCollect() {
 
   try {
     const optionsPayload = { maxItems, country, ...getPlatformFieldValues() };
+    // Sent only when the user ticked something, so an untouched panel keeps
+    // the exact previous behaviour (everything crawled is kept).
+    if (crawlMetrics.length > 0) optionsPayload.metrics = crawlMetrics;
     if (collectPlatform === 'toidispy') {
       optionsPayload.section = optionsPayload.section || 'posts';
       optionsPayload.filters = {};
@@ -699,6 +1124,10 @@ async function startCollect() {
           clearInterval(poll);
           if (run.status === 'done') {
             status.innerHTML = `<small class="text-success">✅ Done! ${run.items_count} items (${run.new_count} new, ${run.active_count} active, ${run.dropped_count} dropped)</small>`;
+            // The run records what the crawl filter did (runs.input_options
+            // .crawlFilter). Showing it here answers "why did 5 crawled items
+            // become 2 stored" without opening the database.
+            renderCrawlFilterOutcome(run);
           } else {
             let errorHtml = `❌ ${escapeHtml(run.error_message || 'Failed')}`;
             try {

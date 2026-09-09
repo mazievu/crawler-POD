@@ -26,6 +26,16 @@ const QUOTA_PATTERNS = [
   /payment required/i,
   /usage limit exceeded/i,
   /monthly usage limit/i,
+  // Apify's real wording once an account crosses maxMonthlyUsageUsd is
+  // "Monthly usage hard limit exceeded" — observed on run #100 (tiktok_shop,
+  // 2026-09-07) while /v2/users/me/limits reported monthlyUsageUsd 5.0150
+  // against maxMonthlyUsageUsd 5. The word "hard" sits between "usage" and
+  // "limit", so neither /monthly usage limit/ nor /usage limit exceeded/
+  // matched. The failure was therefore classified as no-error: the drained
+  // token was recorded as successful instead of quarantined, and the pool kept
+  // handing it out while two sibling tokens still held ~$4.50 of budget.
+  /monthly usage\b.*\blimit exceeded/i,
+  /hard limit exceeded/i,
   /monthly cap reached/i,
   /out of credit/i,
   /free usage tier limit/i,

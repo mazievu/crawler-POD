@@ -7,7 +7,7 @@
   <title>Apify Collector — Product Intelligence</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.css">
-  <link rel="stylesheet" href="style.css?v=2.2.0">
+  <link rel="stylesheet" href="style.css?v=3.1.0">
 </head>
 <body>
 
@@ -36,7 +36,7 @@
           <i data-feather="list"></i> Jobs History
         </button>
         <button class="btn-topbar" onclick="showCollectModal()">
-          <i data-feather="plus-circle"></i> Collect
+          <i data-feather="plus-circle"></i> Crawl Now
         </button>
         <button class="btn-topbar" onclick="exportAll()">
           <i data-feather="download"></i> Export
@@ -70,6 +70,50 @@
         </div>
       </div>
 
+      <!-- Row 1b: Metric filter + ranking (server-side).
+           Kept separate from the legacy sort-select above: that one reorders
+           the page already in the browser, this one filters and orders the
+           whole table in SQL, so a match outside the first page is still found. -->
+      <div class="metric-panel" id="metric-panel">
+        <button type="button" class="metric-toggle" id="metric-toggle" aria-expanded="false" onclick="toggleMetricPanel()">
+          <i data-feather="sliders"></i>
+          <span>Lọc &amp; xếp hạng theo chỉ số</span>
+          <span class="metric-toggle-summary" id="metric-toggle-summary"></span>
+          <i data-feather="chevron-down" class="metric-toggle-caret"></i>
+        </button>
+
+        <div class="metric-panel-body" id="metric-panel-body" hidden>
+          <div class="metric-panel-head">
+            <div class="metric-group">
+              <span class="metric-group-label">Nền tảng</span>
+              <select class="filter-select" id="metric-platform" onchange="onMetricPlatformChange()">
+                <!-- populated from /api/item-metrics + /api/platforms -->
+              </select>
+            </div>
+            <div class="metric-panel-actions">
+              <button class="btn btn-outline-secondary btn-sm" onclick="clearMetricFilters()">Xóa lọc</button>
+              <button class="btn btn-primary btn-sm" onclick="applyMetricFilters()">Áp dụng</button>
+            </div>
+          </div>
+
+          <div class="metric-section">
+            <div class="metric-section-title">
+              Chỉ số của nền tảng này <span class="metric-and-tag">tích nhiều ô = khớp tất cả</span>
+            </div>
+            <div class="metric-boxes" id="metric-boxes"><!-- checkboxes injected by app.js --></div>
+          </div>
+
+          <div class="metric-section metric-rank-row">
+            <span class="metric-section-title">Xếp hạng</span>
+            <select class="filter-select" id="metric-sort-dir" onchange="applyMetricFilters()">
+              <option value="desc">Cao → Thấp</option>
+              <option value="asc">Thấp → Cao</option>
+            </select>
+            <span class="metric-result" id="metric-result"></span>
+          </div>
+        </div>
+      </div>
+
       <!-- Row 2: Platform pills (full width wrap, no horizontal scroll) -->
       <div class="filter-pills-row">
         <div class="filter-pills" id="filter-pills">
@@ -86,7 +130,7 @@
     <div class="items-grid" id="items-grid">
       <div class="empty-state">
         <i data-feather="inbox" style="width:48px;height:48px" class="mb-2"></i>
-        <p>No items yet. Click <strong>Collect</strong> to start gathering data.</p>
+        <p>No items yet. Click <strong>Crawl Now</strong> to start gathering data.</p>
       </div>
     </div>
   </div>
@@ -97,7 +141,7 @@
       <div class="modal-content border-0 shadow-lg">
         <div class="modal-header border-0 pb-0">
           <h5 class="modal-title fw-bold">
-            <i data-feather="plus-circle" class="me-2 text-primary"></i>Collect Data
+            <i data-feather="plus-circle" class="me-2 text-primary"></i>Crawl Now
           </h5>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
@@ -148,12 +192,30 @@
               </select>
             </div>
           </div>
+
+          <!-- Task 3: crawl-time filter. Same condition shape as the DB panel
+               above, but evaluated in the pipeline right after normalization,
+               so a rejected item is never written to the database at all. -->
+          <div class="crawl-filter" id="crawl-filter">
+            <button type="button" class="crawl-filter-toggle" id="crawl-filter-toggle" aria-expanded="false" onclick="toggleCrawlFilter()">
+              <i data-feather="filter"></i>
+              <span>Bộ lọc</span>
+              <span class="crawl-filter-summary" id="crawl-filter-summary"></span>
+              <i data-feather="chevron-down" class="crawl-filter-caret"></i>
+            </button>
+
+            <div class="crawl-filter-body" id="crawl-filter-body" hidden>
+              <p class="crawl-filter-hint" id="crawl-filter-hint"></p>
+              <div class="metric-boxes" id="crawl-filter-boxes"></div>
+            </div>
+            <div class="crawl-filter-msg" id="crawl-filter-msg"></div>
+          </div>
         </div>
         <div class="modal-footer border-0">
           <div class="flex-grow-1" id="collect-status"></div>
           <button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
           <button class="btn btn-primary btn-sm" id="collect-start" disabled onclick="startCollect()">
-            <span class="btn-text"><i data-feather="play" class="me-1" style="width:14px"></i>Start</span>
+            <span class="btn-text"><i data-feather="play" class="me-1" style="width:14px"></i>Crawl Now</span>
             <span class="btn-loading spinner-border spinner-border-sm d-none"></span>
           </button>
         </div>
@@ -512,6 +574,6 @@
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
-  <script src="/app.js?v=3.5.0"></script>
+  <script src="/app.js?v=4.2.0"></script>
 </body>
 </html>

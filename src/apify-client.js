@@ -31,6 +31,74 @@ const client = TOKEN ? new ApifyClient({ token: TOKEN }) : null;
 /**
  * Each builder takes { query, maxItems, country } and returns Actor input.
  */
+/**
+ * Hard per-call result caps published by an actor's own input schema.
+ *
+ * A platform listed here cannot be asked for more than this many items in one
+ * actor call, so collecting more means paging. Only platforms whose schema
+ * actually declares a maximum belong here — an entry that is merely assumed
+ * would silently halve throughput.
+ */
+const PRATIKDANI_LIMIT_MAX = 10;
+
+const ACTOR_PAGE_LIMITS = {
+  // inputSchema.properties.limit.maximum is 10, read from this actor's live
+  // build metadata on 2026-09-07. unseenuser/TikTok-Shop-Scraper is absent on
+  // purpose: its maxResults maximum is 5000, so it needs no paging.
+  'pratikdani/tiktok-shop-search-scraper': PRATIKDANI_LIMIT_MAX,
+};
+
+/**
+ * Input builders keyed by ACTOR id, for platforms served by more than one actor
+ * whose input schemas differ. Looked up before the per-platform table below, so
+ * a platform keeps working when its actors disagree about field names.
+ */
+const ACTOR_INPUT_BUILDERS = {
+  /*
+   * memo23/facebook-ads-library-scraper-ppe — the only source verified to
+   * return the two fields apify/facebook-ads-scraper never carries.
+   *
+   * Verified live on 2026-09-08 (run w0EQIRi1TDh0aasWQ, dataset
+   * CD4GGAOYifWYnBow6, "press on nails", DE, 5 ads, $0.05):
+   *
+   *   data_reach...eu_transparency.eu_total_reach    = 2,622,368
+   *   data_reach...eu_transparency.location_audience = [Austria, Germany]
+   *   total_ads_count                                = 75 / 60 / 82 / 10
+   *
+   * `includeAdReach` is what fetches the ad's DETAIL page, where Meta publishes
+   * EU transparency; the search-results endpoint the older actor reads simply
+   * does not carry it. `includeTotalActiveAds` adds the advertiser's live ad
+   * count, a real number rather than collationCount's nullable one.
+   *
+   * RESIDENTIAL proxy is not optional: the first attempt on Apify's datacenter
+   * pool hit Facebook rate limit 1675004 on every request and never produced an
+   * item. With RESIDENTIAL it succeeded on the first try.
+   */
+  'memo23/facebook-ads-library-scraper-ppe': ({ query, maxItems, country }) => ({
+    searchTerms: [query],
+    ...(country ? { searchCountries: [country] } : {}),
+    adActiveStatus: 'active',
+    includeAdReach: true,
+    includeTotalActiveAds: true,
+    maxItems,
+    proxy: {
+      useApifyProxy: true,
+      apifyProxyGroups: ['RESIDENTIAL'],
+      ...(country ? { apifyProxyCountry: country } : {}),
+    },
+  }),
+
+  // unseenuser/TikTok-Shop-Scraper — schema read from its live build metadata
+  // on 2026-09-07: required ["mode"], searchKeywords (array), region (string,
+  // default "US"), maxResults (integer, maximum 5000).
+  'unseenuser/TikTok-Shop-Scraper': ({ query, maxItems, country }) => ({
+    mode: 'shop_search',
+    searchKeywords: [query],
+    region: String(country || 'US').toUpperCase(),
+    maxResults: Math.max(1, Number(maxItems) || 20),
+  }),
+};
+
 const INPUT_BUILDERS = {
   // Facebook Posts/Groups — danek/facebook-search-ppr
   facebook_posts: ({ query, maxItems }) => ({
@@ -65,10 +133,29 @@ const INPUT_BUILDERS = {
     maxItems,
   }),
 
-  // TikTok Shop — clockworks/tiktok-scraper
-  tiktok_shop: ({ query, maxItems }) => ({
-    searchQueries: [query],
-    resultsPerPage: maxItems,
+  /*
+   * TikTok Shop — pratikdani/tiktok-shop-search-scraper.
+   *
+   * Verified against the live actor on 2026-09-07 (not carried over from any
+   * prior report): public, not deprecated, 78,531 runs, and its published input
+   * schema is exactly
+   *     required: ["country_code"]
+   *     country_code (string) · keyword (string) · limit (integer, maximum 10)
+   *     · page (integer, minimum 1)
+   *
+   * `limit` really is capped at 10 by that schema, so a Top-20 job is two calls
+   * (page 1 + page 2), not one call for 20. A separate runtime check confirmed
+   * consecutive pages return disjoint products: page=1 and page=2 at limit=5
+   * shared zero product_ids.
+   *
+   * The previous configuration pointed at clockworks/tiktok-scraper, which is a
+   * TikTok *video* scraper and carries no product, price or sold data at all.
+   */
+  tiktok_shop: ({ query, maxItems, country, page }) => ({
+    country_code: String(country || 'US').toUpperCase(),
+    keyword: query,
+    limit: Math.min(PRATIKDANI_LIMIT_MAX, Math.max(1, Number(maxItems) || PRATIKDANI_LIMIT_MAX)),
+    page: Math.max(1, Number(page) || 1),
   }),
 
   // Pinterest — automation-lab/pinterest-scraper
@@ -171,9 +258,9 @@ async function startActor(actorId, platform, input, apiClient = null) {
     throw new Error(`actorId is missing for platform: ${platform}`);
   }
 
-  const buildInput = INPUT_BUILDERS[platform];
+  const buildInput = ACTOR_INPUT_BUILDERS[actorId] || INPUT_BUILDERS[platform];
   if (!buildInput) {
-    throw new Error(`No input builder for: ${platform}`);
+    throw new Error(`No input builder for: ${platform} (actor ${actorId})`);
   }
 
   const actorInput = buildInput(input);
@@ -256,4 +343,6 @@ module.exports = {
   fetchDatasetItems,
   paginateDatasetItems,
   INPUT_BUILDERS,
+  ACTOR_INPUT_BUILDERS,
+  ACTOR_PAGE_LIMITS,
 };

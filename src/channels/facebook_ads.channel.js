@@ -27,7 +27,25 @@ module.exports = {
   },
 
   backends: [
-    
+    /*
+     * Primary since 2026-09-08. apify/facebook-ads-scraper reads the Ad Library
+     * SEARCH RESULTS endpoint, which carries no reach and no country list for
+     * commercial ads — verified null/[] on 15/15 ads across US, GB and DE.
+     * This actor fetches each ad's DETAIL page, where Meta publishes EU
+     * transparency, and returns eu_total_reach, location_audience and
+     * total_ads_count. The old one stays as fallback: cheaper, and still
+     * correct for everything except those three fields.
+     */
+    {
+      name: 'apify-reach',
+      kind: BACKEND_KIND.APIFY,
+      priority: 10,
+      enabled: true,
+      actorId: 'memo23/facebook-ads-library-scraper-ppe',
+      requiresEnv: ['APIFY_TOKEN'],
+      actorEntitlement: 'unverified',
+      availabilityMode: 'token_plus_actor_entitlement'
+    },
     {
       name: 'apify',
       kind: BACKEND_KIND.APIFY,

@@ -16,7 +16,10 @@ function normalizeItems(normalizerName, items, context) {
     console.warn(`No normalizer found for ${normalizerName}, returning raw items`);
     return items;
   }
-  return items.map(item => normalizer(item, context));
+  // `index` is the position the provider returned the item in. It is the only
+  // ordering signal available for TikTok Shop, whose actor emits no rank field
+  // — see returnPosition in product-listing.js for why that is not called rank.
+  return items.map((item, index) => normalizer(item, { ...context, index }));
 }
 
 module.exports = { normalizeItems };
