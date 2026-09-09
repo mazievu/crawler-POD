@@ -100,8 +100,8 @@ async function recoverOrphanedRuns(database = null, retryPolicy = defaultRetryPo
   const getApifyRunStatus = probeOptions.getApifyRunStatus || defaultGetApifyRunStatus;
 
   const orphaned = typeof db.getRunsByStatus === 'function'
-    ? db.getRunsByStatus('running')
-    : (db.getAllRuns ? db.getAllRuns(100000).filter(r => r.status === 'running') : []);
+    ? await db.getRunsByStatus('running')
+    : (db.getAllRuns ? (await db.getAllRuns(100000)).filter(r => r.status === 'running') : []);
 
   let recoveredCount = 0;
   let failedCount = 0;
@@ -113,7 +113,7 @@ async function recoverOrphanedRuns(database = null, retryPolicy = defaultRetryPo
     if (externalExecution) {
       const { stillActive, checkFailed } = await probeExternalExecution(externalExecution, { isPidAlive, getApifyRunStatus });
       if (stillActive || checkFailed) {
-        db.updateRun(run.id, {
+        await db.updateRun(run.id, {
           status: 'stuck',
           errorMessage: `RECOVERY_FAILED: external execution (${externalExecution.executionClass} ${externalExecution.externalExecutionId}) is ${checkFailed ? 'of unconfirmed status' : 'still active'} after server restart — NOT re-queued to avoid dispatching a duplicate execution. Manual verification required.`
         });
@@ -129,7 +129,7 @@ async function recoverOrphanedRuns(database = null, retryPolicy = defaultRetryPo
     if (retryPolicy.shouldRetry(attempt, new Error('SERVER_RESTART'))) {
       const nextAttempt = attempt + 1;
       const updatedOptions = { ...options, attempt: nextAttempt, executionToken: issueExecutionToken(run.id, nextAttempt) };
-      db.updateRun(run.id, {
+      await db.updateRun(run.id, {
         status: 'queued',
         errorMessage: `Auto-recovered after server restart (attempt ${attempt}/${retryPolicy.maxAttempts})`,
         inputOptions: JSON.stringify(updatedOptions),
@@ -137,7 +137,7 @@ async function recoverOrphanedRuns(database = null, retryPolicy = defaultRetryPo
       });
       recoveredCount++;
     } else {
-      db.updateRun(run.id, {
+      await db.updateRun(run.id, {
         status: 'failed',
         errorMessage: 'SERVER_RESTART_TERMINATED: Run was interrupted during unexpected server shutdown',
         externalExecution: null

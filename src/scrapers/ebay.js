@@ -101,15 +101,11 @@ async function scrape(query, options = {}) {
   if (merged.size < maxItems) {
     if (options.signal?.aborted) throw new Error('ABORTED: execution cancelled');
     try {
-      const Database = require('better-sqlite3');
-      const sqlite = new Database('./data/collector.db', { readonly: true });
-      const existingSnapshots = sqlite.prepare(
-        `SELECT DISTINCT title, url, image, author, price, rating, reviews, sold_count
-         FROM snapshots
-         WHERE platform = 'ebay' AND (author LIKE ? OR query LIKE ? OR title LIKE ?)
-         LIMIT ?`
-      ).all(`%${query}%`, `%${query}%`, `%${query}%`, maxItems - merged.size);
-      sqlite.close();
+      // Reads through the shared Postgres connection rather than opening its
+      // own handle on ./data/collector.db — that SQLite file is archive-only
+      // after the Postgres cutover and must not be touched at runtime.
+      const database = require('../database');
+      const existingSnapshots = await database.getSnapshotsMatchingQuery('ebay', query, maxItems - merged.size);
 
       if (existingSnapshots.length > 0) {
         const cacheItems = existingSnapshots.map(s => ({

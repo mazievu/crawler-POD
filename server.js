@@ -23,13 +23,67 @@ const { getStuckDetector } = require('./src/reliability/stuck-detector');
 const { recoverOrphanedRuns } = require('./src/reliability/restart-recovery');
 const { runManaged } = require('./src/reliability/managed-execution');
 const { abortExecution } = require('./src/reliability/execution-control');
+const {
+  parseConditions, buildSqlOrder, metricsForGroup, ECOM, SOCIAL,
+  PLATFORM_METRICS, metricsForPlatform, parseMetricSelection, buildSqlSelectionOrder,
+} = require('./src/filters/metric-conditions');
 
-// Boot-time crash recovery
-void recoverOrphanedRuns(db).catch((err) => console.error('[RestartRecovery] Boot-time recovery failed:', err.message));
-// Boot-time V2 dual-write divergence repair (Simplification Round #17)
-const v2RepairResult = db.repairPendingV2WriteFailures();
-if (v2RepairResult.attempted > 0) {
-  console.log(`[V2Repair] Repaired ${v2RepairResult.repaired}/${v2RepairResult.attempted} pending V2 dual-write failures.`);
+/**
+ * Reads filter conditions off a query string in the two shapes a browser can
+ * realistically send:
+ *
+ *   conditions=[{"field":"likes","operator":">=","value":1000}]   (JSON array)
+ *   likes_min=1000&shares_min=100&price_max=50                     (flat pairs)
+ *
+ * Both go through the same whitelist, so neither can widen what a filter is
+ * allowed to touch.
+ */
+function parseItemConditions(query = {}) {
+  const raw = [];
+
+  if (query.conditions) {
+    try {
+      const parsed = JSON.parse(query.conditions);
+      if (Array.isArray(parsed)) raw.push(...parsed);
+      else return { conditions: [], invalid: [{ entry: query.conditions, reason: 'conditions_not_an_array' }] };
+    } catch {
+      return { conditions: [], invalid: [{ entry: query.conditions, reason: 'conditions_not_valid_json' }] };
+    }
+  }
+
+  for (const [key, value] of Object.entries(query)) {
+    const match = /^([a-z_]+)_(min|max)$/.exec(key);
+    if (!match) continue;
+    raw.push({ field: match[1], operator: match[2] === 'min' ? '>=' : '<=', value });
+  }
+
+  return parseConditions(raw);
+}
+
+/**
+ * Boot sequence.
+ *
+ * Under better-sqlite3 the schema existed the moment src/database was required,
+ * so recovery and repair could run at module scope. Postgres initialisation is
+ * asynchronous, so it becomes an explicit awaited step that must finish before
+ * the port opens — otherwise the first request could reach an empty database.
+ *
+ * A failure here is fatal on purpose: there is no SQLite fallback, and serving
+ * traffic against an uninitialised database would corrupt state silently.
+ */
+async function bootstrapDatabase() {
+  await db.initDatabase();
+
+  // Boot-time crash recovery
+  void recoverOrphanedRuns(db).catch((err) =>
+    console.error('[RestartRecovery] Boot-time recovery failed:', err.message)
+  );
+
+  // Boot-time V2 dual-write divergence repair (Simplification Round #17)
+  const v2RepairResult = await db.repairPendingV2WriteFailures();
+  if (v2RepairResult.attempted > 0) {
+    console.log(`[V2Repair] Repaired ${v2RepairResult.repaired}/${v2RepairResult.attempted} pending V2 dual-write failures.`);
+  }
 }
 
 const app = express();
@@ -94,12 +148,53 @@ const scheduler = getScheduler({
     })
   }
 });
-scheduler.start();
 const stuckDetector = getStuckDetector({ database: db, queue: scheduler.queue });
-stuckDetector.start();
 const socialScheduler = getSocialScheduler({ scheduler });
-socialScheduler.start();
 
+/**
+ * Everything that touches the database has to wait for the Postgres schema to
+ * exist. Under better-sqlite3 that was guaranteed by require() alone; now it is
+ * this one promise.
+ *
+ * The background pollers are started only after it resolves — otherwise
+ * scheduler.tick()/stuckDetector would start querying tables that are still
+ * being created — and the middleware below holds every HTTP request until the
+ * same promise settles. A failure is fatal: there is no SQLite fallback.
+ */
+const databaseReady = bootstrapDatabase().then(
+  () => {
+    scheduler.start();
+    stuckDetector.start();
+    socialScheduler.start();
+  },
+  (err) => {
+    // node-postgres reports a refused connection as an AggregateError whose own
+    // .message is empty, which printed a bare "[FATAL] …:" and told nobody
+    // anything. Dig out the real cause and say what to do about it.
+    const causes = [err, ...(Array.isArray(err?.errors) ? err.errors : []), err?.cause].filter(Boolean);
+    const detail =
+      causes.map((e) => e.message).find((m) => m) ||
+      causes.map((e) => e.code).find((c) => c) ||
+      err?.code ||
+      String(err);
+
+    console.error('[FATAL] PostgreSQL initialisation failed — refusing to serve.');
+    console.error(`        cause: ${detail}`);
+    if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|timeout/i.test(detail)) {
+      const target = process.env.DATABASE_URL
+        ? 'DATABASE_URL'
+        : `${process.env.PGHOST || 'localhost'}:${process.env.PGPORT || 5432}`;
+      console.error(`        nothing accepted a PostgreSQL connection at ${target}.`);
+      console.error('        Either start a PostgreSQL server and set PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE');
+      console.error('        (or DATABASE_URL), or set PG_MODE=pglite in .env to run the embedded engine.');
+    }
+    process.exit(1);
+  }
+);
+
+app.use(async (req, res, next) => {
+  try { await databaseReady; next(); } catch (err) { next(err); }
+});
 app.use(cors());
 app.use(express.json());
 app.use((req, res, next) => {
@@ -121,31 +216,31 @@ app.get('/api/platforms', (req, res) => {
 
 // Marketplace browser sessions. Only opaque account metadata is ever returned;
 // the encrypted browser storage state stays server-side for captures.
-app.get('/api/marketplace-accounts', (req, res) => {
+app.get('/api/marketplace-accounts', async (req, res) => {
   try {
     if (!req.query.platform) return res.status(400).json({ error: 'platform is required' });
-    res.json(db.getMarketplaceAccounts(req.query.platform));
+    res.json(await db.getMarketplaceAccounts(req.query.platform));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/marketplace-accounts', (req, res) => {
+app.post('/api/marketplace-accounts', async (req, res) => {
   try {
-    const account = db.createMarketplaceAccount(req.body || {});
+    const account = await db.createMarketplaceAccount(req.body || {});
     res.status(201).json(account);
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.put('/api/marketplace-accounts/:id/proxy', (req, res) => {
+app.put('/api/marketplace-accounts/:id/proxy', async (req, res) => {
   try {
-    const account = db.assignMarketplaceAccountProxy(Number(req.params.id), req.body?.proxyId ?? null);
+    const account = await db.assignMarketplaceAccountProxy(Number(req.params.id), req.body?.proxyId ?? null);
     if (!account) return res.status(404).json({ error: 'Marketplace account not found' });
     res.json(account);
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.delete('/api/marketplace-accounts/:id', (req, res) => {
+app.delete('/api/marketplace-accounts/:id', async (req, res) => {
   try {
-    const deleted = db.deleteMarketplaceAccount(Number(req.params.id));
+    const deleted = await db.deleteMarketplaceAccount(Number(req.params.id));
     if (!deleted) return res.status(404).json({ error: 'Marketplace account not found' });
     res.json({ success: true });
   } catch (err) { res.status(400).json({ error: err.message }); }
@@ -153,19 +248,19 @@ app.delete('/api/marketplace-accounts/:id', (req, res) => {
 
 // SOCKS5 proxy profiles are encrypted at rest. List responses deliberately
 // omit credentials, and a proxy is only resolved when an account captures.
-app.get('/api/marketplace-proxies', (req, res) => {
-  try { res.json(db.getMarketplaceProxies()); }
+app.get('/api/marketplace-proxies', async (req, res) => {
+  try { res.json(await db.getMarketplaceProxies()); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/marketplace-proxies', (req, res) => {
-  try { res.status(201).json(db.createMarketplaceProxy(req.body || {})); }
+app.post('/api/marketplace-proxies', async (req, res) => {
+  try { res.status(201).json(await db.createMarketplaceProxy(req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.delete('/api/marketplace-proxies/:id', (req, res) => {
+app.delete('/api/marketplace-proxies/:id', async (req, res) => {
   try {
-    const deleted = db.deleteMarketplaceProxy(Number(req.params.id));
+    const deleted = await db.deleteMarketplaceProxy(Number(req.params.id));
     if (!deleted) return res.status(404).json({ error: 'Proxy profile not found' });
     res.json({ success: true });
   } catch (err) { res.status(400).json({ error: err.message }); }
@@ -182,7 +277,7 @@ app.post('/api/marketplace-login-sessions', async (req, res) => {
 app.post('/api/marketplace-login-sessions/:id/complete', async (req, res) => {
   try {
     const result = await marketplaceLoginManager.complete(req.params.id);
-    const account = db.createMarketplaceAccount({
+    const account = await db.createMarketplaceAccount({
       platform: result.platform,
       label: req.body?.label,
       storageState: result.storageState,
@@ -199,15 +294,15 @@ app.delete('/api/marketplace-login-sessions/:id', async (req, res) => {
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.get('/api/html-captures', (req, res) => {
+app.get('/api/html-captures', async (req, res) => {
   try {
-    res.json(db.getMarketplaceCaptures({ platform: req.query.platform || null, limit: req.query.limit }));
+    res.json(await db.getMarketplaceCaptures({ platform: req.query.platform || null, limit: req.query.limit }));
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.get('/api/html-captures/:id', (req, res) => {
+app.get('/api/html-captures/:id', async (req, res) => {
   try {
-    const capture = db.getMarketplaceCapture(Number(req.params.id));
+    const capture = await db.getMarketplaceCapture(Number(req.params.id));
     if (!capture) return res.status(404).json({ error: 'HTML capture not found' });
     res.json(capture);
   } catch (err) { res.status(400).json({ error: err.message }); }
@@ -217,7 +312,7 @@ async function runMarketplaceCapture(payload, assertOwner = () => {}) {
   const { platform, url, accountId, variantMode, maxVariants } = payload || {};
   let normalizedAccountId = null;
   if (accountId) {
-    const account = db.getMarketplaceAccounts(platform).find((candidate) => candidate.id === Number(accountId));
+    const account = (await db.getMarketplaceAccounts(platform)).find((candidate) => candidate.id === Number(accountId));
     if (!account) {
       const error = new Error('Marketplace account not found for this platform');
       error.status = 404;
@@ -225,7 +320,7 @@ async function runMarketplaceCapture(payload, assertOwner = () => {}) {
     }
     normalizedAccountId = Number(accountId);
   }
-  const cachedCapture = db.getCachedMarketplaceCapture({ platform, url, accountId: normalizedAccountId, variantMode, maxVariants });
+  const cachedCapture = await db.getCachedMarketplaceCapture({ platform, url, accountId: normalizedAccountId, variantMode, maxVariants });
   if (cachedCapture) {
     return {
       capture: cachedCapture,
@@ -239,9 +334,9 @@ async function runMarketplaceCapture(payload, assertOwner = () => {}) {
   let storageState = null;
   let proxy = null;
   if (normalizedAccountId) {
-    const account = db.getMarketplaceAccounts(platform).find((candidate) => candidate.id === normalizedAccountId);
-    storageState = JSON.parse(db.getMarketplaceStorageState(account.id));
-    proxy = db.getMarketplaceProxyUrl(account.proxy_id);
+    const account = (await db.getMarketplaceAccounts(platform)).find((candidate) => candidate.id === normalizedAccountId);
+    storageState = JSON.parse(await db.getMarketplaceStorageState(account.id));
+    proxy = await db.getMarketplaceProxyUrl(account.proxy_id);
   }
   const { captureMarketplaceHtml } = require('./src/marketplaces/html-capture');
   const result = await captureMarketplaceHtml({ platform, url, storageState, accountId: normalizedAccountId, proxy, variantMode, maxVariants });
@@ -251,8 +346,8 @@ async function runMarketplaceCapture(payload, assertOwner = () => {}) {
   // §7: COLLECT (captureMarketplaceHtml above) -> ASSERT OWNER -> PERSIST.
   // A stale execution whose lease was revoked WHILE the browser capture was
   // running must never reach the write below.
-  assertOwner('PRE_CAPTURE_PERSIST');
-  const capture = db.createMarketplaceCapture({
+  await assertOwner('PRE_CAPTURE_PERSIST');
+  const capture = await db.createMarketplaceCapture({
     platform,
     accountId: normalizedAccountId,
     url,
@@ -269,10 +364,10 @@ async function discoverScheduledEtsyListings(keyword, { limit, accountId } = {})
   let storageState = null;
   let proxy = null;
   if (normalizedAccountId != null) {
-    const account = db.getMarketplaceAccounts('etsy').find((candidate) => candidate.id === normalizedAccountId);
+    const account = (await db.getMarketplaceAccounts('etsy')).find((candidate) => candidate.id === normalizedAccountId);
     if (account) {
-      storageState = JSON.parse(db.getMarketplaceStorageState(account.id));
-      proxy = db.getMarketplaceProxyUrl(account.proxy_id);
+      storageState = JSON.parse(await db.getMarketplaceStorageState(account.id));
+      proxy = await db.getMarketplaceProxyUrl(account.proxy_id);
     }
   }
 
@@ -307,7 +402,7 @@ async function discoverScheduledEtsyListings(keyword, { limit, accountId } = {})
  * `marketplace_discovery` job, so it existed but was dead code.
  */
 async function submitMarketplaceDiscoveryViaScheduler(keyword, { limit, accountId } = {}) {
-  const run = db.createRun({
+  const run = await db.createRun({
     platform: 'etsy',
     query: keyword,
     maxItems: limit || 30,
@@ -324,20 +419,20 @@ async function submitMarketplaceDiscoveryViaScheduler(keyword, { limit, accountI
   return snapshotObj.result || { items: [] };
 }
 
-const marketplaceCaptureJobs = createCaptureJobQueue({ runCapture: (payload) => submitMarketplaceCaptureViaScheduler(payload) });
+const marketplaceCaptureJobs = createCaptureJobQueue({ runCapture: async (payload) => await submitMarketplaceCaptureViaScheduler(payload) });
 const marketplaceCaptureScheduler = createMarketplaceCaptureScheduler({
   discover: submitMarketplaceDiscoveryViaScheduler,
   // Each discovered listing is submitted as its own marketplace_capture job
   // through the shared Resource Scheduler (Simplification Round #8/#12) —
   // not a direct browser call — so BROWSER pool/RAM admission applies per item.
-  capture: (payload) => submitMarketplaceCaptureViaScheduler(payload),
+  capture: async (payload) => await submitMarketplaceCaptureViaScheduler(payload),
   // §3: claimToken threaded through so a stale attempt's completion write is
   // rejected at the DB layer (claim_token IS @claimToken), never silently
   // clearing a newer claim or advancing next_run_at out from under it.
-  markComplete: (id, summary, claimToken) => db.completeMarketplaceCaptureSchedule(id, summary, new Date(), claimToken),
+  markComplete: async (id, summary, claimToken) => await db.completeMarketplaceCaptureSchedule(id, summary, new Date(), claimToken),
   // §4: claimToken is passed through from run(schedule, claimToken) below —
   // renewal without the matching token is a guaranteed no-op by design.
-  renewClaim: (id, claimToken) => db.renewMarketplaceCaptureScheduleClaim(id, 5 * 60 * 1000, claimToken),
+  renewClaim: async (id, claimToken) => await db.renewMarketplaceCaptureScheduleClaim(id, 5 * 60 * 1000, claimToken),
 });
 let marketplaceScheduleTickActive = false;
 
@@ -366,8 +461,12 @@ async function dispatchScheduleExecution(schedule, claimToken) {
     const platform = schedule.platform;
     const query = schedule.keyword;
     const maxItems = schedule.max_listings || 30;
-    const normalizedOptions = buildCollectionOptions(platform, { maxItems });
-    const run = db.createRun({ platform, query, maxItems, country: null, options: normalizedOptions });
+    // Task 5.2: the schedule's market has to reach the crawl. TikTok Shop's
+    // actor takes country_code as a required input, so a US Top-20 job that
+    // dropped it here would silently crawl the actor's default market.
+    const country = schedule.country || null;
+    const normalizedOptions = buildCollectionOptions(platform, { maxItems, country });
+    const run = await db.createRun({ platform, query, maxItems, country, options: normalizedOptions });
 
     await scheduler.submitRun(run);
     const finishedRun = await scheduler.waitForCompletion(run.id, { timeoutMs: 180000 });
@@ -381,7 +480,7 @@ async function dispatchScheduleExecution(schedule, claimToken) {
       error: finishedRun.error || null
     };
 
-    db.completeMarketplaceCaptureSchedule(schedule.id, summary, new Date(), claimToken);
+    await db.completeMarketplaceCaptureSchedule(schedule.id, summary, new Date(), claimToken);
     return summary;
   } catch (err) {
     const summary = {
@@ -391,7 +490,7 @@ async function dispatchScheduleExecution(schedule, claimToken) {
       failed: 1,
       error: err.message
     };
-    db.completeMarketplaceCaptureSchedule(schedule.id, summary, new Date(), claimToken);
+    await db.completeMarketplaceCaptureSchedule(schedule.id, summary, new Date(), claimToken);
     throw err;
   }
 }
@@ -400,15 +499,15 @@ async function runDueMarketplaceSchedules() {
   if (marketplaceScheduleTickActive) return;
   marketplaceScheduleTickActive = true;
   try {
-    const dueSchedules = db.getDueMarketplaceCaptureSchedules();
+    const dueSchedules = await db.getDueMarketplaceCaptureSchedules();
     for (const schedule of dueSchedules) {
-      const claimToken = db.claimMarketplaceCaptureSchedule(schedule.id);
+      const claimToken = await db.claimMarketplaceCaptureSchedule(schedule.id);
       if (!claimToken) {
         continue; // Already claimed by a still-active execution
       }
-      dispatchScheduleExecution(schedule, claimToken).catch((schErr) => {
+      await dispatchScheduleExecution(schedule, claimToken).catch(async (schErr) => {
         console.error(`[Marketplace schedules] Error running schedule #${schedule.id} (${schedule.platform}:${schedule.keyword}):`, schErr.message);
-        db.releaseMarketplaceCaptureScheduleClaim(schedule.id, claimToken);
+        await db.releaseMarketplaceCaptureScheduleClaim(schedule.id, claimToken);
       });
     }
   } catch (error) {
@@ -419,19 +518,19 @@ async function runDueMarketplaceSchedules() {
 }
 setInterval(() => { void runDueMarketplaceSchedules(); }, 60 * 1000).unref();
 
-app.get('/api/marketplace-capture-schedules', (req, res) => {
-  try { res.json(db.getMarketplaceCaptureSchedules()); }
+app.get('/api/marketplace-capture-schedules', async (req, res) => {
+  try { res.json(await db.getMarketplaceCaptureSchedules()); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/marketplace-capture-schedules', (req, res) => {
-  try { res.status(201).json(db.createMarketplaceCaptureSchedule(req.body || {})); }
+app.post('/api/marketplace-capture-schedules', async (req, res) => {
+  try { res.status(201).json(await db.createMarketplaceCaptureSchedule(req.body || {})); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.post('/api/marketplace-capture-schedules/:id/toggle', (req, res) => {
+app.post('/api/marketplace-capture-schedules/:id/toggle', async (req, res) => {
   try {
-    const updated = db.toggleMarketplaceCaptureSchedule(req.params.id);
+    const updated = await db.toggleMarketplaceCaptureSchedule(req.params.id);
     if (!updated) return res.status(404).json({ error: 'Schedule not found' });
     res.json(updated);
   } catch (err) { res.status(400).json({ error: err.message }); }
@@ -439,28 +538,28 @@ app.post('/api/marketplace-capture-schedules/:id/toggle', (req, res) => {
 
 app.post('/api/marketplace-capture-schedules/:id/run-now', async (req, res) => {
   try {
-    const schedule = db.getMarketplaceCaptureSchedules().find((s) => s.id === Number(req.params.id));
+    const schedule = (await db.getMarketplaceCaptureSchedules()).find((s) => s.id === Number(req.params.id));
     if (!schedule) return res.status(404).json({ error: 'Schedule not found' });
-    const claimToken = db.claimMarketplaceCaptureSchedule(schedule.id);
+    const claimToken = await db.claimMarketplaceCaptureSchedule(schedule.id);
     if (!claimToken) return res.status(409).json({ error: 'Schedule is already running' });
 
-    dispatchScheduleExecution(schedule, claimToken).catch((err) => {
+    await dispatchScheduleExecution(schedule, claimToken).catch(async (err) => {
       console.error(`[Marketplace schedules] Manual run error for #${schedule.id}:`, err.message);
-      db.releaseMarketplaceCaptureScheduleClaim(schedule.id, claimToken);
+      await db.releaseMarketplaceCaptureScheduleClaim(schedule.id, claimToken);
     });
 
     res.json({ success: true, message: 'Schedule execution triggered' });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.get('/api/marketplace-capture-schedules/:id/runs', (req, res) => {
-  try { res.json(db.getMarketplaceCaptureScheduleRuns(req.params.id, req.query.limit)); }
+app.get('/api/marketplace-capture-schedules/:id/runs', async (req, res) => {
+  try { res.json(await db.getMarketplaceCaptureScheduleRuns(req.params.id, req.query.limit)); }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-app.delete('/api/marketplace-capture-schedules/:id', (req, res) => {
+app.delete('/api/marketplace-capture-schedules/:id', async (req, res) => {
   try {
-    if (!db.deleteMarketplaceCaptureSchedule(req.params.id)) return res.status(404).json({ error: 'Schedule not found' });
+    if (!await db.deleteMarketplaceCaptureSchedule(req.params.id)) return res.status(404).json({ error: 'Schedule not found' });
     res.json({ success: true });
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
@@ -473,7 +572,7 @@ app.get('/api/html-capture-jobs/:id', (req, res) => {
 
 /** Submits a marketplace capture through the shared Resource Scheduler (BROWSER pool) instead of launching a browser directly. */
 async function submitMarketplaceCaptureViaScheduler(payload) {
-  const run = db.createRun({ platform: payload.platform || 'marketplace', query: payload.url || 'capture', maxItems: 1, options: { jobKind: 'marketplace_capture', ...payload } });
+  const run = await db.createRun({ platform: payload.platform || 'marketplace', query: payload.url || 'capture', maxItems: 1, options: { jobKind: 'marketplace_capture', ...payload } });
   await scheduler.submitRun(run);
   const finished = await scheduler.waitForCompletion(run.id, { pollMs: 150, timeoutMs: 180000 });
   const snapshotObj = JSON.parse(finished.health_snapshot || '{}');
@@ -503,7 +602,7 @@ app.post('/api/user-journey/run', async (req, res) => {
     // Goes through the shared Resource Scheduler (BROWSER pool) instead of
     // launching Playwright directly — this is real browser automation and
     // must be admission-controlled like every other crawl workload.
-    const run = db.createRun({
+    const run = await db.createRun({
       platform: 'user-journey',
       query: body.startUrl || body.url || body.query || 'journey',
       maxItems: 1,
@@ -534,19 +633,19 @@ app.get('/api/doctor', async (req, res) => {
 });
 
 // Runs
-app.get('/api/runs', (req, res) => {
-  try { res.json(db.getAllRuns(100)); }
+app.get('/api/runs', async (req, res) => {
+  try { res.json(await db.getAllRuns(100)); }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/runs/:id', (req, res) => {
+app.get('/api/runs/:id', async (req, res) => {
   try {
-    const run = db.getRunById(parseInt(req.params.id, 10));
+    const run = await db.getRunById(parseInt(req.params.id, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
     // §6.2: getRunItems() reads legacy `snapshots` or runs.result_items_json
     // depending on READ_MODEL_V2 — this route never depends on legacy rows
     // existing for a post-cutover Run.
-    run.snapshots = db.getRunItems(run.id);
+    run.snapshots = await db.getRunItems(run.id);
     res.json(run);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -577,7 +676,7 @@ app.post('/api/runs', async (req, res) => {
 
     const maxItems = normalizedOptions.maxItems;
     const country = normalizedOptions.country || null;
-    const run = db.createRun({ platform, query, maxItems, country, options: normalizedOptions });
+    const run = await db.createRun({ platform, query, maxItems, country, options: normalizedOptions });
 
     // Submit to Resource-Aware Scheduler with queue admission control
     scheduler.submitRun(run).catch(console.error);
@@ -589,17 +688,17 @@ app.get('/api/system/info', (req, res) => {
   res.json(getSystemInfo());
 });
 
-app.get('/api/database/health', (req, res) => {
+app.get('/api/database/health', async (req, res) => {
   try {
-    res.json(db.getDatabaseHealth());
+    res.json(await db.getDatabaseHealth());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/api/scheduler/status', (req, res) => {
+app.get('/api/scheduler/status', async (req, res) => {
   try {
-    res.json(scheduler.getStatus());
+    res.json(await scheduler.getStatus());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -623,9 +722,9 @@ app.get('/api/apify-tokens/status', (req, res) => {
   }
 });
 
-app.delete('/api/runs/:id', (req, res) => {
+app.delete('/api/runs/:id', async (req, res) => {
   try {
-    const run = db.getRunById(parseInt(req.params.id, 10));
+    const run = await db.getRunById(parseInt(req.params.id, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
 
     // UI-BUG-03: this is the only "Cancel/Stop" affordance the UI has for an
@@ -641,7 +740,7 @@ app.delete('/api/runs/:id', (req, res) => {
       } catch (_e) { /* best-effort abort; deletion still proceeds below */ }
     }
 
-    db.deleteRun(run.id);
+    await db.deleteRun(run.id);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -653,11 +752,11 @@ app.delete('/api/runs/:id', (req, res) => {
 // regardless), so flipping this flag back is always safe and instant.
 const READ_MODEL_V2 = process.env.READ_MODEL_V2 === 'true';
 
-function mapProductCurrentToItemShape(p) {
+async function mapProductCurrentToItemShape(p) {
   let richMeta = {};
   try {
     if (p.last_run_id) {
-      const run = db.getRunById(p.last_run_id);
+      const run = await db.getRunById(p.last_run_id);
       if (run?.result_items_json) {
         const items = JSON.parse(run.result_items_json);
         const match = items.find(it => it.item_uid === p.item_uid);
@@ -670,7 +769,17 @@ function mapProductCurrentToItemShape(p) {
             fanpageLikes: match.fanpageLikes || p.current_likes || 0,
             cta: match.cta || '',
             landingUrl: match.landingUrl || '',
-            subreddit: match.subreddit || ''
+            subreddit: match.subreddit || '',
+            // mediaItems is the per-media breakdown (carousel children, each
+            // with its own type/image/video). It lives only in the run's packed
+            // items, never as a product_current column, so this lookup is the
+            // only place it can come from.
+            mediaItems: Array.isArray(match.mediaItems) ? match.mediaItems : [],
+            mediaCount: match.mediaCount || 0,
+            // Task 4: adCount stays null when the provider reported none — the
+            // UI renders that as SOURCE_NOT_AVAILABLE rather than as 0 ads.
+            adCount: match.adCount === undefined ? null : match.adCount,
+            activeCountries: Array.isArray(match.activeCountries) ? match.activeCountries : []
           };
         }
       }
@@ -685,6 +794,17 @@ function mapProductCurrentToItemShape(p) {
     url: p.url,
     image: p.image,
     author: p.author,
+    videoUrl: p.video_url || '',
+    mediaType: p.media_type || '',
+    // Task 5. return_position is the provider's returned order, not a rank —
+    // see product-listing.js. delta is positive when the product moved UP.
+    returnPosition: p.return_position ?? null,
+    prevReturnPosition: p.prev_return_position ?? null,
+    returnPositionChange: p.delta_return_position ?? null,
+    sold30d: p.sold_30d ?? null,
+    gmv: p.gmv ?? null,
+    shopUrl: p.shop_url || '',
+    country: p.country || '',
     price: p.current_price,
     prev_price: p.prev_price,
     rating: p.current_rating,
@@ -714,20 +834,94 @@ function mapProductCurrentToItemShape(p) {
   };
 }
 
-app.get('/api/items', (req, res) => {
+// Task 2: the UI builds its two filter panels from this rather than hardcoding
+// a metric list that could drift from what the server actually accepts.
+app.get('/api/item-metrics', (req, res) => {
+  // `platforms` is what both filter panels are built from: a platform's tick
+  // boxes must be the metrics that platform can actually report, so the UI
+  // never offers "shares" on an Etsy crawl. `groups` stays for the older
+  // threshold-style API surface.
+  const platforms = {};
+  for (const name of Object.keys(PLATFORM_METRICS)) platforms[name] = metricsForPlatform(name);
+
+  res.json({
+    platforms,
+    groups: [
+      { key: ECOM, label: 'E-COM', metrics: metricsForGroup(ECOM) },
+      { key: SOCIAL, label: 'SOCIAL', metrics: metricsForGroup(SOCIAL) },
+    ],
+    operators: ['>=', '>', '<=', '<', '=', '!='],
+    combine: 'AND',
+  });
+});
+
+app.get('/api/items', async (req, res) => {
   try {
     if (READ_MODEL_V2) {
-      const current = db.getProductCurrent({ platform: req.query.platform || null, search: req.query.search || null, limit: req.query.limit ? Number(req.query.limit) : 100 });
-      return res.json(current.map(mapProductCurrentToItemShape));
+      // Task 2. FILTER decides membership, RANKING decides order — two separate
+      // inputs, both resolved in SQL so they apply to the whole table rather
+      // than to whatever the LIMIT happened to return.
+      //
+      //   ?conditions=[{"field":"likes","operator":">=","value":1000},
+      //                {"field":"shares","operator":">=","value":100}]
+      //   ?sort=likes&dir=desc
+      //
+      // Multiple conditions are ANDed by metric-conditions.evaluate/buildSql.
+      let { conditions, invalid } = parseItemConditions(req.query);
+      let orderBy = buildSqlOrder(req.query.sort, req.query.dir);
+
+      // Ticked-metric filter (?metrics=likes,comments&dir=desc). Ticking a
+      // metric means "only items that report it, ranked by it" — there is no
+      // threshold to type. It reuses the same whitelisted-column SQL path as
+      // `conditions` by expressing each tick as "> 0", so nothing new reaches
+      // the database.
+      if (req.query.metrics !== undefined) {
+        const { selected, invalid: badMetrics } = parseMetricSelection(req.query.metrics);
+        if (badMetrics.length) {
+          return res.status(400).json({
+            error: 'Unknown metric(s)',
+            invalid: badMetrics,
+            hint: `metric must be one of: ${Object.keys(require('./src/filters/metric-conditions').METRICS).join(', ')}`,
+          });
+        }
+        if (selected.length) {
+          conditions = conditions.concat(selected.map((field) => ({ field, operator: 'gt', value: 0 })));
+          orderBy = buildSqlSelectionOrder(selected, req.query.dir) || orderBy;
+        }
+      }
+
+      if (invalid.length) {
+        return res.status(400).json({
+          error: 'Unusable filter condition(s)',
+          invalid,
+          hint: 'field must be one of the known metrics, operator one of >= > <= < = !=, value numeric',
+        });
+      }
+
+      const current = await db.getProductCurrent({
+        platform: req.query.platform || null,
+        search: req.query.search || null,
+        limit: req.query.limit ? Number(req.query.limit) : 100,
+        conditions,
+        orderBy,
+      });
+      // mapProductCurrentToItemShape is async (it reads the run's stored items
+      // for rich metadata), so this map yields Promises. Without Promise.all,
+      // res.json() serialises each one as {} and the dashboard shows a full
+      // grid of "UNDEFINED / No title / No image" cards.
+      return res.json(await Promise.all(current.map(mapProductCurrentToItemShape)));
     }
 
-    const snapshots = db.getLatestSnapshots({
+    const snapshots = await db.getLatestSnapshots({
       search: req.query.search,
       platform: req.query.platform,
       limit: req.query.limit,
     });
     // Add growth data
-    const items = snapshots.map((s) => {
+    // Promise.all: the callback awaits per-item history, so without it this
+    // array holds Promises and res.json() serialises each one as an empty
+    // object - which is what the dashboard rendered as No title / UNDEFINED.
+    const items = await Promise.all(snapshots.map(async (s) => {
       let rawMeta = {};
       if (s.raw_data) {
         try {
@@ -746,7 +940,7 @@ app.get('/api/items', (req, res) => {
 
       let growth = { likes: 0, comments: 0, shares: 0, views: 0, soldCount: 0, reviews: 0, priceChange: 0 };
       if (s.prev_snapshot_id) {
-        const prev = db.getSnapshotHistory(s.item_uid);
+        const prev = await db.getSnapshotHistory(s.item_uid);
         if (prev.length >= 2) {
           const older = prev[prev.length - 2];
           growth = {
@@ -761,21 +955,21 @@ app.get('/api/items', (req, res) => {
         }
       }
       return { ...s, ...rawMeta, growth };
-    });
+    }));
     res.json(items);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Item history (timeline)
-app.get('/api/items/:uid/history', (req, res) => {
+app.get('/api/items/:uid/history', async (req, res) => {
   try {
     const uid = decodeURIComponent(req.params.uid);
     if (READ_MODEL_V2) {
-      const history = db.getProductHistoryWithMetadata(uid, 365);
+      const history = await db.getProductHistoryWithMetadata(uid, 365);
       if (history && history.length > 0) {
         return res.json(history);
       }
-      const current = db.getProductCurrentByUid(uid);
+      const current = await db.getProductCurrentByUid(uid);
       if (current) {
         return res.json([{
           item_uid: current.item_uid,
@@ -798,52 +992,52 @@ app.get('/api/items/:uid/history', (req, res) => {
       }
       return res.json([]);
     }
-    const history = db.getSnapshotHistory(uid);
+    const history = await db.getSnapshotHistory(uid);
     res.json(history);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Delete single item by UID
-app.delete('/api/items/:uid', (req, res) => {
+app.delete('/api/items/:uid', async (req, res) => {
   try {
     const uid = decodeURIComponent(req.params.uid);
-    const result = db.deleteItem(uid);
+    const result = await db.deleteItem(uid);
     res.json({ success: true, message: `Item ${uid} deleted`, changes: result.changes });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Delete all items (or filtered by platform/query)
-app.delete('/api/items', (req, res) => {
+app.delete('/api/items', async (req, res) => {
   try {
     const { platform, query } = req.query;
-    const result = db.deleteAllItems({ platform, query });
+    const result = await db.deleteAllItems({ platform, query });
     res.json({ success: true, message: 'All items deleted successfully', changes: result.changes });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/database/parity', (req, res) => {
+app.get('/api/database/parity', async (req, res) => {
   try {
-    res.json({ readModelV2Enabled: READ_MODEL_V2, ...db.checkV2Parity() });
+    res.json({ readModelV2Enabled: READ_MODEL_V2, ...await db.checkV2Parity() });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Stats
-app.get('/api/stats', (req, res) => {
+app.get('/api/stats', async (req, res) => {
   try {
-    const stats = db.getStats();
-    const runStats = db.getRunStats();
+    const stats = await db.getStats();
+    const runStats = await db.getRunStats();
     res.json({ ...stats, platforms: runStats });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Toidispy import — save scraped items directly
-app.post('/api/toidispy/import', (req, res) => {
+app.post('/api/toidispy/import', async (req, res) => {
   try {
     const { query, items } = req.body;
     if (!items || !items.length) return res.status(400).json({ error: 'No items' });
 
     // Create a run
-    const run = db.createRun({ platform: 'toidispy', query: query || 'search', maxItems: items.length });
+    const run = await db.createRun({ platform: 'toidispy', query: query || 'search', maxItems: items.length });
 
     // Convert toidispy format to raw_data
     const rawItems = items.map((item) => ({
@@ -860,8 +1054,8 @@ app.post('/api/toidispy/import', (req, res) => {
       platform: 'facebook',
     }));
 
-    const result = db.insertSnapshots(run.id, 'toidispy', query || 'search', rawItems);
-    db.updateRun(run.id, { status: 'done', ...result });
+    const result = await db.insertSnapshots(run.id, 'toidispy', query || 'search', rawItems);
+    await db.updateRun(run.id, { status: 'done', ...result });
 
     res.json({ runId: run.id, count: items.length, ...result });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -877,7 +1071,7 @@ app.post('/api/toidispy/run', async (req, res) => {
     // Goes through the shared Resource Scheduler (CDP pool + cdp:9222 lock),
     // like every other crawl workload — toidispy already has a real channel
     // entry, so this is the same path as POST /api/runs.
-    const run = db.createRun({ platform: 'toidispy', query: keyword, maxItems: options.maxItems, options });
+    const run = await db.createRun({ platform: 'toidispy', query: keyword, maxItems: options.maxItems, options });
     scheduler.submitRun(run).catch(console.error);
 
     // Return immediately — client polls /api/runs/:id for status (unchanged contract).
@@ -942,13 +1136,13 @@ app.get('/api/toidispy/filters', (req, res) => {
 });
 
 // Export
-app.get('/api/export/:runId', (req, res) => {
+app.get('/api/export/:runId', async (req, res) => {
   try {
-    const run = db.getRunById(parseInt(req.params.runId, 10));
+    const run = await db.getRunById(parseInt(req.params.runId, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
     // §6.2: never depends on legacy `snapshots` existing for a post-cutover Run.
-    const snapshots = db.getRunItems(run.id);
-    const items = snapshots.map((s) => {
+    const snapshots = await db.getRunItems(run.id);
+    const items = await Promise.all(snapshots.map(async (s) => {
       let growth = { soldCount: 0, reviews: 0, likes: 0, priceChange: 0 };
       if (READ_MODEL_V2) {
         // §11 (Final Architecture Closure Round): read growth from the V2
@@ -957,7 +1151,7 @@ app.get('/api/export/:runId', (req, res) => {
         // semantics the legacy branch below used), never from legacy
         // snapshots — a post-cutover Run must not silently degrade to
         // growth=0 just because legacy history stopped growing.
-        const current = s.item_uid ? db.getProductCurrentByUid(s.item_uid) : null;
+        const current = s.item_uid ? await db.getProductCurrentByUid(s.item_uid) : null;
         if (current) {
           growth = {
             soldCount: current.delta_sold || 0,
@@ -967,7 +1161,7 @@ app.get('/api/export/:runId', (req, res) => {
           };
         }
       } else if (s.prev_snapshot_id || s.item_uid) {
-        const prev = db.getSnapshotHistory(s.item_uid);
+        const prev = await db.getSnapshotHistory(s.item_uid);
         if (prev && prev.length >= 2) {
           const older = prev[prev.length - 2];
           growth = {
@@ -984,7 +1178,7 @@ app.get('/api/export/:runId', (req, res) => {
         comments: s.comments, shares: s.shares, views: s.views, status: s.status,
         createdAt: s.created_at || run.created_at, growth
       };
-    });
+    }));
     
     if (req.query.format === 'csv') {
       const filename = `${run.platform}_${run.query.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.csv`;
@@ -1027,6 +1221,8 @@ process.on('unhandledRejection', (reason) => console.error('[FATAL]', reason));
 
 // ==================== Start ====================
 
+// Database initialisation is kicked off above (see `databaseReady`); requests
+// are held by middleware until it resolves, so the port can open immediately.
 const serverInstance = app.listen(PORT, '0.0.0.0', () => {
   const info = getSystemInfo();
   console.log(`Apify Collector running at http://0.0.0.0:${PORT}`);

@@ -22,7 +22,7 @@ async function main() {
       platform,
       waitForConfirmation: async () => { await prompt.question('Press Enter only after the account page is ready... '); },
     });
-    const account = db.createMarketplaceAccount({ platform, label, storageState });
+    const account = await db.createMarketplaceAccount({ platform, label, storageState });
     console.log(`Saved encrypted ${account.platform} session as "${account.label}" (account #${account.id}).`);
   } finally {
     prompt.close();

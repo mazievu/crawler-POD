@@ -131,18 +131,18 @@ function loadAnalyticsDirectory(directory, sourceLabel = path.basename(directory
   return { files: files.length, shopRows: shops.length, productRows: products.length, records };
 }
 
-function importAnalyticsDirectory({ database, directory, sourceLabel = path.basename(directory) }) {
+async function importAnalyticsDirectory({ database, directory, sourceLabel = path.basename(directory) }) {
   const collection = loadAnalyticsDirectory(directory, sourceLabel);
   if (!collection.records.length) throw new Error(`No Etsy analytics rows found in ${directory}`);
 
   const query = `Etsy analytics import: ${sourceLabel}`;
-  const run = database.createRun({ platform: 'etsy', query, maxItems: collection.records.length });
+  const run = await database.createRun({ platform: 'etsy', query, maxItems: collection.records.length });
   try {
-    const result = database.insertSnapshots(run.id, 'etsy', query, collection.records);
-    database.updateRun(run.id, { status: 'done', ...result });
+    const result = await database.insertSnapshots(run.id, 'etsy', query, collection.records);
+    await database.updateRun(run.id, { status: 'done', ...result });
     return { runId: run.id, ...collection, ...result };
   } catch (error) {
-    database.updateRun(run.id, { status: 'failed', errorMessage: error.message });
+    await database.updateRun(run.id, { status: 'failed', errorMessage: error.message });
     throw error;
   }
 }

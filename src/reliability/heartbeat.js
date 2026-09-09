@@ -83,6 +83,12 @@ class HeartbeatTracker {
 
   maybeFlush() {
     if (Date.now() - this.lastDbFlushAt >= this.dbFlushIntervalMs) {
+      // Claim the flush window BEFORE persisting. persist() is asynchronous
+      // since the PostgreSQL cutover, so it can no longer stamp lastDbFlushAt
+      // itself in time: every progress() arriving before the first write
+      // resolved would still see the old timestamp and start another write,
+      // defeating the throttle and hammering the database.
+      this.lastDbFlushAt = Date.now();
       this.persist();
     }
   }
@@ -118,7 +124,7 @@ class HeartbeatTracker {
     };
   }
 
-  persist() {
+  async persist() {
     try {
       if (!this.db || typeof this.db.updateRun !== 'function') return;
       // Final Stabilization Round #10: a stale attempt A (superseded by a
@@ -126,11 +132,15 @@ class HeartbeatTracker {
       // recovery) must never overwrite B's live health_snapshot with its own
       // outdated one. Same ownership check the execution-lease write path
       // already uses for business writes.
-      if (this.executionToken && !isCurrentOwner(this.db, this.runId, this.executionToken)) {
+      // isCurrentOwner is async now that the database is PostgreSQL-backed.
+      // Without the await, `!Promise` is always false and this guard silently
+      // stops blocking — a stale attempt would overwrite the current owner's
+      // health_snapshot.
+      if (this.executionToken && !(await isCurrentOwner(this.db, this.runId, this.executionToken))) {
         this.stop();
         return;
       }
-      this.db.updateRun(this.runId, {
+      await this.db.updateRun(this.runId, {
         healthSnapshot: JSON.stringify(this.getSnapshot())
       });
       this.lastDbFlushAt = Date.now();

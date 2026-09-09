@@ -14,9 +14,9 @@ function successfulData() {
   };
 }
 
-test('reuses the newest successful capture for the same canonical product and capture options', () => {
+test('reuses the newest successful capture for the same canonical product and capture options', async () => {
   const listingId = `cache${Date.now()}`.replace(/\D/g, '').slice(-10);
-  const stored = db.createMarketplaceCapture({
+  const stored = await db.createMarketplaceCapture({
     platform: 'etsy',
     url: `https://www.etsy.com/listing/${listingId}/cached-product?ref=homepage`,
     html: '<html><title>Cached product</title></html>',
@@ -25,7 +25,7 @@ test('reuses the newest successful capture for the same canonical product and ca
     maxVariants: 0,
   });
 
-  const cached = db.getCachedMarketplaceCapture({
+  const cached = await db.getCachedMarketplaceCapture({
     platform: 'etsy',
     url: `https://www.etsy.com/listing/${listingId}/cached-product?utm_source=mail`,
     accountId: null,
@@ -37,17 +37,17 @@ test('reuses the newest successful capture for the same canonical product and ca
   assert.equal(cached.parsedData.metrics.title, 'Cached product');
 });
 
-test('does not reuse a capture for different variant options or a blocked page', () => {
+test('does not reuse a capture for different variant options or a blocked page', async () => {
   const listingId = `cache${Date.now() + 1}`.replace(/\D/g, '').slice(-10);
   const url = `https://www.etsy.com/listing/${listingId}/cached-product`;
-  db.createMarketplaceCapture({
+  await db.createMarketplaceCapture({
     platform: 'etsy', url, html: '<html>blocked</html>',
     parsedData: { metrics: {}, capture: { status: 'blocked' }, variants: [] },
     variantMode: 'base', maxVariants: 0,
   });
 
-  assert.equal(db.getCachedMarketplaceCapture({ platform: 'etsy', url, accountId: null, variantMode: 'base', maxVariants: 0 }), null);
-  assert.equal(db.getCachedMarketplaceCapture({ platform: 'etsy', url, accountId: null, variantMode: 'all', maxVariants: 10 }), null);
+  assert.equal(await db.getCachedMarketplaceCapture({ platform: 'etsy', url, accountId: null, variantMode: 'base', maxVariants: 0 }), null);
+  assert.equal(await db.getCachedMarketplaceCapture({ platform: 'etsy', url, accountId: null, variantMode: 'all', maxVariants: 10 }), null);
 });
 
 test('cache URL normalization removes tracking parameters without removing product options', () => {

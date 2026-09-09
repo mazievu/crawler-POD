@@ -44,7 +44,7 @@ test('Heartbeat ownership is executionToken-based: Attempt A cannot remove or ov
 // P0-8 acceptance: a stuck attempt (A) that wakes up AFTER recovery has already
 // issued a new attempt (B) must not be allowed to write results as if it still
 // owned the run.
-test('Execution lease prevents a stale (revoked) attempt from overwriting a newer attempt (P0-8)', () => {
+test('Execution lease prevents a stale (revoked) attempt from overwriting a newer attempt (P0-8)', async () => {
   const runs = new Map();
   runs.set(1, { id: 1, status: 'running', input_options: JSON.stringify({ attempt: 1, executionToken: 'token-A' }) });
   const mockDb = {
@@ -57,16 +57,16 @@ test('Execution lease prevents a stale (revoked) attempt from overwriting a newe
   };
 
   // Attempt A is confirmed as the current owner while it is still the only attempt.
-  assert.equal(isCurrentOwner(mockDb, 1, 'token-A'), true);
+  assert.equal(await isCurrentOwner(mockDb, 1, 'token-A'), true);
 
   // Recovery revokes A and issues token B for attempt 2.
   const tokenB = issueExecutionToken(1, 2);
   mockDb.updateRun(1, { status: 'queued', inputOptions: JSON.stringify({ attempt: 2, executionToken: tokenB }) });
 
   // A wakes up late and checks ownership before writing its stale result: must be false now.
-  assert.equal(isCurrentOwner(mockDb, 1, 'token-A'), false, 'Stale attempt A must no longer be recognized as the owner');
+  assert.equal(await isCurrentOwner(mockDb, 1, 'token-A'), false, 'Stale attempt A must no longer be recognized as the owner');
   // B is the current owner and may write.
-  assert.equal(isCurrentOwner(mockDb, 1, tokenB), true, 'Attempt B must be the current owner');
+  assert.equal(await isCurrentOwner(mockDb, 1, tokenB), true, 'Attempt B must be the current owner');
 });
 
 test('RetryPolicy accurately classifies retryable and fatal errors', () => {
@@ -146,27 +146,27 @@ test('HeartbeatTracker.persist() refuses to write once its executionToken is no 
 // Final Implementation Closure §2 mandatory regression: a heartbeat/progress
 // update (still status='running') must never stamp completed_at — only an
 // actual terminal transition (done/failed/stuck/...) may.
-test('db.updateRun() only stamps completed_at on a terminal status transition, never on a running heartbeat (#2)', () => {
-  const created = realDb.createRun({ platform: 'shopify', query: 'db-completed-at-test-' + Date.now(), maxItems: 5 });
+test('db.updateRun() only stamps completed_at on a terminal status transition, never on a running heartbeat (#2)', async () => {
+  const created = await realDb.createRun({ platform: 'shopify', query: 'db-completed-at-test-' + Date.now(), maxItems: 5 });
   try {
-    realDb.updateRun(created.id, { status: 'running', healthSnapshot: JSON.stringify({ stage: 'SCRAPING' }) });
-    let row = realDb.getRunById(created.id);
+    await realDb.updateRun(created.id, { status: 'running', healthSnapshot: JSON.stringify({ stage: 'SCRAPING' }) });
+    let row = await realDb.getRunById(created.id);
     assert.equal(row.status, 'running');
     assert.equal(row.completed_at, null, 'A running Run must not have completed_at set by a heartbeat update');
 
     // Simulate several more heartbeat beats — still must not set completed_at.
-    realDb.updateRun(created.id, { healthSnapshot: JSON.stringify({ stage: 'SCRAPING', itemsCollected: 3 }) });
-    realDb.updateRun(created.id, { healthSnapshot: JSON.stringify({ stage: 'SCRAPING', itemsCollected: 7 }) });
-    row = realDb.getRunById(created.id);
+    await realDb.updateRun(created.id, { healthSnapshot: JSON.stringify({ stage: 'SCRAPING', itemsCollected: 3 }) });
+    await realDb.updateRun(created.id, { healthSnapshot: JSON.stringify({ stage: 'SCRAPING', itemsCollected: 7 }) });
+    row = await realDb.getRunById(created.id);
     assert.equal(row.completed_at, null, 'Repeated heartbeat updates must still leave completed_at null');
 
     // Now a real terminal transition must stamp it.
-    realDb.updateRun(created.id, { status: 'done', itemsCount: 7 });
-    row = realDb.getRunById(created.id);
+    await realDb.updateRun(created.id, { status: 'done', itemsCount: 7 });
+    row = await realDb.getRunById(created.id);
     assert.equal(row.status, 'done');
     assert.ok(row.completed_at, 'A terminal transition (done) must stamp completed_at');
   } finally {
-    realDb.deleteRun(created.id);
+    await realDb.deleteRun(created.id);
   }
 });
 
@@ -388,9 +388,9 @@ test('A stuck attempt loses write ownership immediately; if it later wakes, exec
   const { executeRun, router } = require('../src/runs.service');
   const originalRun = router.run;
 
-  const outerRun = realDb.createRun({ platform: 'etsy', query: 'gap1-stale-owner-' + Date.now(), maxItems: 3 });
+  const outerRun = await realDb.createRun({ platform: 'etsy', query: 'gap1-stale-owner-' + Date.now(), maxItems: 3 });
   const tokenA = 'tok-stale-owner-' + Date.now();
-  realDb.updateRun(outerRun.id, { status: 'running', inputOptions: JSON.stringify({ attempt: 1, executionToken: tokenA }) });
+  await realDb.updateRun(outerRun.id, { status: 'running', inputOptions: JSON.stringify({ attempt: 1, executionToken: tokenA }) });
 
   registerExecution(tokenA, new AbortController()); // never settled — simulates A ignoring abort and remaining alive
   const tracker = getOrCreateTracker(outerRun.id, realDb, { executionToken: tokenA, attempt: 1, executionClass: 'LOCAL_HTTP', heartbeatIntervalMs: 100000 });
@@ -404,10 +404,10 @@ test('A stuck attempt loses write ownership immediately; if it later wakes, exec
     const detector = new StuckDetector({ database: realDb, heartbeatDeadAfterMs: 500, cleanupGraceMs: 20 });
     await detector.checkStuckRuns();
 
-    const afterRecovery = realDb.getRunById(outerRun.id);
+    const afterRecovery = await realDb.getRunById(outerRun.id);
     assert.equal(afterRecovery.status, 'stuck');
     assert.match(afterRecovery.error_message, /RECOVERY_CLEANUP_FAILED/);
-    assert.equal(isCurrentOwner(realDb, outerRun.id, tokenA), false, 'A\'s token must already be rejected — recovery revokes ownership BEFORE/regardless of settlement outcome, not only on successful retry-requeue');
+    assert.equal(await isCurrentOwner(realDb, outerRun.id, tokenA), false, 'A\'s token must already be rejected — recovery revokes ownership BEFORE/regardless of settlement outcome, not only on successful retry-requeue');
 
     // A "wakes up" (ignored the abort) and tries to run through the real
     // production path with its now-stale token.

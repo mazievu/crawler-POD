@@ -1,3 +1,5 @@
+const { parseConditions, parseMetricSelection } = require('./filters/metric-conditions');
+
 const DEFAULT_QUERY_FIELD = {
   id: 'query', label: 'Search query', type: 'text', required: true, placeholder: 'Enter keyword...',
 };
@@ -68,6 +70,37 @@ function buildCollectionOptions(platform, values = {}) {
     if (!isLocalCdpUrl(values.cdpUrl)) throw new Error('CDP URL must use localhost or 127.0.0.1 over HTTP');
     options.cdpUrl = String(values.cdpUrl).trim();
   }
+
+  // Task 3: crawl-time metric conditions. Deliberately NOT declared as
+  // per-platform fields — the metric set is shared (an e-commerce listing and a
+  // social post are filtered by the same core), so gating them on
+  // getPlatformInputFields() would silently drop them for every platform.
+  // parseConditions() is the same whitelist the crawl pipeline and the items
+  // API use, so an unknown field or operator cannot get through here either.
+  if (values.conditions !== undefined) {
+    let raw = values.conditions;
+    if (typeof raw === 'string') {
+      try { raw = JSON.parse(raw); } catch { throw new Error('conditions must be a JSON array of {field, operator, value}'); }
+    }
+    const { conditions, invalid } = parseConditions(raw);
+    if (invalid.length > 0) {
+      throw new Error(`Unusable filter condition(s): ${invalid.map((i) => `${JSON.stringify(i.entry)} (${i.reason})`).join(', ')}`);
+    }
+    if (conditions.length > 0) options.conditions = conditions;
+  }
+
+  // Ticked-metric crawl filter. Same reasoning as `conditions` above: not a
+  // per-platform input field, and validated by the shared registry rather than
+  // by a second list here — parseMetricSelection() rejects any name the crawl
+  // pipeline and the items API would not accept either.
+  if (values.metrics !== undefined) {
+    const { selected, invalid } = parseMetricSelection(values.metrics);
+    if (invalid.length > 0) {
+      throw new Error(`Unknown metric(s): ${invalid.join(', ')}`);
+    }
+    if (selected.length > 0) options.metrics = selected;
+  }
+
   return options;
 }
 

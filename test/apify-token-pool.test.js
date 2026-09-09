@@ -30,6 +30,27 @@ test('ApifyTokenPool: parseTokenSignal detects 401, 402, 429 error signals', () 
   assert.equal(parseTokenSignal(new Error('Actor not found')).isError, false);
 });
 
+test('ApifyTokenPool: an account over its monthly hard limit is EXHAUSTED, not a success', () => {
+  // Regression: the message Apify actually returns once an account crosses
+  // maxMonthlyUsageUsd. Run #100 (tiktok_shop, 2026-09-07) failed with exactly
+  // this string while /v2/users/me/limits reported monthlyUsageUsd 5.0150
+  // against a limit of 5. Because "hard" sits between "usage" and "limit",
+  // /monthly usage limit/ and /usage limit exceeded/ both missed it, so the
+  // classifier returned isError:false — the pool recorded the drained token as
+  // successful, never quarantined it, and kept selecting it while two sibling
+  // tokens still had budget.
+  assert.equal(parseTokenSignal(new Error('Monthly usage hard limit exceeded')).type, 'EXHAUSTED');
+  assert.equal(parseTokenSignal({ message: 'Monthly usage hard limit exceeded' }).isError, true);
+
+  // Wording drift around the same condition must classify the same way.
+  assert.equal(parseTokenSignal(new Error('Monthly usage soft limit exceeded')).type, 'EXHAUSTED');
+
+  // ...without swallowing unrelated failures into the quota bucket, which
+  // would quarantine a healthy token on any actor crash.
+  assert.equal(parseTokenSignal(new Error('Actor run failed: page timed out')).isError, false);
+  assert.equal(parseTokenSignal(new Error('Monthly report generated')).isError, false);
+});
+
 test('ApifyTokenPool: initializes tokens from list and supports round-robin', () => {
   const pool = new ApifyTokenPoolManager({
     tokens: ['token_aaa_11111111', 'token_bbb_22222222', 'token_ccc_33333333']

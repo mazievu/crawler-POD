@@ -2,6 +2,25 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 
+/**
+ * These tests seed data through the in-process `db` module and then assert on
+ * it through a SEPARATELY SPAWNED server.js — so the two processes must share
+ * one database.
+ *
+ * Under SQLite they shared the data/collector.db file. PostgreSQL supports this
+ * too, via a server both processes connect to. PGlite does not: it is an
+ * in-process engine, and two processes pointed at the same PGLITE_DIR each get
+ * their own isolated state (verified: a run created by one is invisible to the
+ * other). So on PGlite these two cross-process tests cannot pass for reasons
+ * unrelated to the code under test, and are skipped with the reason stated
+ * rather than weakened. Point PGHOST/PGPORT or DATABASE_URL at a real
+ * PostgreSQL server and they run normally.
+ */
+const NEEDS_SHARED_SERVER = (process.env.PG_MODE || '').toLowerCase() === 'pglite';
+const crossProcessTest = NEEDS_SHARED_SERVER
+  ? (name, fn) => test.skip(`${name} [needs a shared PostgreSQL server; PGlite is per-process]`, fn)
+  : test;
+
 const port = 31987;
 const baseUrl = `http://127.0.0.1:${port}`;
 const encryptionKey = Buffer.alloc(32, 9).toString('base64');
@@ -85,9 +104,9 @@ test('all Etsy variants are acknowledged as a background capture job', async () 
   assert.match(status.error, /URL does not belong to etsy/);
 });
 
-test('capture API returns a successful saved capture instead of starting a browser again', async () => {
+crossProcessTest('capture API returns a successful saved capture instead of starting a browser again', async () => {
   const listingId = `${Date.now()}`.slice(-10);
-  const saved = db.createMarketplaceCapture({
+  const saved = await db.createMarketplaceCapture({
     platform: 'etsy',
     url: `https://www.etsy.com/listing/${listingId}/saved-product`,
     html: '<html><title>Saved product</title></html>',
@@ -112,18 +131,18 @@ test('capture API returns a successful saved capture instead of starting a brows
   assert.equal(body.metrics.title, 'Saved product');
 });
 
-test('schedule run API returns the persisted history shown by the dashboard', async () => {
-  const schedule = db.createMarketplaceCaptureSchedule({
+crossProcessTest('schedule run API returns the persisted history shown by the dashboard', async () => {
+  const schedule = await db.createMarketplaceCaptureSchedule({
     platform: 'etsy', keyword: `history-${Date.now()}`, scheduleType: 'once', runAt: '2099-12-31T23:45',
   });
   try {
-    db.completeMarketplaceCaptureSchedule(schedule.id, { discovered: 30, captured: 24, blocked: 4, failed: 2 }, new Date('2099-12-31T16:46:00.000Z'));
+    await db.completeMarketplaceCaptureSchedule(schedule.id, { discovered: 30, captured: 24, blocked: 4, failed: 2 }, new Date('2099-12-31T16:46:00.000Z'));
     const response = await fetch(`${baseUrl}/api/marketplace-capture-schedules/${schedule.id}/runs`);
     const history = await response.json();
     assert.equal(response.status, 200);
     assert.equal(history.length, 1);
     assert.deepEqual(history[0].summary, { discovered: 30, captured: 24, blocked: 4, failed: 2 });
   } finally {
-    db.deleteMarketplaceCaptureSchedule(schedule.id);
+    await db.deleteMarketplaceCaptureSchedule(schedule.id);
   }
 });

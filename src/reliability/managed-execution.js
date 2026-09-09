@@ -8,7 +8,7 @@
  * Scheduler for admission but had none of that lifecycle — each one would
  * otherwise have to hand-roll its own heartbeat/lease/retry/cleanup code.
  *
- * `runManaged(runId, options, workFn)` provides, once, for every non-channel
+ * `await runManaged(runId, options, workFn)` provides, once, for every non-channel
  * workload:
  *   - executionToken ownership checks before starting and before persisting
  *     the final result (stale-attempt protection)
@@ -39,11 +39,14 @@ async function runManaged(runId, options, workFn) {
 
   const tracker = getOrCreateTracker(runId, db, { executionClass, executionToken, attempt });
 
-  const assertOwner = (stageLabel) => {
+  // Async since the PostgreSQL cutover: isCurrentOwner() reads the run row, so
+  // without the await `!Promise` is always false and this guard silently stops
+  // rejecting stale attempts. Every call site awaits it.
+  const assertOwner = async (stageLabel) => {
     if (timedOut) {
       throw new Error(`STALE_EXECUTION: token ${executionToken} was superseded before "${stageLabel}" (timed out)`);
     }
-    if (!isCurrentOwner(db, runId, executionToken)) {
+    if (!(await isCurrentOwner(db, runId, executionToken))) {
       throw new Error(`STALE_EXECUTION: token ${executionToken} was superseded before "${stageLabel}"`);
     }
   };
@@ -66,7 +69,7 @@ async function runManaged(runId, options, workFn) {
   let timer = null;
   let workPromiseCreated = false;
   // Final Stabilization Round #7: a workFn that ignores AbortSignal must not be
-  // able to hang runManaged() forever. abort() alone only *requests*
+  // able to hang await runManaged() forever. abort() alone only *requests*
   // cancellation; if the callee never checks signal.aborted, the awaited
   // promise never settles. Racing workPromise against a real timeoutPromise
   // guarantees this function rejects at ~timeoutMs regardless of whether the
@@ -87,7 +90,7 @@ async function runManaged(runId, options, workFn) {
   });
 
   try {
-    assertOwner('START');
+    await assertOwner('START');
     tracker.setStage(STAGES.SCRAPING);
 
     const workPromise = workFn({
@@ -98,8 +101,8 @@ async function runManaged(runId, options, workFn) {
     });
     workPromiseCreated = true;
     // §1.3: the registry's "settled" signal must reflect when the REAL work
-    // finishes, not when runManaged() itself resolves/rejects — those are
-    // different moments once a timeout can make runManaged() reject early
+    // finishes, not when await runManaged() itself resolves/rejects — those are
+    // different moments once a timeout can make await runManaged() reject early
     // while workPromise keeps running in the background. Whoever actually
     // owns the worker slot/RAM/lock (the Resource Scheduler) awaits this
     // signal — bounded — before releasing them, so a new Attempt B cannot be
@@ -124,16 +127,16 @@ async function runManaged(runId, options, workFn) {
 
     // Re-check ownership right before persisting the final result — the work
     // itself may have taken a long time (browser automation, HTML capture).
-    assertOwner('PRE_PERSIST');
+    await assertOwner('PRE_PERSIST');
 
     tracker.setStage(STAGES.COMPLETED);
-    db.updateRun(runId, { status: 'done', healthSnapshot: JSON.stringify({ result, ...tracker.getSnapshot() }) });
+    await db.updateRun(runId, { status: 'done', healthSnapshot: JSON.stringify({ result, ...tracker.getSnapshot() }) });
     return result;
   } catch (err) {
     const effectiveErr = timedOut ? new Error(`MANAGED_EXECUTION_TIMEOUT: exceeded ${timeoutMs}ms`) : err;
     tracker.setStage(STAGES.FAILED, { error: effectiveErr.message });
 
-    if (!isCurrentOwner(db, runId, executionToken)) {
+    if (!(await isCurrentOwner(db, runId, executionToken))) {
       // Stale execution: do not touch the run's status, a newer attempt owns it.
       throw effectiveErr;
     }
@@ -142,13 +145,13 @@ async function runManaged(runId, options, workFn) {
       const nextAttempt = attempt + 1;
       const updatedOptions = { ...options, attempt: nextAttempt, executionToken: issueExecutionToken(runId, nextAttempt) };
       delete updatedOptions.database;
-      db.updateRun(runId, {
+      await db.updateRun(runId, {
         status: 'queued',
         errorMessage: `Transient error, retrying (${attempt}/${defaultRetryPolicy.maxAttempts}): ${effectiveErr.message}`,
         inputOptions: JSON.stringify(updatedOptions)
       });
     } else {
-      db.updateRun(runId, { status: 'failed', errorMessage: effectiveErr.message });
+      await db.updateRun(runId, { status: 'failed', errorMessage: effectiveErr.message });
     }
     throw effectiveErr;
   } finally {

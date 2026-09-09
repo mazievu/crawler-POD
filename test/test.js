@@ -171,53 +171,53 @@ test('shopping discovery rejects non-merchant sources', () => {
   assert.strictEqual(isMerchantResult('https://store.example.com/product/cat-nails'), true);
 });
 
-test('product snapshot persists rating, review count, and sold count', () => {
-  const run = db.createRun({ platform: 'test', query: 'product-metrics', maxItems: 1 });
-  db.insertSnapshots(run.id, 'test', 'product-metrics', [{
+test('product snapshot persists rating, review count, and sold count', async () => {
+  const run = await db.createRun({ platform: 'test', query: 'product-metrics', maxItems: 1 });
+  await db.insertSnapshots(run.id, 'test', 'product-metrics', [{
     title: 'Metric Product', url: 'https://example.com/product', image: 'https://example.com/product.jpg',
     price: '$24.50', rating: '4.6', reviewCount: '1.2K', soldCount: '321',
   }]);
-  const snapshot = db.getSnapshotsByRunId(run.id)[0];
+  const snapshot = (await db.getSnapshotsByRunId(run.id))[0];
   assert.strictEqual(snapshot.price, 24.5);
   assert.strictEqual(snapshot.rating, 4.6);
   assert.strictEqual(snapshot.reviews, 1200);
   assert.strictEqual(snapshot.sold_count, 321);
-  db.deleteRun(run.id);
+  await db.deleteRun(run.id);
 });
 
-test('getAllPlatforms returns array', () => {
-  const platforms = db.getAllPlatforms();
+test('getAllPlatforms returns array', async () => {
+  const platforms = await db.getAllPlatforms();
   assert.ok(Array.isArray(platforms));
   assert.ok(platforms.length > 0);
 });
 
-test('createRun + getRunById works', () => {
-  const run = db.createRun({ platform: 'test', query: 'test-query', maxItems: 5 });
+test('createRun + getRunById works', async () => {
+  const run = await db.createRun({ platform: 'test', query: 'test-query', maxItems: 5 });
   assert.ok(run.id);
   assert.strictEqual(run.platform, 'test');
   assert.strictEqual(run.query, 'test-query');
   assert.strictEqual(run.status, 'pending');
   // Cleanup
-  db.deleteRun(run.id);
+  await db.deleteRun(run.id);
 });
 
-test('deleteRun removes run', () => {
-  const run = db.createRun({ platform: 'test', query: 'delete-me', maxItems: 1 });
-  db.deleteRun(run.id);
-  const found = db.getRunById(run.id);
+test('deleteRun removes run', async () => {
+  const run = await db.createRun({ platform: 'test', query: 'delete-me', maxItems: 1 });
+  await db.deleteRun(run.id);
+  const found = await db.getRunById(run.id);
   assert.strictEqual(found, undefined);
 });
 
-test('insertSnapshots handles empty items', () => {
-  const run = db.createRun({ platform: 'test', query: 'empty', maxItems: 0 });
-  const result = db.insertSnapshots(run.id, 'test', 'empty', []);
+test('insertSnapshots handles empty items', async () => {
+  const run = await db.createRun({ platform: 'test', query: 'empty', maxItems: 0 });
+  const result = await db.insertSnapshots(run.id, 'test', 'empty', []);
   assert.strictEqual(result.newItems, 0);
   assert.strictEqual(result.activeItems, 0);
-  db.deleteRun(run.id);
+  await db.deleteRun(run.id);
 });
 
-test('insertSnapshots inserts items', () => {
-  const run = db.createRun({ platform: 'test', query: 'items', maxItems: 3 });
+test('insertSnapshots inserts items', async () => {
+  const run = await db.createRun({ platform: 'test', query: 'items', maxItems: 3 });
   // §12: item_uid is derived from platform+url (see generateUid()), and this
   // suite runs against the real persistent data/collector.db (no per-test
   // isolation) — hardcoded URLs would already exist in product_current after
@@ -229,15 +229,15 @@ test('insertSnapshots inserts items', () => {
     { title: 'Item 2', url: `https://example.com/insert-test-${suffix}/2`, likes: 20 },
     { title: 'Item 3', url: `https://example.com/insert-test-${suffix}/3`, likes: 30 },
   ];
-  const result = db.insertSnapshots(run.id, 'test', 'items', items);
+  const result = await db.insertSnapshots(run.id, 'test', 'items', items);
   assert.strictEqual(result.newItems, 3);
   assert.strictEqual(result.activeItems, 0);
   // Cleanup
-  db.deleteRun(run.id);
+  await db.deleteRun(run.id);
 });
 
-test('getStats returns numbers', () => {
-  const stats = db.getStats();
+test('getStats returns numbers', async () => {
+  const stats = await db.getStats();
   assert.strictEqual(typeof stats.totalRuns, 'number');
   assert.strictEqual(typeof stats.totalSnapshots, 'number');
 });

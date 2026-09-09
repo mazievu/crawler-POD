@@ -206,7 +206,7 @@ test('ResourceScheduler admits jobs within capacity and queues overflow', async 
   await scheduler.submitRun({ platform: 'shopify', query: 'shop4.com' });
 
   await scheduler.tick();
-  const status1 = scheduler.getStatus();
+  const status1 = await scheduler.getStatus();
   assert.ok(status1.pools.pools.LOCAL.running <= 2, 'Should not exceed local concurrency 2');
 
   await new Promise(resolve => setTimeout(resolve, 250));
@@ -570,8 +570,8 @@ test('ResourceScheduler stops admission and queues overflow when RAM headroom is
 
   await scheduler.tick();
   assert.equal(dispatched.length, 2, 'Exactly 2 runs should be admitted (1000MB <= 1200MB); 3rd and 4th must be queued due to RAM check');
-  assert.equal(scheduler.queue.countByStatus().queued, 2);
-  assert.equal(scheduler.queue.countByStatus().running, 2);
+  assert.equal((await scheduler.queue.countByStatus()).queued, 2);
+  assert.equal((await scheduler.queue.countByStatus()).running, 2);
 });
 
 test('ResourceScheduler allows BROWSER pool to burst beyond baseline when RAM is sufficient (BUG-SCHED-ELASTIC-01)', async () => {
@@ -659,6 +659,6 @@ test('ResourceScheduler strictly enforces CDP=1 capacity even with high RAM (BUG
   await scheduler.tick();
   assert.equal(dispatched.length, 1, 'Only 1 CDP run may be admitted at a time');
   assert.equal(scheduler.pools.getStatus().pools.CDP.running, 1);
-  assert.equal(scheduler.queue.countByStatus().queued, 1);
+  assert.equal((await scheduler.queue.countByStatus()).queued, 1);
 });
 

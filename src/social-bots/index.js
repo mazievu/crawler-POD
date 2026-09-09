@@ -11,11 +11,11 @@ function createSocialBotsRouter(options = {}) {
   const socialScheduler = options.socialScheduler || getSocialScheduler(options);
 
   // List all bots and status
-  router.get('/api/social-bots', (req, res) => {
+  router.get('/api/social-bots', async (req, res) => {
     try {
       res.json({
         ok: true,
-        bots: socialScheduler.getStatus()
+        bots: await socialScheduler.getStatus()
       });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });

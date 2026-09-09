@@ -54,7 +54,7 @@ test('deduplicates repeated export rows by their Etsy URLs', () => {
   assert.equal(records.length, 1);
 });
 
-test('loads nested CSV exports and imports the normalized records in one Etsy run', () => {
+test('loads nested CSV exports and imports the normalized records in one Etsy run', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'etsy-analytics-'));
   const nestedDirectory = path.join(directory, 'nested');
   fs.mkdirSync(nestedDirectory);
@@ -71,7 +71,7 @@ test('loads nested CSV exports and imports the normalized records in one Etsy ru
 
   try {
     const loaded = loadAnalyticsDirectory(directory, 'fixture');
-    const imported = importAnalyticsDirectory({ database, directory, sourceLabel: 'fixture' });
+    const imported = await importAnalyticsDirectory({ database, directory, sourceLabel: 'fixture' });
 
     assert.deepEqual({ files: loaded.files, shopRows: loaded.shopRows, productRows: loaded.productRows, records: loaded.records.length }, { files: 3, shopRows: 1, productRows: 1, records: 2 });
     assert.equal(imported.runId, 77);
@@ -82,39 +82,39 @@ test('loads nested CSV exports and imports the normalized records in one Etsy ru
   }
 });
 
-test('latest snapshots include imported analytics records without a product image', () => {
+test('latest snapshots include imported analytics records without a product image', async () => {
   const query = `etsy-analytics-no-image-${Date.now()}`;
-  const run = db.createRun({ platform: 'etsy', query, maxItems: 1 });
+  const run = await db.createRun({ platform: 'etsy', query, maxItems: 1 });
   try {
-    db.insertSnapshots(run.id, 'etsy', query, [{
+    await db.insertSnapshots(run.id, 'etsy', query, [{
       title: 'Image-free imported listing',
       url: `https://www.etsy.com/listing/${Date.now()}`,
       author: 'Analytics Shop',
       price: '21.99',
     }]);
-    db.updateRun(run.id, { status: 'done' });
+    await db.updateRun(run.id, { status: 'done' });
 
-    assert.equal(db.getLatestSnapshots().some((item) => item.title === 'Image-free imported listing'), true);
+    assert.equal((await db.getLatestSnapshots()).some((item) => item.title === 'Image-free imported listing'), true);
   } finally {
-    db.deleteRun(run.id);
+    await db.deleteRun(run.id);
   }
 });
 
-test('latest snapshot search returns only matching imported product or shop records', () => {
+test('latest snapshot search returns only matching imported product or shop records', async () => {
   const marker = `needle-${Date.now()}`;
   const query = `etsy-analytics-search-${marker}`;
-  const run = db.createRun({ platform: 'etsy', query, maxItems: 2 });
+  const run = await db.createRun({ platform: 'etsy', query, maxItems: 2 });
   try {
-    db.insertSnapshots(run.id, 'etsy', query, [
+    await db.insertSnapshots(run.id, 'etsy', query, [
       { title: `Analytics search ${marker} tumbler`, url: `https://www.etsy.com/listing/${Date.now()}`, author: 'Needle Shop' },
       { title: 'Unrelated blanket', url: `https://www.etsy.com/listing/${Date.now() + 1}`, author: 'Blanket Shop' },
     ]);
-    db.updateRun(run.id, { status: 'done' });
+    await db.updateRun(run.id, { status: 'done' });
 
-    const results = db.getLatestSnapshots({ search: marker, limit: 10 });
+    const results = await db.getLatestSnapshots({ search: marker, limit: 10 });
     assert.equal(results.length, 1);
     assert.equal(results[0].title, `Analytics search ${marker} tumbler`);
   } finally {
-    db.deleteRun(run.id);
+    await db.deleteRun(run.id);
   }
 });

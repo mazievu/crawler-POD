@@ -2,6 +2,7 @@ const db = require('./database');
 const registry = require('./channels/registry');
 const { BackendRouter } = require('./router/backend-router');
 const { normalizeItems } = require('./normalize');
+const { parseConditions, applyConditions, parseMetricSelection, applySelection, OPERATOR_SQL } = require('./filters/metric-conditions');
 const doctorModule = require('./doctor');
 const { getOrCreateTracker, removeTracker, STAGES } = require('./reliability/heartbeat');
 const { defaultRetryPolicy } = require('./reliability/retry-policy');
@@ -19,12 +20,26 @@ const router = new BackendRouter({ registry, doctor: doctorModule });
  * Current State, Daily History, final status — must be refused, not just the
  * last one.
  */
-function assertStillOwner(db, runId, executionToken, stageLabel) {
-  if (!isCurrentOwner(db, runId, executionToken)) {
+// Async since the PostgreSQL cutover: isCurrentOwner() reads the run row, so
+// without the await `!Promise` is always false and this guard silently stops
+// refusing stale writes.
+async function assertStillOwner(db, runId, executionToken, stageLabel) {
+  if (!(await isCurrentOwner(db, runId, executionToken))) {
     console.warn(`Run ${runId}: stale execution (token ${executionToken}) attempted to write at stage "${stageLabel}" after being superseded; discarding.`);
     return false;
   }
   return true;
+}
+
+/**
+ * input_options is round-tripped through JSON, and two members of the dispatch
+ * options cannot survive that: an AbortSignal becomes `{}` and a callback
+ * disappears. Everything else — executionToken included — is kept, because
+ * execution-lease.js reads the token back out of this column.
+ */
+function serializableOptions(options) {
+  const { signal, reportExternalExecution, ...rest } = options || {};
+  return rest;
 }
 
 async function executeRun(runId, platform, query, options = {}) {
@@ -46,7 +61,7 @@ async function executeRun(runId, platform, query, options = {}) {
 
   try {
     tracker.setStage(STAGES.INIT);
-    db.updateRun(runId, { status: 'running' });
+    await db.updateRun(runId, { status: 'running' });
 
     const channel = registry.getChannel(platform);
     if (!channel) throw new Error(`Unknown channel: ${platform}`);
@@ -62,8 +77,8 @@ async function executeRun(runId, platform, query, options = {}) {
     // an external execution (a spawned child process, a remote Apify actor
     // run) that can outlive THIS Node process, so RestartRecovery can
     // reconcile it on next boot instead of blindly dispatching a duplicate.
-    const reportExternalExecution = (info) => {
-      db.updateRun(runId, { externalExecution: { ...info, executionToken, startedAt: info.startedAt || Date.now() } });
+    const reportExternalExecution = async (info) => {
+      await db.updateRun(runId, { externalExecution: { ...info, executionToken, startedAt: info.startedAt || Date.now() } });
     };
     const result = await router.run(platform, query, { ...options, signal: abortController.signal, reportExternalExecution })
       .finally(() => {
@@ -78,13 +93,13 @@ async function executeRun(runId, platform, query, options = {}) {
 
     // router.run() can take minutes; re-check ownership before the FIRST write
     // that happens after it returns.
-    if (!assertStillOwner(db, runId, executionToken, 'POST_BACKEND_RUN')) {
+    if (!(await assertStillOwner(db, runId, executionToken, 'POST_BACKEND_RUN'))) {
       removeTracker(executionToken);
       return { success: false, runId, discarded: true, reason: 'STALE_EXECUTION' };
     }
 
     // Save metadata early in case of normalization failure
-    db.updateRun(runId, {
+    await db.updateRun(runId, {
       activeBackend: result.activeBackend,
       backendKind: result.backendKind,
       backendStatus: result.backendStatus,
@@ -106,33 +121,94 @@ async function executeRun(runId, platform, query, options = {}) {
     // have a visual asset that can be shown in the product intelligence UI.
     const itemsWithImages = normalizedItems.filter((item) => item.image);
     const skippedWithoutImages = normalizedItems.length - itemsWithImages.length;
-    tracker.progress(itemsWithImages.length);
+
+    // Task 3: metric conditions are evaluated HERE — after normalization, so
+    // each provider's formatting ("160.23K") is already a number, and before
+    // persistence, so a rejected item never reaches product_current or
+    // daily_packed_history at all. Filtering in the UI instead would still
+    // store everything, and would only ever filter the page the client
+    // happened to fetch.
+    //
+    // With no conditions supplied applyConditions() returns its input
+    // untouched, which is the pre-existing behaviour exactly.
+    // Ticked-metric crawl filter (options.metrics = ['likes','comments']).
+    // "Highest by this metric" needs no operator and no threshold, so a tick
+    // becomes: the item must REPORT the metric, and what survives is ordered
+    // highest-first. Two ticks means it must report both.
+    const { selected: selectedMetrics, invalid: invalidMetrics } = parseMetricSelection(options.metrics);
+    if (invalidMetrics.length > 0) {
+      console.warn(`Run ${runId}: ignoring ${invalidMetrics.length} unknown metric(s): ${invalidMetrics.join(', ')}`);
+    }
+
+    const { conditions: metricConditions, invalid: invalidConditions } = parseConditions(options.conditions);
+    if (invalidConditions.length > 0) {
+      console.warn(`Run ${runId}: ignoring ${invalidConditions.length} unusable filter condition(s): ${invalidConditions.map((i) => i.reason).join(', ')}`);
+    }
+    // Thresholds first (if any), then the ticked metrics decide presence and
+    // order. Both are AND: an item has to survive each stage.
+    const afterConditions = applyConditions(itemsWithImages, metricConditions);
+    const afterSelection = applySelection(afterConditions.kept, selectedMetrics);
+    const keptItems = afterSelection.kept;
+    const rejectedItems = afterConditions.rejected.concat(afterSelection.rejected);
+
+    if (selectedMetrics.length > 0) {
+      console.log(`Run ${runId}: crawl filter [highest ${selectedMetrics.join(' + ')}] -> fetched ${itemsWithImages.length}, kept ${keptItems.length}, rejected ${rejectedItems.length}`);
+    }
+
+    if (metricConditions.length > 0) {
+      const summary = metricConditions.map((c) => `${c.field} ${OPERATOR_SQL[c.operator]} ${c.value}`).join(' AND ');
+      console.log(`Run ${runId}: crawl filter [${summary}] -> fetched ${itemsWithImages.length}, kept ${keptItems.length}, rejected ${rejectedItems.length}`);
+      for (const rejection of rejectedItems) {
+        console.log(`Run ${runId}:   REJECT ${rejection.item.url || rejection.item.uid} — ${rejection.reasons.join('; ')}`);
+      }
+    }
+
+    tracker.progress(keptItems.length);
 
     // Guard again immediately before the PERSISTING stage: this is where legacy
     // snapshots, product_current, and daily_packed_history all get written.
-    if (!assertStillOwner(db, runId, executionToken, 'PRE_PERSIST')) {
+    if (!(await assertStillOwner(db, runId, executionToken, 'PRE_PERSIST'))) {
       removeTracker(executionToken);
       return { success: false, runId, discarded: true, reason: 'STALE_EXECUTION' };
     }
 
     // Save to DB
     tracker.setStage(STAGES.PERSISTING);
-    const dbCounts = db.insertSnapshots(runId, platform, query, itemsWithImages);
+    const dbCounts = await db.insertSnapshots(runId, platform, query, keptItems);
 
     tracker.setStage(STAGES.COMPLETED);
-    db.updateRun(runId, {
+    // The filter outcome is persisted alongside the run so "why did this run
+    // store 2 of 5 items" is answerable later from the DB, not only from logs.
+    const crawlFilter = (metricConditions.length > 0 || selectedMetrics.length > 0)
+      ? {
+          conditions: metricConditions,
+          metrics: selectedMetrics,
+          fetched: itemsWithImages.length,
+          kept: keptItems.length,
+          rejected: rejectedItems.length,
+          rejectedReasons: rejectedItems.map((r) => ({ url: r.item.url || r.item.uid, reasons: r.reasons, values: r.values })),
+        }
+      : null;
+
+    await db.updateRun(runId, {
       status: 'done',
-      ...dbCounts
+      ...dbCounts,
+      // executionToken MUST survive this write: execution-lease.getRunToken()
+      // reads it back out of input_options, and dropping it would make
+      // isCurrentOwner() fall through to "nothing has claimed a lease" for
+      // every later stale-write check. Only the two non-serializable members
+      // are removed (an AbortSignal stringifies to {}, a callback vanishes).
+      ...(crawlFilter ? { inputOptions: JSON.stringify({ ...serializableOptions(options), crawlFilter }) } : {}),
     });
 
-    console.log(`Run ${runId} completed via ${result.activeBackend}: ${itemsWithImages.length} items with images (${skippedWithoutImages} skipped, ${dbCounts.newItems} new)`);
+    console.log(`Run ${runId} completed via ${result.activeBackend}: ${keptItems.length} items stored (${skippedWithoutImages} skipped for no image, ${rejectedItems.length} rejected by filter, ${dbCounts.newItems} new)`);
     removeTracker(executionToken);
-    return { success: true, runId, dbCounts };
+    return { success: true, runId, dbCounts, crawlFilter };
   } catch (err) {
     tracker.setStage(STAGES.FAILED, { error: err.message });
     console.error(`Run ${runId} failed:`, err.message);
 
-    if (!isCurrentOwner(db, runId, executionToken)) {
+    if (!(await isCurrentOwner(db, runId, executionToken))) {
       console.warn(`Run ${runId}: stale execution (token ${executionToken}) errored after being superseded; not touching run status.`);
       removeTracker(executionToken);
       throw err;
@@ -141,13 +217,13 @@ async function executeRun(runId, platform, query, options = {}) {
     if (defaultRetryPolicy.shouldRetry(attempt, err)) {
       const nextAttempt = attempt + 1;
       const updatedOptions = { ...options, attempt: nextAttempt };
-      db.updateRun(runId, {
+      await db.updateRun(runId, {
         status: 'queued',
         errorMessage: `Transient error, retrying (${attempt}/${defaultRetryPolicy.maxAttempts}): ${err.message}`,
         inputOptions: JSON.stringify(updatedOptions)
       });
     } else {
-      db.updateRun(runId, { status: 'failed', errorMessage: err.message });
+      await db.updateRun(runId, { status: 'failed', errorMessage: err.message });
     }
     removeTracker(executionToken);
     throw err;

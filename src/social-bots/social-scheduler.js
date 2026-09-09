@@ -110,7 +110,7 @@ class SocialListeningScheduler {
       throw new Error('ResourceScheduler is not configured');
     }
 
-    const stateId = this.db.reserveSocialBotWindow(bot.key, windowSlot, queryKey);
+    const stateId = await this.db.reserveSocialBotWindow(bot.key, windowSlot, queryKey);
     if (stateId === null) {
       return null; // Already reserved/dispatched - restart-safe idempotency.
     }
@@ -126,12 +126,12 @@ class SocialListeningScheduler {
           source: 'social_listening'
         }
       });
-      this.db.markSocialBotDispatched(stateId, run.id);
+      await this.db.markSocialBotDispatched(stateId, run.id);
       return run;
     } catch (err) {
       // Enqueue failed after the window was reserved: release the reservation so
       // this exact window is retried on the next tick instead of being lost.
-      this.db.releaseSocialBotWindow(stateId);
+      await this.db.releaseSocialBotWindow(stateId);
       throw err;
     }
   }
@@ -161,7 +161,7 @@ class SocialListeningScheduler {
     // stuck as 'pending', blocked from ever being retried by the UNIQUE
     // constraint. Clear anything abandoned before evaluating due bots.
     if (typeof this.db.recoverStalePendingSocialBotWindows === 'function') {
-      this.db.recoverStalePendingSocialBotWindows();
+      await this.db.recoverStalePendingSocialBotWindows();
     }
     const now = Date.now();
     const bots = this.configManager.getAll();
@@ -190,15 +190,18 @@ class SocialListeningScheduler {
     });
   }
 
-  getStatus() {
+  async getStatus() {
     const bots = this.configManager.getAll();
     const now = Date.now();
 
-    return bots.map(b => {
+    // Each row needs two Postgres reads (last dispatch, dispatch count). Under
+    // better-sqlite3 those were synchronous inside a plain map(); now they are
+    // awaited per bot, so the map produces promises resolved together here.
+    return Promise.all(bots.map(async b => {
       const windowSlot = this.windowSlotFor(b, now);
       const intervalMs = Math.max(5, b.intervalMinutes || 60) * 60000;
       const nextRunAt = new Date((windowSlot + 1) * intervalMs).toISOString();
-      const last = b.platform ? this.db.getLastDispatchedSocialBotWindow(b.key) : null;
+      const last = b.platform ? await this.db.getLastDispatchedSocialBotWindow(b.key) : null;
       const dependency = this.dependencyState.get(b.key) || null;
 
       return {
@@ -212,14 +215,14 @@ class SocialListeningScheduler {
         filters: b.filters,
         lastRunAt: last ? last.created_at : null,
         nextRunAt,
-        totalDispatched: b.platform ? this.db.countDispatchedSocialBotRuns(b.key) : 0,
+        totalDispatched: b.platform ? await this.db.countDispatchedSocialBotRuns(b.key) : 0,
         // #14: surfaces why an enabled bot with a real channel isn't actually
         // dispatching (e.g. BLOCKED_CONFIGURATION for a missing APIFY_TOKEN)
         // without requiring the user to dig through server logs.
         blockedReason: dependency && dependency.blocked ? `${dependency.reasonCode}: ${dependency.message}` : null,
         lastDependencyCheckAt: dependency ? dependency.checkedAt : null
       };
-    });
+    }));
   }
 }
 
