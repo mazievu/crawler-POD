@@ -45,9 +45,12 @@ async function createCloakBrowserSession({
 
   const userDataDir = resolveCloakProfileDir(platform, profileRoot);
   try {
-    const lockFile = path.join(userDataDir, 'SingletonLock');
-    if (fs.existsSync(lockFile)) {
-      fs.unlinkSync(lockFile);
+    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      const lockFile = path.join(userDataDir, name);
+      try {
+        fs.lstatSync(lockFile);
+        fs.unlinkSync(lockFile);
+      } catch {}
     }
   } catch {}
   

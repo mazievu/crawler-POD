@@ -1364,6 +1364,7 @@ async function showMarketplaceAccountsModal() {
   new bootstrap.Modal(document.getElementById('marketplace-accounts-modal')).show();
   await loadMarketplaceProxyProfiles();
   await loadMarketplaceAccounts();
+  await loadApifyTokens();
   feather.replace();
 }
 
@@ -1513,6 +1514,187 @@ async function deleteMarketplaceAccount(id) {
     await apiFetch(`/api/marketplace-accounts/${id}`, { method: 'DELETE' });
     await loadMarketplaceAccounts();
   } catch (err) { alert(`Could not remove session: ${err.message}`); }
+}
+
+// ==================== Apify Token Pool UI ====================
+
+async function loadApifyTokens() {
+  const list = document.getElementById('apify-tokens-list');
+  const badge = document.getElementById('apify-pool-summary-badge');
+  if (!list) return;
+  list.innerHTML = '<span class="text-muted">Đang tải danh sách token...</span>';
+
+  try {
+    const data = await apiFetch('/api/apify-tokens');
+    const tokens = data.tokens || [];
+    if (badge) {
+      badge.textContent = `${tokens.length} token (${data.healthyCount || 0} active)`;
+      badge.className = (data.healthyCount > 0) ? 'badge bg-success' : 'badge bg-warning text-dark';
+    }
+
+    if (!tokens.length) {
+      list.innerHTML = '<span class="text-muted">Chưa có token nào trong pool. Vui lòng thêm token bên trên.</span>';
+      return;
+    }
+
+    const stateBadgeMap = {
+      HEALTHY: '<span class="badge bg-success">HEALTHY</span>',
+      COOLDOWN: '<span class="badge bg-warning text-dark">COOLDOWN</span>',
+      EXHAUSTED: '<span class="badge bg-danger">EXHAUSTED / CAP REACHED</span>',
+      INVALID: '<span class="badge bg-secondary">INVALID</span>',
+      DISABLED: '<span class="badge bg-dark">DISABLED</span>'
+    };
+
+    list.innerHTML = tokens.map((t) => `
+      <div class="border rounded p-2 mb-2 bg-light">
+        <div class="d-flex justify-content-between align-items-center">
+          <div>
+            <strong>${escapeHtml(t.label || t.id)}</strong>
+            <span class="ms-2">${stateBadgeMap[t.state] || escapeHtml(t.state)}</span>
+            <br>
+            <small class="text-muted font-monospace">ID: ${escapeHtml(t.id)} | Lượt dùng: ${t.usageCount || 0}${t.consecutiveFailures > 0 ? ` | Lỗi liên tiếp: ${t.consecutiveFailures}` : ''}${t.lastBlockReason ? ` | Lý do: ${escapeHtml(t.lastBlockReason)}` : ''}</small>
+          </div>
+          <button class="btn btn-outline-danger btn-sm" onclick="deleteApifyToken('${escapeAttr(t.id)}')">
+            <i data-feather="trash-2" style="width:14px"></i> Xóa
+          </button>
+        </div>
+      </div>
+    `).join('');
+    feather.replace();
+  } catch (err) {
+    list.innerHTML = `<span class="text-danger">Lỗi tải token: ${escapeHtml(err.message)}</span>`;
+  }
+}
+
+async function saveApifyToken() {
+  const tokenInput = document.getElementById('apify-token-input');
+  const labelInput = document.getElementById('apify-token-label');
+  const status = document.getElementById('apify-token-status');
+  const tokenVal = tokenInput ? tokenInput.value.trim() : '';
+  const labelVal = labelInput ? labelInput.value.trim() : '';
+
+  if (!tokenVal) {
+    status.innerHTML = '<span class="text-danger">Vui lòng nhập Apify API token.</span>';
+    return;
+  }
+
+  status.innerHTML = '<span class="text-muted">Đang lưu token vào pool...</span>';
+  try {
+    const res = await apiFetch('/api/apify-tokens', {
+      method: 'POST',
+      body: JSON.stringify({ token: tokenVal, label: labelVal || null })
+    });
+    tokenInput.value = '';
+    if (labelInput) labelInput.value = '';
+    status.innerHTML = `<span class="text-success">Đã lưu thành công ${res.count || 1} token vào pool!</span>`;
+    await loadApifyTokens();
+  } catch (err) {
+    status.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`;
+  }
+}
+
+async function deleteApifyToken(id) {
+  if (!confirm('Bạn có chắc chắn muốn xóa token này khỏi pool không?')) return;
+  const status = document.getElementById('apify-token-status');
+  try {
+    await apiFetch(`/api/apify-tokens/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    status.innerHTML = '<span class="text-success">Đã xóa token khỏi pool.</span>';
+    await loadApifyTokens();
+  } catch (err) {
+    status.innerHTML = `<span class="text-danger">Lỗi xóa token: ${escapeHtml(err.message)}</span>`;
+  }
+}
+
+function parseTokensFromText(text) {
+  if (!text) return [];
+  if (text.trim().startsWith('[') || text.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return parsed.map((item) => (typeof item === 'string' ? item.trim() : (item.token || ''))).filter(Boolean);
+      }
+      if (parsed.tokens && Array.isArray(parsed.tokens)) {
+        return parsed.tokens.map((item) => (typeof item === 'string' ? item.trim() : (item.token || ''))).filter(Boolean);
+      }
+    } catch (_e) {}
+  }
+  return text.split(/[,;\r\n]+/)
+    .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+    .filter((s) => Boolean(s) && !s.startsWith('#') && !s.startsWith('//'));
+}
+
+function updateBulkTokenCountHint() {
+  const textarea = document.getElementById('apify-bulk-tokens');
+  const hint = document.getElementById('apify-bulk-count-hint');
+  if (!textarea || !hint) return;
+  const tokens = parseTokensFromText(textarea.value);
+  hint.textContent = `${tokens.length} token phát hiện`;
+}
+
+function clearBulkApifyInput() {
+  const textarea = document.getElementById('apify-bulk-tokens');
+  const fileInput = document.getElementById('apify-token-file');
+  const fileName = document.getElementById('apify-file-name');
+  if (textarea) textarea.value = '';
+  if (fileInput) fileInput.value = '';
+  if (fileName) fileName.textContent = '';
+  updateBulkTokenCountHint();
+}
+
+function handleApifyTokenFile(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  const fileNameSpan = document.getElementById('apify-file-name');
+  if (fileNameSpan) fileNameSpan.textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const content = e.target.result || '';
+    const textarea = document.getElementById('apify-bulk-tokens');
+    if (textarea) {
+      textarea.value = (textarea.value ? textarea.value.trim() + '\n' : '') + content.trim();
+      updateBulkTokenCountHint();
+    }
+  };
+  reader.readAsText(file);
+}
+
+async function saveBulkApifyTokens() {
+  const textarea = document.getElementById('apify-bulk-tokens');
+  const status = document.getElementById('apify-token-status');
+  if (!textarea) return;
+
+  const tokens = parseTokensFromText(textarea.value);
+  if (!tokens.length) {
+    status.innerHTML = '<span class="text-danger">Không tìm thấy token hợp lệ nào trong ô nhập hoặc file tải lên.</span>';
+    return;
+  }
+
+  status.innerHTML = `<span class="text-muted">Đang tải lên và lưu ${tokens.length} token vào pool...</span>`;
+  try {
+    const res = await apiFetch('/api/apify-tokens', {
+      method: 'POST',
+      body: JSON.stringify({ tokens })
+    });
+    status.innerHTML = `<span class="text-success">Đã thêm thành công ${res.count || tokens.length} token mới vào pool! (Tổng cộng: ${res.status?.total || 'N/A'} token)</span>`;
+    clearBulkApifyInput();
+    await loadApifyTokens();
+  } catch (err) {
+    status.innerHTML = `<span class="text-danger">Lỗi khi thêm hàng loạt: ${escapeHtml(err.message)}</span>`;
+  }
+}
+
+async function cleanupApifyTokens() {
+  if (!confirm('Dọn dẹp và xóa tất cả các token đã cạn kiệt (EXHAUSTED) hoặc không hợp lệ (INVALID) khỏi pool?')) return;
+  const status = document.getElementById('apify-token-status');
+  status.innerHTML = '<span class="text-muted">Đang dọn dẹp token lỗi...</span>';
+  try {
+    const res = await apiFetch('/api/apify-tokens/cleanup', { method: 'POST' });
+    status.innerHTML = `<span class="text-success">Đã dọn dẹp ${res.removedCount || 0} token lỗi/hết hạn khỏi pool.</span>`;
+    await loadApifyTokens();
+  } catch (err) {
+    status.innerHTML = `<span class="text-danger">Lỗi dọn dẹp: ${escapeHtml(err.message)}</span>`;
+  }
 }
 
 function toggleCaptureModeUI() {

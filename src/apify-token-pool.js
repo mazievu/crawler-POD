@@ -195,6 +195,95 @@ class ApifyTokenPoolManager {
     return record;
   }
 
+  saveToFile() {
+    try {
+      const dir = path.dirname(this.configPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tokensToSave = [];
+      for (const rec of this.tokens.values()) {
+        tokensToSave.push({
+          id: rec.id,
+          token: rec.token,
+          label: rec.label,
+          addedAt: rec.addedAt || new Date().toISOString()
+        });
+      }
+      fs.writeFileSync(this.configPath, JSON.stringify({ tokens: tokensToSave }, null, 2), 'utf8');
+      return true;
+    } catch (err) {
+      console.warn('[ApifyTokenPool] Failed to save token config file:', err.message);
+      return false;
+    }
+  }
+
+  addAndPersistToken(token, customLabel = null) {
+    if (!token || typeof token !== 'string') return null;
+    const trimmed = token.trim();
+    if (!trimmed) return null;
+
+    // Check if token already exists in pool
+    for (const rec of this.tokens.values()) {
+      if (rec.token === trimmed) {
+        if (customLabel) rec.label = customLabel;
+        this.saveToFile();
+        return rec;
+      }
+    }
+
+    const assignedId = `token-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const record = {
+      id: assignedId,
+      token: trimmed,
+      label: customLabel || maskToken(trimmed),
+      state: 'HEALTHY',
+      consecutiveFailures: 0,
+      blockedUntil: 0,
+      lastFailureAt: null,
+      lastSuccessAt: null,
+      lastBlockReason: null,
+      usageCount: 0,
+      addedAt: new Date().toISOString()
+    };
+
+    this.tokens.set(assignedId, record);
+    this.clients.set(assignedId, new ApifyClient({ token: trimmed }));
+    this.saveToFile();
+    return record;
+  }
+
+  removeToken(id) {
+    if (!id) return false;
+    const strId = String(id);
+    let found = false;
+    for (const [key, rec] of this.tokens.entries()) {
+      if (key === strId || rec.id === strId) {
+        this.tokens.delete(key);
+        this.clients.delete(key);
+        found = true;
+        break;
+      }
+    }
+    if (found) {
+      this.saveToFile();
+    }
+    return found;
+  }
+
+  clearNonHealthyTokens() {
+    let count = 0;
+    for (const [key, rec] of [...this.tokens.entries()]) {
+      if (rec.state === 'EXHAUSTED' || rec.state === 'INVALID') {
+        this.tokens.delete(key);
+        this.clients.delete(key);
+        count++;
+      }
+    }
+    if (count > 0) {
+      this.saveToFile();
+    }
+    return count;
+  }
+
   isBlockSignal(signal) {
     return parseTokenSignal(signal).isError;
   }

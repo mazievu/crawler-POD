@@ -51,7 +51,12 @@ test.before(async () => {
   await waitForServer();
 });
 
-test.after(() => server?.kill());
+test.after(async () => {
+  if (server) {
+    server.kill('SIGKILL');
+  }
+  await db._connection.close();
+});
 
 test('account API saves a marketplace session without returning the secret', async () => {
   const response = await fetch(`${baseUrl}/api/marketplace-accounts`, {

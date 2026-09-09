@@ -1,0 +1,25 @@
+[Unit]
+Description=Crawler POD Data MCP Read-only Server
+After=network.target
+
+[Service]
+Type=simple
+User=crawler_mcp_ro
+Group=crawler_mcp_ro
+WorkingDirectory=/mnt/Data-ReadOnly/GTFTools/crawler-POD
+ExecStart=/usr/bin/node /mnt/Data-ReadOnly/GTFTools/crawler-POD/src/mcp/index.js
+Restart=on-failure
+RestartSec=5s
+
+# Security Hardening Flags
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+ReadOnlyPaths=/mnt/Data-ReadOnly/GTFTools/crawler-POD
+
+Environment=NODE_ENV=production
+Environment=CRAWLER_DB_PATH=/mnt/Data-ReadOnly/GTFTools/crawler-POD/data/collector.db
+
+[Install]
+WantedBy=multi-user.target

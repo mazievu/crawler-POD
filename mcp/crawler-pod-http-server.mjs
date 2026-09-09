@@ -52,7 +52,7 @@ const HOST = process.env.MCP_HTTP_HOST || '0.0.0.0';
 const PORT = Number(process.env.MCP_HTTP_PORT) || 20130;
 const TOKEN = process.env.MCP_HTTP_TOKEN || null;
 const ALLOW_ANON = process.env.MCP_HTTP_ALLOW_ANON === '1';
-const CRAWLER_PORT = Number(process.env.CRAWLER_PORT) || 20129;
+const CRAWLER_PORT = Number(process.env.CRAWLER_PORT) || Number(process.env.PORT) || 9999;
 const CRAWLER_BASE = process.env.CRAWLER_BASE_URL || `http://127.0.0.1:${CRAWLER_PORT}`;
 
 const text = (value) => ({
