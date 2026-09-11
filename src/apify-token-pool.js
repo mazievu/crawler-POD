@@ -284,6 +284,101 @@ class ApifyTokenPoolManager {
     return count;
   }
 
+  /**
+   * Actively verifies a single token against Apify API (/v2/users/me).
+   * Updates the token record with username, plan, usage credits, and current state.
+   */
+  async verifyToken(id) {
+    if (!id) return { success: false, error: 'Token ID is required' };
+    const strId = String(id);
+    let record = this.tokens.get(strId);
+    if (!record) {
+      for (const r of this.tokens.values()) {
+        if (r.id === strId || r.label === strId) {
+          record = r;
+          break;
+        }
+      }
+    }
+    if (!record) {
+      return { success: false, error: `Token ${id} not found in pool` };
+    }
+
+    const client = this.clients.get(record.id) || new ApifyClient({ token: record.token });
+    try {
+      const user = await client.user().get();
+      record.state = 'HEALTHY';
+      record.consecutiveFailures = 0;
+      record.lastSuccessAt = new Date().toISOString();
+      record.lastVerifiedAt = new Date().toISOString();
+      record.lastBlockReason = null;
+      record.username = user ? user.username : null;
+      record.planTier = user && user.plan ? user.plan.tier : null;
+      record.monthlyUsageCreditsUsd = user && user.plan ? user.plan.monthlyUsageCreditsUsd : null;
+      record.maxMonthlyUsageUsd = user && user.plan ? user.plan.maxMonthlyUsageUsd : null;
+
+      return {
+        success: true,
+        id: record.id,
+        label: record.label,
+        state: record.state,
+        username: record.username,
+        planTier: record.planTier,
+        monthlyUsageCreditsUsd: record.monthlyUsageCreditsUsd,
+        maxMonthlyUsageUsd: record.maxMonthlyUsageUsd,
+        verifiedAt: record.lastVerifiedAt
+      };
+    } catch (err) {
+      const signal = parseTokenSignal(err);
+      record.lastVerifiedAt = new Date().toISOString();
+      const reason = err.message || signal.reason || 'Verification failed';
+
+      if (signal.type === 'INVALID' || err.statusCode === 401) {
+        this.markInvalid(record.id, reason);
+      } else if (signal.type === 'EXHAUSTED' || err.statusCode === 402) {
+        this.markExhausted(record.id, reason);
+      } else if (signal.type === 'RATE_LIMITED' || err.statusCode === 429) {
+        this.markCooldown(record.id, reason);
+      } else {
+        record.lastBlockReason = reason;
+      }
+
+      return {
+        success: false,
+        id: record.id,
+        label: record.label,
+        state: record.state,
+        error: reason,
+        verifiedAt: record.lastVerifiedAt
+      };
+    }
+  }
+
+  /**
+   * Actively verifies all tokens in the pool.
+   * Concurrency capped to avoid rate-limiting.
+   */
+  async verifyAllTokens({ concurrency = 3 } = {}) {
+    const results = [];
+    const allRecords = Array.from(this.tokens.values());
+    const limit = Math.max(1, Number(concurrency) || 3);
+
+    for (let i = 0; i < allRecords.length; i += limit) {
+      const batch = allRecords.slice(i, i + limit);
+      const batchResults = await Promise.all(batch.map(rec => this.verifyToken(rec.id)));
+      results.push(...batchResults);
+    }
+
+    return {
+      total: allRecords.length,
+      validCount: results.filter(r => r.success).length,
+      invalidCount: results.filter(r => !r.success && r.state === 'INVALID').length,
+      exhaustedCount: results.filter(r => !r.success && r.state === 'EXHAUSTED').length,
+      results,
+      status: this.getStatus()
+    };
+  }
+
   isBlockSignal(signal) {
     return parseTokenSignal(signal).isError;
   }
@@ -536,7 +631,12 @@ class ApifyTokenPoolManager {
         lastFailureAt: rec.lastFailureAt,
         lastSuccessAt: rec.lastSuccessAt,
         lastBlockReason: rec.lastBlockReason,
-        usageCount: rec.usageCount
+        usageCount: rec.usageCount,
+        username: rec.username || null,
+        planTier: rec.planTier || null,
+        monthlyUsageCreditsUsd: rec.monthlyUsageCreditsUsd || null,
+        maxMonthlyUsageUsd: rec.maxMonthlyUsageUsd || null,
+        lastVerifiedAt: rec.lastVerifiedAt || null
       });
     }
 

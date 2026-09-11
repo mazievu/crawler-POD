@@ -1545,24 +1545,92 @@ async function loadApifyTokens() {
       DISABLED: '<span class="badge bg-dark">DISABLED</span>'
     };
 
-    list.innerHTML = tokens.map((t) => `
+    list.innerHTML = tokens.map((t) => {
+      const extraInfo = [];
+      if (t.username) extraInfo.push(`User: <strong>${escapeHtml(t.username)}</strong>`);
+      if (t.planTier) extraInfo.push(`Plan: <strong>${escapeHtml(t.planTier)}</strong>`);
+      if (t.lastVerifiedAt) extraInfo.push(`Kiểm tra lúc: ${new Date(t.lastVerifiedAt).toLocaleTimeString()}`);
+
+      return `
       <div class="border rounded p-2 mb-2 bg-light">
         <div class="d-flex justify-content-between align-items-center">
           <div>
             <strong>${escapeHtml(t.label || t.id)}</strong>
             <span class="ms-2">${stateBadgeMap[t.state] || escapeHtml(t.state)}</span>
+            ${extraInfo.length ? `<span class="ms-2 text-muted small">(${extraInfo.join(' | ')})</span>` : ''}
             <br>
-            <small class="text-muted font-monospace">ID: ${escapeHtml(t.id)} | Lượt dùng: ${t.usageCount || 0}${t.consecutiveFailures > 0 ? ` | Lỗi liên tiếp: ${t.consecutiveFailures}` : ''}${t.lastBlockReason ? ` | Lý do: ${escapeHtml(t.lastBlockReason)}` : ''}</small>
+            <small class="text-muted font-monospace">ID: ${escapeHtml(t.id)} | Lượt dùng: ${t.usageCount || 0}${t.consecutiveFailures > 0 ? ` | Lỗi liên tiếp: ${t.consecutiveFailures}` : ''}${t.lastBlockReason ? ` | Ghi chú: ${escapeHtml(t.lastBlockReason)}` : ''}</small>
           </div>
-          <button class="btn btn-outline-danger btn-sm" onclick="deleteApifyToken('${escapeAttr(t.id)}')">
-            <i data-feather="trash-2" style="width:14px"></i> Xóa
-          </button>
+          <div class="d-flex gap-1">
+            <button class="btn btn-outline-primary btn-sm" onclick="verifySingleApifyToken('${escapeAttr(t.id)}', this)" title="Kiểm tra token này">
+              <i data-feather="check" style="width:14px"></i> Kiểm tra
+            </button>
+            <button class="btn btn-outline-danger btn-sm" onclick="deleteApifyToken('${escapeAttr(t.id)}')" title="Xóa token">
+              <i data-feather="trash-2" style="width:14px"></i> Xóa
+            </button>
+          </div>
         </div>
       </div>
-    `).join('');
+    `;
+    }).join('');
     feather.replace();
   } catch (err) {
     list.innerHTML = `<span class="text-danger">Lỗi tải token: ${escapeHtml(err.message)}</span>`;
+  }
+}
+
+async function verifySingleApifyToken(id, btn) {
+  const status = document.getElementById('apify-token-status');
+  const originalHtml = btn ? btn.innerHTML : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span>';
+  }
+  if (status) status.innerHTML = `<span class="text-muted">Đang kiểm tra token ${escapeHtml(id)}...</span>`;
+
+  try {
+    const res = await apiFetch(`/api/apify-tokens/${encodeURIComponent(id)}/verify`, { method: 'POST' });
+    if (res.success) {
+      if (status) status.innerHTML = `<span class="text-success">Token ${escapeHtml(id)} hợp lệ! Tài khoản: <strong>${escapeHtml(res.result?.username || '')}</strong> (Gói: ${escapeHtml(res.result?.planTier || 'FREE')})</span>`;
+    } else {
+      if (status) status.innerHTML = `<span class="text-danger">Token ${escapeHtml(id)} không hợp lệ: ${escapeHtml(res.result?.error || 'Lỗi kiểm tra')}</span>`;
+    }
+    await loadApifyTokens();
+  } catch (err) {
+    if (status) status.innerHTML = `<span class="text-danger">Lỗi kiểm tra token: ${escapeHtml(err.message)}</span>`;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+      feather.replace();
+    }
+  }
+}
+
+async function verifyAllApifyTokens() {
+  const status = document.getElementById('apify-token-status');
+  const btn = document.getElementById('btn-verify-all-tokens');
+  const originalHtml = btn ? btn.innerHTML : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> Đang kiểm tra...';
+  }
+  if (status) status.innerHTML = '<span class="text-muted">Đang kiểm tra tất cả token qua API Apify... Vui lòng đợi trong giây lát.</span>';
+
+  try {
+    const res = await apiFetch('/api/apify-tokens/verify-all', { method: 'POST' });
+    if (status) {
+      status.innerHTML = `<span class="text-info fw-bold">Kết quả kiểm tra: Tổng ${res.total} token | <span class="text-success">${res.validCount} hợp lệ</span> | <span class="text-danger">${res.invalidCount} lỗi / không tồn tại</span>${res.exhaustedCount > 0 ? ` | <span class="text-warning">${res.exhaustedCount} hết quota</span>` : ''}</span>`;
+    }
+    await loadApifyTokens();
+  } catch (err) {
+    if (status) status.innerHTML = `<span class="text-danger">Lỗi khi kiểm tra tất cả token: ${escapeHtml(err.message)}</span>`;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+      feather.replace();
+    }
   }
 }
 

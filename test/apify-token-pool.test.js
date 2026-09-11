@@ -174,3 +174,84 @@ test('ApifyTokenPool: non-token errors do not exhaust the token', async () => {
   const status = pool.getStatus();
   assert.equal(status.healthyCount, 1); // Token remains healthy
 });
+
+test('ApifyTokenPool: verifyToken updates healthy token state and metadata on success', async () => {
+  const pool = new ApifyTokenPoolManager({
+    tokens: ['mock_valid_token']
+  });
+
+  // Mock client
+  pool.clients.set('token-1', {
+    user: () => ({
+      get: async () => ({
+        username: 'test_user',
+        plan: { tier: 'FREE', monthlyUsageCreditsUsd: 5, maxMonthlyUsageUsd: 5 }
+      })
+    })
+  });
+
+  const res = await pool.verifyToken('token-1');
+  assert.equal(res.success, true);
+  assert.equal(res.username, 'test_user');
+  assert.equal(res.planTier, 'FREE');
+  assert.equal(res.state, 'HEALTHY');
+
+  const status = pool.getStatus();
+  assert.equal(status.tokens[0].username, 'test_user');
+  assert.equal(status.tokens[0].planTier, 'FREE');
+  assert.ok(status.tokens[0].lastVerifiedAt);
+});
+
+test('ApifyTokenPool: verifyToken marks token INVALID on 401 Unauthorized', async () => {
+  const pool = new ApifyTokenPoolManager({
+    tokens: ['mock_invalid_token']
+  });
+
+  // Mock client throwing 401
+  pool.clients.set('token-1', {
+    user: () => ({
+      get: async () => {
+        const err = new Error('User was not found or authentication token is not valid');
+        err.statusCode = 401;
+        throw err;
+      }
+    })
+  });
+
+  const res = await pool.verifyToken('token-1');
+  assert.equal(res.success, false);
+  assert.equal(res.state, 'INVALID');
+
+  const status = pool.getStatus();
+  assert.equal(status.invalidCount, 1);
+  assert.equal(status.tokens[0].state, 'INVALID');
+});
+
+test('ApifyTokenPool: verifyAllTokens verifies all tokens and aggregates counts', async () => {
+  const pool = new ApifyTokenPoolManager({
+    tokens: ['tok_valid', 'tok_invalid']
+  });
+
+  pool.clients.set('token-1', {
+    user: () => ({
+      get: async () => ({ username: 'valid_user', plan: { tier: 'FREE' } })
+    })
+  });
+  pool.clients.set('token-2', {
+    user: () => ({
+      get: async () => {
+        const err = new Error('Invalid token');
+        err.statusCode = 401;
+        throw err;
+      }
+    })
+  });
+
+  const summary = await pool.verifyAllTokens({ concurrency: 2 });
+  assert.equal(summary.total, 2);
+  assert.equal(summary.validCount, 1);
+  assert.equal(summary.invalidCount, 1);
+  assert.equal(summary.status.healthyCount, 1);
+  assert.equal(summary.status.invalidCount, 1);
+});
+

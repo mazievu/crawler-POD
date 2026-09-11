@@ -788,6 +788,29 @@ app.delete('/api/apify-tokens/:id', (req, res) => {
   }
 });
 
+app.post('/api/apify-tokens/:id/verify', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    const pool = getApifyTokenPool();
+    const result = await pool.verifyToken(id);
+    res.json({ success: result.success, result, status: pool.getStatus() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/apify-tokens/verify-all', async (req, res) => {
+  try {
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    const pool = getApifyTokenPool();
+    const result = await pool.verifyAllTokens({ concurrency: 3 });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.delete('/api/runs/:id', async (req, res) => {
   try {
     const run = await db.getRunById(parseInt(req.params.id, 10));

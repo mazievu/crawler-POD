@@ -63,7 +63,23 @@ async function main() {
   // Check using apify-client
   const client = new ApifyClient({ token });
   try {
-    // Attempt to get the actor
+    // 1. Verify token first
+    try {
+      await client.user().get();
+    } catch (authErr) {
+      const authMsg = authErr.message ? authErr.message.toLowerCase() : '';
+      if (authErr.statusCode === 401 || authMsg.includes('authentication') || authMsg.includes('token is not valid') || authMsg.includes('unauthorized')) {
+        result.status = 'invalid_token';
+        result.actions.push('Update APIFY_TOKEN in .env or Apify Token Pool with a valid token');
+        if (isJson) console.log(JSON.stringify(result, null, 2));
+        else {
+          console.log(`Platform: ${platform}\nActor ID: ${actorId}\nStatus: ${result.status}\nActions: \n - ${result.actions.join('\n - ')}`);
+        }
+        return;
+      }
+    }
+
+    // 2. Attempt to get the actor
     const actor = await client.actor(actorId).get();
     if (!actor) {
       result.status = 'actor_not_found';
@@ -85,9 +101,15 @@ async function main() {
     }
   } catch (err) {
     const msg = err.message ? err.message.toLowerCase() : '';
-    if (msg.includes('not found')) {
+    if (err.statusCode === 401 || msg.includes('authentication') || msg.includes('token is not valid') || msg.includes('unauthorized')) {
+       result.status = 'invalid_token';
+       result.actions.push('Check or renew APIFY_TOKEN in .env');
+    } else if (err.statusCode === 404 || (msg.includes('not found') && !msg.includes('user'))) {
        result.status = 'actor_not_found';
-    } else if (msg.includes('unauthorized') || msg.includes('payment') || msg.includes('forbidden') || msg.includes('access denied')) {
+    } else if (err.statusCode === 402 || msg.includes('payment') || msg.includes('usage limit')) {
+       result.status = 'quota_exceeded';
+       result.actions.push('Check Apify account usage limit or upgrade plan');
+    } else if (err.statusCode === 403 || msg.includes('forbidden') || msg.includes('access denied') || msg.includes('rental')) {
        result.status = 'actor_requires_rental';
        result.actions.push('Rent/enable the actor in Apify');
     } else {

@@ -323,9 +323,14 @@
 
           <div class="d-flex justify-content-between align-items-center mb-2">
             <span class="small fw-bold text-muted">Danh Sách Token Trong Pool</span>
-            <button class="btn btn-outline-warning btn-sm py-0 px-2 small" onclick="cleanupApifyTokens()" title="Dọn dẹp các token đã cạn kiệt hoặc lỗi">
-              <i data-feather="refresh-cw" style="width:12px"></i> Dọn token lỗi/hết hạn
-            </button>
+            <div class="d-flex gap-2">
+              <button class="btn btn-outline-primary btn-sm py-0 px-2 small" onclick="verifyAllApifyTokens()" id="btn-verify-all-tokens" title="Kiểm tra trạng thái trực tiếp của tất cả token qua API Apify">
+                <i data-feather="check-circle" style="width:12px"></i> Kiểm tra tất cả token
+              </button>
+              <button class="btn btn-outline-warning btn-sm py-0 px-2 small" onclick="cleanupApifyTokens()" title="Dọn dẹp các token đã cạn kiệt hoặc lỗi">
+                <i data-feather="refresh-cw" style="width:12px"></i> Dọn token lỗi/hết hạn
+              </button>
+            </div>
           </div>
           <div id="apify-token-status" class="small mb-2"></div>
           <div id="apify-tokens-list" class="small text-muted">Đang tải danh sách token...</div>

@@ -84,6 +84,15 @@ async function checkApify(platform) {
 
   const client = new ApifyClient({ token });
   try {
+    try {
+      await client.user().get();
+    } catch (authErr) {
+      const authMsg = authErr.message ? authErr.message.toLowerCase() : '';
+      if (authErr.statusCode === 401 || authMsg.includes('authentication') || authMsg.includes('token is not valid') || authMsg.includes('unauthorized')) {
+        return { status: 'failed', reason: 'INVALID_APIFY_TOKEN' };
+      }
+    }
+
     const actor = await client.actor(apifyBackend.actorId).get();
     if (!actor) return { status: 'failed', reason: 'ACTOR_NOT_FOUND' };
     
@@ -94,8 +103,16 @@ async function checkApify(platform) {
     return { status: 'skipped', reason: 'ENTITLEMENT_UNVERIFIED' };
   } catch (err) {
     const msg = err.message ? err.message.toLowerCase() : '';
-    if (msg.includes('not found')) return { status: 'failed', reason: 'ACTOR_NOT_FOUND' };
-    if (msg.includes('unauthorized') || msg.includes('payment') || msg.includes('forbidden')) {
+    if (err.statusCode === 401 || msg.includes('authentication') || msg.includes('token is not valid') || msg.includes('unauthorized')) {
+      return { status: 'failed', reason: 'INVALID_APIFY_TOKEN' };
+    }
+    if (err.statusCode === 404 || (msg.includes('not found') && !msg.includes('user'))) {
+      return { status: 'failed', reason: 'ACTOR_NOT_FOUND' };
+    }
+    if (err.statusCode === 402 || msg.includes('payment') || msg.includes('usage limit')) {
+      return { status: 'skipped', reason: 'QUOTA_EXCEEDED' };
+    }
+    if (err.statusCode === 403 || msg.includes('forbidden') || msg.includes('rental')) {
       return { status: 'skipped', reason: 'ENTITLEMENT_UNVERIFIED' };
     }
     return { status: 'failed', reason: err.message };
