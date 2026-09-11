@@ -354,6 +354,79 @@ async function getAllRuns(limit = 100) { return await stmt.findAllRuns.all(limit
 async function getRunsByStatus(status) { return await stmt.findRunsByStatus.all(status); }
 async function deleteRun(id) { await stmt.deleteRun.run(id); }
 
+/**
+ * Writes full comment text for one item into post_comments.
+ *
+ * Shapes accepted: clockworks/tiktok-scraper's comment rows (cid, text,
+ * diggCount, replyCommentTotal, repliesToId, uniqueId, createTimeISO) and the
+ * flatter shape a local scraper produces (id, text, likes, replies, author).
+ * Upsert on (item_uid, comment_id) so a re-crawl refreshes like counts and
+ * reply counts in place instead of piling up duplicate rows.
+ */
+async function saveComments(itemUid, platform, runId, comments) {
+  if (!itemUid || !Array.isArray(comments) || comments.length === 0) return { saved: 0 };
+  const collectedAt = new Date().toISOString();
+
+  const upsert = db.prepare(`
+    INSERT INTO post_comments (
+      item_uid, comment_id, platform, parent_comment_id, author, text,
+      likes, reply_count, liked_by_author, pinned_by_author,
+      commented_at, run_id, collected_at
+    ) VALUES (
+      @item_uid, @comment_id, @platform, @parent_comment_id, @author, @text,
+      @likes, @reply_count, @liked_by_author, @pinned_by_author,
+      @commented_at, @run_id, @collected_at
+    )
+    ON CONFLICT (item_uid, comment_id) DO UPDATE SET
+      text = EXCLUDED.text,
+      likes = EXCLUDED.likes,
+      reply_count = EXCLUDED.reply_count,
+      liked_by_author = EXCLUDED.liked_by_author,
+      pinned_by_author = EXCLUDED.pinned_by_author,
+      run_id = EXCLUDED.run_id,
+      collected_at = EXCLUDED.collected_at
+  `);
+
+  let saved = 0;
+  for (const c of comments) {
+    if (!c) continue;
+    // A comment with no id cannot be keyed, and inventing one would create a
+    // fresh duplicate on every crawl. Skipped rather than guessed.
+    const commentId = String(c.cid || c.id || c.comment_id || '').trim();
+    if (!commentId) continue;
+    await upsert.run({
+      item_uid: itemUid,
+      comment_id: commentId,
+      platform: platform || '',
+      parent_comment_id: c.repliesToId || c.parentId || null,
+      author: String(c.uniqueId || c.author || c.username || '').slice(0, 100),
+      text: String(c.text || c.comment || ''),
+      likes: Number(c.diggCount ?? c.likes ?? 0) || 0,
+      reply_count: Number(c.replyCommentTotal ?? c.replies ?? 0) || 0,
+      liked_by_author: Boolean(c.likedByAuthor),
+      pinned_by_author: Boolean(c.pinnedByAuthor),
+      commented_at: c.createTimeISO || c.created_at || '',
+      run_id: runId || null,
+      collected_at: collectedAt,
+    });
+    saved += 1;
+  }
+  return { saved };
+}
+
+/** Comments of one item, most-liked first; replies follow their parent. */
+async function getComments(itemUid, { limit = 200 } = {}) {
+  if (!itemUid) return [];
+  return await db.prepare(
+    `SELECT comment_id, parent_comment_id, author, text, likes, reply_count,
+            liked_by_author, pinned_by_author, commented_at
+       FROM post_comments
+      WHERE item_uid = ?
+      ORDER BY pinned_by_author DESC, likes DESC
+      LIMIT ?`
+  ).all(itemUid, Number(limit) || 200);
+}
+
 async function deleteItem(itemUid) {
   if (!itemUid) return { changes: 0 };
   const tx = db.transaction(async (uid) => {
@@ -369,6 +442,7 @@ async function deleteItem(itemUid) {
     // that was filed. Deleting by platform never touched this table, which is
     // why that path worked.
     try { await db.prepare('DELETE FROM weekly_summary WHERE item_uid = ?').run(uid); } catch (_) {}
+    try { await db.prepare('DELETE FROM post_comments WHERE item_uid = ?').run(uid); } catch (_) {}
     return { changes: snapResult.changes };
   });
   return await tx(itemUid);
@@ -497,6 +571,7 @@ async function insertSnapshots(runId, platform, query, items) {
   let newCount = 0, activeCount = 0, droppedCount = 0;
   const currentUids = new Set();
   const resultItems = []; // Â§6.1: this Run's own packed result array
+  const pendingComments = []; // flushed to post_comments AFTER the item transaction commits
 
   const insertMany = db.transaction(async (txItems) => {
     for (const item of txItems) {
@@ -530,6 +605,7 @@ async function insertSnapshots(runId, platform, query, items) {
         likes: parsed.likes,
         comments: parsed.comments,
         shares: parsed.shares,
+        saves: parsed.saves,
         views: parsed.views
       };
 
@@ -610,10 +686,21 @@ async function insertSnapshots(runId, platform, query, items) {
         subreddit: parsed.subreddit,
         comments: parsed.comments,
         shares: parsed.shares,
+        saves: parsed.saves,
         views: parsed.views,
         status,
         observed_at: new Date().toISOString()
       });
+
+      // Comments are QUEUED, not written here. Writing them inside this
+      // transaction meant one bad comment statement aborted the whole thing —
+      // PostgreSQL refuses every later command once a statement fails, and a
+      // try/catch cannot undo that, so run #1112 lost all three videos to a
+      // single "column id does not exist". They are flushed after commit,
+      // where a failure costs the comments and nothing else.
+      if (Array.isArray(parsed.fullComments) && parsed.fullComments.length > 0) {
+        pendingComments.push({ itemUid, comments: parsed.fullComments });
+      }
 
       // Â§14/Â§16: Gate legacy snapshot writes. When LEGACY_SNAPSHOT_WRITE=false,
       // the snapshots table stops growing (no new rows). V2 dual-write continues.
@@ -689,6 +776,22 @@ async function insertSnapshots(runId, platform, query, items) {
   });
 
   await insertMany(items);
+
+  // Full comment text, written outside the item transaction so a comment
+  // failure costs only the comments. Each item is independent for the same
+  // reason: one unparseable thread should not take the others with it.
+  let savedComments = 0;
+  for (const { itemUid, comments } of pendingComments) {
+    try {
+      const { saved } = await saveComments(itemUid, platform, runId, comments);
+      savedComments += saved;
+    } catch (err) {
+      console.warn(`Run ${runId}: could not save ${comments.length} comment(s) for ${itemUid}: ${err.message}`);
+    }
+  }
+  if (savedComments > 0) {
+    console.log(`Run ${runId}: stored ${savedComments} comment(s) across ${pendingComments.length} item(s).`);
+  }
 
   // Â§6.1: written unconditionally, independent of LEGACY_SNAPSHOT_WRITE.
   await db.prepare('UPDATE runs SET result_items_json = ? WHERE id = ?').run(JSON.stringify(resultItems), runId);
@@ -1137,6 +1240,10 @@ function parseItemData(item) {
   const comments = parseNum(d.comments || d.commentCount || d.commentsCount || d.replyCount || d.reply_count || d.replies || d.conversation_count || d.num_comments || d.numComments || d.comments_count || 0);
   const shares = parseNum(d.shares || d.shareCount || d.sharesCount || d.retweetCount || d.retweet_count || d.retweets || d.reposts || d.repostCount || d.reshare_count || 0);
   const views = parseNum(d.views || d.viewCount || d.viewsCount || d.impressions || d.impression_count || d.view_count || d.video_view_count || 0);
+  // Saves ("Lưu"). Missing here is why run #1079 stored saves=0 for all three
+  // videos even though the normalizer had mapped collectCount correctly: this
+  // is the function that builds what actually reaches product_current.
+  const saves = parseNum(d.saves || d.collectCount || d.collect_count || d.bookmarkCount || 0);
 
   const parseSafeDate = (val) => {
     if (!val) return '';
@@ -1185,7 +1292,8 @@ function parseItemData(item) {
     returnPosition, sold30d, gmv, shopUrl, country,
     title: String(title).substring(0, 200), image, url, author: String(author).substring(0, 100),
     price, currency, source_price: sourcePrice, source_currency: sourceCurrency, fx_rate: fxRate, fx_at: fxAt,
-    rating, reviews, soldCount, likes, comments, shares, views,
+    rating, reviews, soldCount, likes, comments, shares, saves, views,
+    fullComments: Array.isArray(d.fullComments) ? d.fullComments : null,
     startDate, endDate, isActive, publisherPlatforms, fanpageLikes, cta, landingUrl, subreddit };
 }
 
@@ -1855,6 +1963,7 @@ const api = {
   initDatabase,
   getAllPlatforms, createRun, getRunById, getQueuedRuns, getAllRuns, getRunsByStatus, getChildRuns, updateRun, deleteRun,
   deleteItem, deleteAllItems,
+  saveComments, getComments,
   reserveSocialBotWindow, markSocialBotDispatched, markSocialBotFailed, releaseSocialBotWindow,
   getLastDispatchedSocialBotWindow, countDispatchedSocialBotRuns, recoverStalePendingSocialBotWindows,
   insertSnapshots, getLatestSnapshots, getLatestSnapshotByUid, getSnapshotHistory, getSnapshotsByRunId, getRunItems, backfillRunResultItems,

@@ -341,3 +341,43 @@ ALTER TABLE product_current ADD COLUMN IF NOT EXISTS country               TEXT 
 -- job from "press on nails / UK" — without this column every scheduled run fell
 -- back to the actor default and the market was unspecifiable.
 ALTER TABLE marketplace_capture_schedules ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT '';
+
+-- "Saves" / "Lưu": TikTok's collectCount. A distinct signal from shares — a save
+-- is intent to come back, a share is distribution — so it gets its own column
+-- rather than being folded into current_shares, where it would silently inflate
+-- a different metric.
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS current_saves INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE product_current ADD COLUMN IF NOT EXISTS prev_saves    INTEGER;
+
+/*
+ * Full comment text, one row per comment.
+ *
+ * Kept out of product_current deliberately: a post has many comments, they are
+ * text rather than a metric, and product_current holds one row per item. A child
+ * table keeps every comment queryable — search the text, rank by likes, walk a
+ * reply thread — instead of burying them in a JSON blob.
+ *
+ * comment_id is the provider's own id (TikTok's `cid`), so re-crawling a post
+ * updates its comments in place instead of duplicating them.
+ * parent_comment_id is set for replies (TikTok's `repliesToId`).
+ */
+CREATE TABLE IF NOT EXISTS post_comments (
+  item_uid          TEXT NOT NULL,
+  comment_id        TEXT NOT NULL,
+  platform          TEXT NOT NULL DEFAULT '',
+  parent_comment_id TEXT,
+  author            TEXT NOT NULL DEFAULT '',
+  text              TEXT NOT NULL DEFAULT '',
+  likes             INTEGER NOT NULL DEFAULT 0,
+  reply_count       INTEGER NOT NULL DEFAULT 0,
+  liked_by_author   BOOLEAN NOT NULL DEFAULT FALSE,
+  pinned_by_author  BOOLEAN NOT NULL DEFAULT FALSE,
+  commented_at      TEXT NOT NULL DEFAULT '',
+  run_id            INTEGER,
+  collected_at      TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (item_uid, comment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_comments_item   ON post_comments (item_uid, likes DESC);
+CREATE INDEX IF NOT EXISTS idx_post_comments_parent ON post_comments (item_uid, parent_comment_id);
+CREATE INDEX IF NOT EXISTS idx_post_comments_run    ON post_comments (run_id);

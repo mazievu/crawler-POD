@@ -70,6 +70,12 @@ const LOCAL_CHANNEL_CAPABILITIES = {
     mayUseBrowserFallback: false, // no real fallback implemented yet — correctly reports DEPENDENCY_DOWN when SearXNG is down
     supportsSharding: false,
     partitionStrategy: null
+  },
+  tiktok_videos: {
+    hasDirectMethodWithoutSearXNG: true,
+    mayUseBrowserFallback: true,
+    supportsSharding: false,
+    partitionStrategy: null
   }
 };
 

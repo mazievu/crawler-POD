@@ -101,5 +101,13 @@
   "toidispy": {
     "method": "cdp",
     "connectUrl": "http://localhost:9222"
+  },
+  "tiktok_videos": {
+    "method": "api",
+    "baseUrl": "https://www.tiktok.com",
+    "rateLimit": { "perMinute": 30 },
+    "delay": { "min": 2000, "max": 4000 },
+    "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 3000 },
+    "proxy": { "required": false }
   }
 }

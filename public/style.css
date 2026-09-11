@@ -397,3 +397,16 @@ body.modal-open #__everbee_ai_bee {
   .filter-search { width: 200px; }
   .content-area { padding: 12px; }
 }
+
+/* Full comment threads in the item detail modal. Replies are indented under
+   their parent so a "yes same here" reads against what it answers. */
+.comment-list { max-height: 340px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: #fafbff; }
+.comment-row { padding: 7px 0; border-bottom: 1px solid #eef0f6; }
+.comment-row:last-child { border-bottom: none; }
+.comment-reply { margin-left: 22px; border-left: 2px solid #e6e8f0; padding-left: 10px; }
+.comment-head { display: flex; align-items: center; gap: 7px; font-size: 11px; }
+.comment-author { font-weight: 700; color: var(--primary); }
+.comment-likes { margin-left: auto; color: var(--text-3); }
+.comment-pin { font-size: 10px; }
+.comment-text { font-size: 12px; color: var(--text-1); margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+.engagement-stat.saved .eng-val { color: #7c3aed; }

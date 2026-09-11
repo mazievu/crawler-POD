@@ -55,6 +55,48 @@ const ACTOR_PAGE_LIMITS = {
  */
 const ACTOR_INPUT_BUILDERS = {
   /*
+   * clockworks/tiktok-scraper — TikTok VIDEO metrics plus full comment threads.
+   *
+   * This is the actor that used to be wired to tiktok_shop by mistake: it
+   * scrapes videos, not shop listings, which is exactly what tiktok_videos
+   * needs. Verified live on 2026-09-11 (run bufWDKmTr1ENybDdK, dataset
+   * qjmehgl79BOnT5L5Y, "press on nails", 3 videos, $0.031):
+   *
+   *   diggCount 67,000 · shareCount 4,929 · collectCount 20,238
+   *   commentCount 197 · playCount 1,400,000
+   *
+   * Comments land in a SEPARATE dataset the item points at via
+   * `commentsDatasetUrl`; each row carries text, diggCount, replyCommentTotal,
+   * repliesToId, uniqueId and createTimeISO. `commentsPerPost` is what turns
+   * that on — without it the actor returns counts but no comment text.
+   *
+   * The direct-URL form takes precedence: a query that looks like a TikTok URL
+   * is a request for THAT video, not a search for its text.
+   */
+  'clockworks/tiktok-scraper': ({ query, maxItems, options = {} }) => {
+    const trimmed = String(query || '').trim();
+    const isUrl = /^https?:\/\/(www\.|vm\.|vt\.)?tiktok\.com\//i.test(trimmed);
+    const isHashtag = /^#/.test(trimmed);
+    const perPost = Number(options.commentsPerPost ?? 20);
+
+    const base = {
+      resultsPerPage: maxItems,
+      // Comment depth. topLevelCommentsPerPost bounds how many threads and
+      // maxRepliesPerComment bounds each thread, so "full comments" stays
+      // bounded rather than unbounded on a viral post.
+      commentsPerPost: perPost,
+      topLevelCommentsPerPost: Number(options.topLevelCommentsPerPost ?? perPost),
+      maxRepliesPerComment: Number(options.maxRepliesPerComment ?? 5),
+      scrapeRelatedVideos: false,
+      shouldDownloadVideos: false,
+    };
+
+    if (isUrl) return { ...base, postURLs: [trimmed] };
+    if (isHashtag) return { ...base, hashtags: [trimmed.replace(/^#/, '')] };
+    return { ...base, searchQueries: [trimmed], searchSection: '/video' };
+  },
+
+  /*
    * memo23/facebook-ads-library-scraper-ppe — the only source verified to
    * return the two fields apify/facebook-ads-scraper never carries.
    *

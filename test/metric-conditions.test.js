@@ -182,5 +182,29 @@ test('buildSqlOrder: ranking is whitelisted and puts unknown values last', () =>
 
 test('metric groups match the two panels the UI has to render', () => {
   assert.deepEqual(metricsForGroup(ECOM).map((m) => m.name), ['price', 'rating', 'reviews', 'sold', 'likes']);
-  assert.deepEqual(metricsForGroup(SOCIAL).map((m) => m.name), ['likes', 'comments', 'shares', 'views']);
+  // `saves` joined SOCIAL when TikTok video crawling landed: the provider
+  // reports collectCount separately from shareCount.
+  assert.deepEqual(metricsForGroup(SOCIAL).map((m) => m.name), ['likes', 'comments', 'shares', 'views', 'saves']);
+});
+
+test('saves is its own metric, not an alias of shares', () => {
+  const { METRICS, buildSqlFilter, readMetric } = require('../src/filters/metric-conditions');
+
+  // Distinct columns — folding saves into shares would report a number for
+  // shares that the provider never measured.
+  assert.equal(METRICS.saves.column, 'current_saves');
+  assert.notEqual(METRICS.saves.column, METRICS.shares.column);
+
+  // readMetric reads a NORMALIZED item (social-post.js has already mapped
+  // shareCount -> shares and collectCount -> saves), so the two must stay
+  // independent all the way through rather than collapsing into one number.
+  const normalized = { shares: 4929, saves: 20238 };
+  assert.equal(readMetric(normalized, 'shares'), 4929);
+  assert.equal(readMetric(normalized, 'saves'), 20238);
+
+  // A post that is shared but never saved must report 0 saves, not its shares.
+  assert.equal(readMetric({ shares: 4929, saves: 0 }, 'saves'), 0);
+
+  const { sql } = buildSqlFilter([{ field: 'saves', operator: 'gt', value: 0 }]);
+  assert.match(sql, /current_saves > @mc0/);
 });

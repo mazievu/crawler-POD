@@ -81,6 +81,14 @@ const METRICS = {
     label: 'Views', groups: [SOCIAL],
     itemKeys: ['views', 'current_views'], column: 'current_views',
   },
+  // "Lưu" — TikTok's collectCount. Deliberately not merged into `shares`: a
+  // save is intent to return, a share is distribution, and the provider counts
+  // them separately (67,000 diggs / 4,929 shares / 20,238 collects on one
+  // video, run bufWDKmTr1ENybDdK).
+  saves: {
+    label: 'Saves (Lưu)', groups: [SOCIAL],
+    itemKeys: ['saves', 'collectCount', 'current_saves'], column: 'current_saves',
+  },
 };
 
 /** Symbols and names both accepted, so a UI and a JSON job spec can share this. */
@@ -284,6 +292,9 @@ const PLATFORM_METRICS = {
   reddit: ['likes', 'comments'],
   toidispy: ['likes', 'comments', 'shares', 'views'],
   twitter: ['likes', 'comments', 'shares', 'views'],
+  // clockworks/tiktok-scraper reports all five, saves included — verified on
+  // run bufWDKmTr1ENybDdK (3/3 videos carried a non-zero collectCount).
+  tiktok_videos: ['likes', 'comments', 'shares', 'views', 'saves'],
 };
 
 /**
