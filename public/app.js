@@ -387,6 +387,7 @@ function renderItems(items) {
           <div class="engagement-stat liked" title="Likes / Reactions"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes || 0)}</span>${growthHtml.likes}</div>
           <div class="engagement-stat commented" title="Comments"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments || 0)}</span>${growthHtml.comments}</div>
           <div class="engagement-stat shared" title="Shares / Repins"><i data-feather="share-2"></i><span class="eng-val">${formatNum(item.shares || 0)}</span>${growthHtml.shares}</div>
+          ${Number(item.saves) > 0 ? `<div class="engagement-stat saved" title="Lưu / Saves — TikTok collectCount, đếm riêng với Shares"><i data-feather="bookmark"></i><span class="eng-val">${formatNum(item.saves)}</span></div>` : ''}
           <div class="engagement-stat" title="Views"><i data-feather="eye"></i><span class="eng-val">${formatNum(item.views || 0)}</span>${growthHtml.views}</div>
         </div>`;
 
@@ -505,6 +506,53 @@ function renderProductMetrics(item) {
 
 // ==================== Item Detail + Timeline ====================
 
+/**
+ * Full comment text for the open item, from the post_comments table.
+ *
+ * Replies are nested under their parent via parent_comment_id rather than
+ * listed flat, because a reply read on its own usually makes no sense. A post
+ * with no stored comments renders nothing at all — an empty "Comments (0)"
+ * heading would suggest the post has none, when the truth is usually that this
+ * platform's crawl does not collect them.
+ */
+async function loadItemComments(itemUid) {
+  const host = document.getElementById('item-comments-block');
+  if (!host) return;
+  let rows = [];
+  try {
+    rows = await apiFetch(`/api/items/${encodeURIComponent(itemUid)}/comments?limit=200`);
+  } catch (err) {
+    console.error('Could not load comments:', err);
+    return;
+  }
+  if (!Array.isArray(rows) || rows.length === 0) return;
+
+  const replies = new Map();
+  for (const r of rows) {
+    if (!r.parent_comment_id) continue;
+    if (!replies.has(r.parent_comment_id)) replies.set(r.parent_comment_id, []);
+    replies.get(r.parent_comment_id).push(r);
+  }
+  const renderOne = (c, isReply) => `
+    <div class="comment-row${isReply ? ' comment-reply' : ''}">
+      <div class="comment-head">
+        <span class="comment-author">@${escapeHtml(c.author || 'unknown')}</span>
+        ${c.pinned_by_author ? '<span class="comment-pin" title="Tác giả ghim">📌</span>' : ''}
+        ${c.liked_by_author ? '<span class="comment-pin" title="Tác giả đã thích">💗</span>' : ''}
+        <span class="comment-likes" title="Tym của bình luận">❤ ${formatNum(c.likes || 0)}</span>
+      </div>
+      <div class="comment-text">${escapeHtml(c.text || '')}</div>
+    </div>`;
+
+  const top = rows.filter((c) => !c.parent_comment_id);
+  const body = top.map((c) => renderOne(c, false) + (replies.get(c.comment_id) || []).map((r) => renderOne(r, true)).join('')).join('');
+
+  host.innerHTML = `
+    <hr>
+    <h6 class="fw-bold mb-2">💬 Bình Luận (${rows.length}${top.length !== rows.length ? `, gồm ${rows.length - top.length} trả lời` : ''})</h6>
+    <div class="comment-list">${body}</div>`;
+}
+
 async function showItemDetail(itemUid) {
   try {
     const history = await apiFetch(`/api/items/${encodeURIComponent(itemUid)}/history`);
@@ -612,6 +660,7 @@ async function showItemDetail(itemUid) {
       ${statsHtml}
       <div class="timeline-chart mb-3">${timelineHtml}</div>
       <hr>
+      <div id="item-comments-block"></div>
       <h6 class="fw-bold mb-2">Lịch Sử Biến Động (${history.length} lần cào)</h6>
       <div class="table-responsive">
         <table class="table table-sm fs-13 align-middle">
@@ -703,6 +752,9 @@ async function showItemDetail(itemUid) {
     const modal = new bootstrap.Modal(document.getElementById('item-modal'));
     modal.show();
     feather.replace();
+    // Comments are fetched after the modal paints: a post can carry hundreds,
+    // and they are not worth delaying the metrics the user came to see.
+    loadItemComments(latest.item_uid);
   } catch (err) { console.error('Detail failed:', err); }
 }
 

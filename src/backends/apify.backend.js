@@ -105,6 +105,45 @@ class ApifyBackend extends BaseBackend {
         items = envelope.data;
       }
 
+      /*
+       * clockworks/tiktok-scraper puts comment text in a SEPARATE dataset and
+       * leaves only a pointer on each video (`commentsDatasetUrl`). Fetching it
+       * here — while the Apify client is in hand — is what makes "full
+       * comments" reach the pipeline at all; the normalizer and the
+       * post_comments table both read `item.fullComments`.
+       *
+       * All videos in one run share a single comments dataset, so it is fetched
+       * once and grouped by `videoWebUrl`. A failure is logged and left empty:
+       * the video's own metrics are still good, and silently pretending a post
+       * has no comments would be worse than saying so in the log.
+       */
+      if (Array.isArray(items) && items.length > 0 && items.some((it) => it && it.commentsDatasetUrl)) {
+        const commentsDatasetId = String(items.find((it) => it && it.commentsDatasetUrl).commentsDatasetUrl)
+          .match(/datasets\/([A-Za-z0-9]+)/)?.[1];
+        if (commentsDatasetId) {
+          try {
+            const commentRows = await apifyClient.fetchDatasetItems(commentsDatasetId, 5000, apiClient);
+            const byVideo = new Map();
+            for (const row of commentRows) {
+              const key = row?.videoWebUrl;
+              if (!key) continue;
+              if (!byVideo.has(key)) byVideo.set(key, []);
+              byVideo.get(key).push(row);
+            }
+            let attached = 0;
+            for (const item of items) {
+              const rows = byVideo.get(item.webVideoUrl) || [];
+              item.fullComments = rows;
+              if (rows.length) attached += 1;
+            }
+            console.log(`[Apify] ${channel.name}: attached ${commentRows.length} comment(s) to ${attached}/${items.length} video(s) from dataset ${commentsDatasetId}.`);
+          } catch (err) {
+            console.warn(`[Apify] ${channel.name}: could not fetch comments dataset ${commentsDatasetId}: ${err.message}`);
+            for (const item of items) if (!item.fullComments) item.fullComments = [];
+          }
+        }
+      }
+
       // If pinterest, enrich items with real engagement metrics (repins/shares, comments, likes/reactions, views, author)
       if (channel.name === 'pinterest' && Array.isArray(items) && items.length > 0) {
         try {

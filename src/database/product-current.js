@@ -51,7 +51,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
       item_uid, platform, query, title, url, image, author, video_url, media_type,
       return_position, sold_30d, gmv, shop_url, country,
       current_price, current_rating, current_reviews, current_sold,
-      current_likes, current_comments, current_shares, current_views,
+      current_likes, current_comments, current_shares, current_views, current_saves,
       delta_3h_likes, delta_3h_views, delta_24h_likes, delta_24h_views, delta_24h_sold,
       rank_score, status, last_run_id, observation_count,
       first_seen_at, last_seen_at, last_crawled_at
@@ -59,7 +59,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
       @item_uid, @platform, @query, @title, @url, @image, @author, @video_url, @media_type,
       @return_position, @sold_30d, @gmv, @shop_url, @country,
       @current_price, @current_rating, @current_reviews, @current_sold,
-      @current_likes, @current_comments, @current_shares, @current_views,
+      @current_likes, @current_comments, @current_shares, @current_views, @current_saves,
       NULL, NULL, NULL, NULL, NULL,
       @rank_score, 'new', @last_run_id, 1,
       CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
@@ -101,6 +101,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
       prev_likes = current_likes,
       prev_comments = current_comments,
       prev_shares = current_shares,
+      prev_saves = current_saves,
       prev_views = current_views,
       prev_sold = current_sold,
       prev_reviews = current_reviews,
@@ -112,6 +113,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
       current_likes = @current_likes,
       current_comments = @current_comments,
       current_shares = @current_shares,
+      current_saves = @current_saves,
       current_views = @current_views,
 
       delta_price = @delta_price,
@@ -159,6 +161,8 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
     const likes = Number(item.likes || 0);
     const comments = Number(item.comments || 0);
     const shares = Number(item.shares || 0);
+    // Saves ("Lưu") — TikTok's collectCount, kept separate from shares.
+    const saves = Number(item.saves || 0);
     const views = Number(item.views || 0);
     const nowMs = new Date(timestamp).getTime();
 
@@ -191,6 +195,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
         current_likes: likes,
         current_comments: comments,
         current_shares: shares,
+        current_saves: saves,
         current_views: views,
         rank_score: rankScore,
         last_run_id: runId
@@ -242,6 +247,7 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
         current_likes: likes,
         current_comments: comments,
         current_shares: shares,
+        current_saves: saves,
         current_views: views,
         delta_price,
         delta_rating,

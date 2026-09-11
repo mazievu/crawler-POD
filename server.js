@@ -925,6 +925,8 @@ async function mapProductCurrentToItemShape(p) {
     prev_likes: p.prev_likes,
     comments: p.current_comments,
     shares: p.current_shares,
+    saves: p.current_saves,
+    prev_saves: p.prev_saves,
     views: p.current_views,
     status: p.status,
     created_at: p.last_crawled_at,
@@ -944,6 +946,20 @@ async function mapProductCurrentToItemShape(p) {
 
 // Task 2: the UI builds its two filter panels from this rather than hardcoding
 // a metric list that could drift from what the server actually accepts.
+/**
+ * Full comment text for one item, most-liked first (pinned comments lead).
+ * Separate from /api/items because a post can carry hundreds of comments and
+ * the grid does not need them — only the detail view asks.
+ */
+app.get('/api/items/:uid/comments', async (req, res) => {
+  try {
+    const limit = req.query.limit ? Number(req.query.limit) : 200;
+    res.json(await db.getComments(decodeURIComponent(req.params.uid), { limit }));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/item-metrics', (req, res) => {
   // `platforms` is what both filter panels are built from: a platform's tick
   // boxes must be the metrics that platform can actually report, so the UI

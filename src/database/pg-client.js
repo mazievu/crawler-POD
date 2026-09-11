@@ -80,7 +80,7 @@ function isPgliteDriver(driver) {
 
 // Tables whose primary key is not a column named `id`; `RETURNING id` must not
 // be appended for these, and lastInsertRowid is meaningless for them.
-const TABLES_WITHOUT_ID = new Set(['product_current', 'migration_checkpoints']);
+const TABLES_WITHOUT_ID = new Set(['product_current', 'migration_checkpoints', 'post_comments']);
 
 /** Tables are quoted/unquoted in the source SQL; match either form. */
 function insertTargetTable(sql) {

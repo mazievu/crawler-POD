@@ -119,11 +119,29 @@ function extractMedia(raw) {
 }
 
 module.exports = function normalizeSocialPost(raw, context = { platform: 'social_post' }) {
-  const url = raw.url || raw.permalink || raw.link || raw.twitterUrl || (raw.id_str ? `https://x.com/i/web/status/${raw.id_str}` : (raw.id ? `https://x.com/i/web/status/${raw.id}` : '')) || '';
+  /*
+   * The x.com fallback is Twitter-only. It used to fire for ANY platform whose
+   * raw item happened to carry an `id`, and TikTok items do: every video from
+   * clockworks/tiktok-scraper was stored under
+   * `https://x.com/i/web/status/<tiktok id>` — a Twitter URL that does not
+   * exist, used as the item's identity. Guarding it on the platform keeps the
+   * fallback where it belongs; `webVideoUrl` is TikTok's own canonical link.
+   */
+  const isTwitter = context.platform === 'twitter';
+  const twitterFallback = isTwitter
+    ? (raw.id_str ? `https://x.com/i/web/status/${raw.id_str}` : (raw.id ? `https://x.com/i/web/status/${raw.id}` : ''))
+    : '';
+  const url = raw.url || raw.permalink || raw.link || raw.webVideoUrl || raw.twitterUrl || twitterFallback || '';
   const title = raw.title || raw.text || raw.full_text || raw.message || raw.message_rich || raw.caption || raw.description || '';
   
   let author = '';
-  if (typeof raw.author === 'object' && raw.author) {
+  // clockworks/tiktok-scraper nests the creator under authorMeta and leaves
+  // `author` unset, so every TikTok row was persisted with an empty author.
+  // `name` is the @handle, which is the stable identity; nickName is the
+  // display name and is free text.
+  if (typeof raw.authorMeta === 'object' && raw.authorMeta) {
+    author = raw.authorMeta.name || raw.authorMeta.nickName || raw.authorMeta.uniqueId || '';
+  } else if (typeof raw.author === 'object' && raw.author) {
     author = raw.author.name || raw.author.username || raw.author.userName || raw.author.screen_name || raw.author.nickName || '';
   } else if (typeof raw.user === 'object' && raw.user) {
     author = raw.user.name || raw.user.screen_name || raw.user.username || '';
@@ -172,6 +190,17 @@ module.exports = function normalizeSocialPost(raw, context = { platform: 'social
     comments: parseNum(raw.comments || raw.commentCount || raw.commentsCount || raw.replyCount || raw.reply_count || raw.replies || raw.conversation_count || raw.num_comments || raw.numComments || raw.comments_count || 0),
     shares: parseNum(raw.shares || raw.shareCount || raw.sharesCount || raw.retweetCount || raw.retweet_count || raw.retweets || raw.repostCount || raw.reshare_count || raw.repin_count || raw.repinCount || raw.saves || 0),
     views: parseNum(raw.views || raw.viewCount || raw.viewsCount || raw.impressions || raw.impression_count || raw.view_count || raw.playCount || raw.video_view_count || 0),
+    // Saves ("Lưu") is its own signal, not a share: TikTok reports collectCount
+    // separately from shareCount, and folding one into the other would report a
+    // number for shares that nobody measured. Verified on clockworks/tiktok-
+    // scraper run bufWDKmTr1ENybDdK — one video returned 67,000 diggs, 4,929
+    // shares and 20,238 collects: three different quantities.
+    saves: parseNum(raw.saves || raw.collectCount || raw.collect_count || raw.bookmarkCount || 0),
+    // Full comment text, on its way to the post_comments table. The normalizer
+    // does not shape it — persistence does — but it has to survive this hop,
+    // because the field list here is all that reaches the database.
+    fullComments: Array.isArray(raw.fullComments) ? raw.fullComments
+      : (Array.isArray(raw.comments_list) ? raw.comments_list : null),
     publishedAt: parseDate(raw.publishedAt || raw.createdAt || raw.created_at || raw.createTimeISO || raw.timestamp),
     raw: raw
   };
