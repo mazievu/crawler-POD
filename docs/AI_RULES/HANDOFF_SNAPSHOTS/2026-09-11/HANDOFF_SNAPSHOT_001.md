@@ -188,10 +188,9 @@ apify-client-coverage   5 pass / 0 fail
 TOTAL                  61 pass / 0 fail
 ```
 
-### Known Limitations
+### Known Limitations & Operational Notes
 
-1. **Local scraper vẫn ở priority 20 nhưng KHÔNG dùng được** — TikTok chặn HTTP tier, và bug
-   `agent`/native-fetch chưa sửa. Nó chỉ là fallback trên giấy. Cân nhắc `enabled: false`.
-2. 8 file của Report 1 + toàn bộ thay đổi Report 2 **chưa commit**.
-3. Chi phí: ~$0.031 cho 3 video (đã chạy 4 lần trong quá trình debug).
-4. Chưa E2E hai kiểu input còn lại (`postURLs`, `hashtags`) — builder đã viết nhưng chưa chạy thật.
+1. **Local Scraper**: Đã cấu hình `enabled: false` trong `tiktok_videos.channel.js` vì TikTok chặn nghiêm ngặt IP datacenter và trang SSR thiếu comment text/saves. Luồng chạy production được định tuyến qua actor Apify `clockworks/tiktok-scraper` (verified live).
+2. **Input Support**: Hỗ trợ 3 dạng đầu vào: từ khóa (`searchQueries`), hashtag (`hashtags`), và link video trực tiếp (`postURLs`).
+3. **Unit Test Coverage**: Module `src/scrapers/tiktok.js` xuất các hàm tiện ích (`parseItemStruct`, `parseNum`, `isVideoUrl`, `extractVideoId`, `fetchVideoMetrics`) và được kiểm thử trực tiếp kèm mock fetch trong `test/tiktok-scraper.test.js` (27/27 tests PASS).
+

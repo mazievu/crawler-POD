@@ -97,15 +97,9 @@ async function fetchVideoMetrics(videoUrl, options = {}) {
     redirect: 'follow',
   };
 
-  // Proxy support via ProxyAgent (same pattern as reddit.js)
-  if (proxyUrl) {
-    try {
-      const { ProxyAgent } = require('proxy-agent');
-      fetchOpts.agent = new ProxyAgent(proxyUrl);
-    } catch (_) {
-      // proxy-agent not available, proceed without proxy
-    }
-  }
+  // Note: Native global fetch does not use http.Agent.
+  // For production crawls requiring residential proxies and comment extraction,
+  // the primary execution path routes through the Apify actor.
 
   const resp = await fetch(videoUrl, fetchOpts);
   if (!resp.ok) {
@@ -216,6 +210,8 @@ function parseItemStruct(item) {
     // Creator info
     author: {
       uniqueId: author.uniqueId || '',
+      name: author.uniqueId || '',
+      username: author.uniqueId || '',
       nickname: author.nickname || '',
       verified: !!author.verified,
       signature: author.signature || '',
@@ -644,4 +640,14 @@ async function scrape(query, options = {}) {
   };
 }
 
-module.exports = { scrape };
+module.exports = {
+  scrape,
+  fetchVideoMetrics,
+  parseItemStruct,
+  parseNum,
+  isVideoUrl,
+  extractVideoId,
+  TIKTOK_VIDEO_URL_RE,
+  TIKTOK_SHORT_URL_RE,
+  REHYDRATION_SCRIPT_ID,
+};

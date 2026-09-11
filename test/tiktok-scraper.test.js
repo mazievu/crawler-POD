@@ -1,17 +1,33 @@
 /**
- * TikTok Scraper Tests — Zero paid calls, all mocked
+ * TikTok Scraper Tests — Calling real exported module functions
  *
- * Tests the core parsing logic of src/scrapers/tiktok.js:
- *   - Rehydration JSON parsing (metrics extraction)
- *   - Comment parsing
- *   - URL detection and video ID extraction
- *   - Error handling for missing/invalid data
+ * Tests the core parsing and scraping logic of src/scrapers/tiktok.js:
+ *   - URL detection and video ID extraction (real isVideoUrl, extractVideoId)
+ *   - Number parsing (real parseNum)
+ *   - Item struct parsing (real parseItemStruct)
+ *   - Rehydration HTML extraction via mock fetch (real fetchVideoMetrics)
+ *   - Error branches: HTTP error, REHYDRATION_MISSING, VIDEO_REMOVED
+ *   - End-to-end scrape() for single video URL
+ *   - Normalizer and ingestion filter compatibility
  */
 
-const { describe, it } = require('node:test');
+const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 
-// ─── Mock Data ──────────────────────────────────────────────────────────────
+const {
+  scrape,
+  fetchVideoMetrics,
+  parseItemStruct,
+  parseNum,
+  isVideoUrl,
+  extractVideoId,
+  TIKTOK_VIDEO_URL_RE,
+  TIKTOK_SHORT_URL_RE,
+} = require('../src/scrapers/tiktok');
+
+const normalizeSocialPost = require('../src/normalize/social-post');
+
+// ─── Mock Fixtures ──────────────────────────────────────────────────────────
 
 const MOCK_ITEM_STRUCT = {
   id: '7345678901234567890',
@@ -79,284 +95,300 @@ const MOCK_ITEM_STRUCT = {
   contents: [{ desc: 'Auto-generated subtitles text' }],
 };
 
-const MOCK_REHYDRATION_HTML = `
-<!DOCTYPE html>
+function makeRehydrationHtml(payload) {
+  return `<!DOCTYPE html>
 <html>
 <head><title>TikTok</title></head>
 <body>
 <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">
-${JSON.stringify({
+${JSON.stringify(payload)}
+</script>
+</body>
+</html>`;
+}
+
+const VALID_REHYDRATION_HTML = makeRehydrationHtml({
   __DEFAULT_SCOPE__: {
     'webapp.video-detail': {
       itemInfo: {
-        itemStruct: MOCK_ITEM_STRUCT
-      }
-    }
-  }
-})}
-</script>
-</body>
-</html>
-`;
-
-const MOCK_COMMENT_API_RESPONSE = {
-  status_code: 0,
-  comments: [
-    {
-      cid: '7345000000000000001',
-      text: 'This is amazing! Where can I buy?',
-      digg_count: 150,
-      reply_comment_total: 4,
-      create_time: 1718001000,
-      user: {
-        uid: '100001',
-        unique_id: 'commenter1',
-        nickname: 'Happy Shopper',
-        avatar_thumb: { url_list: ['https://p16.tiktokcdn.com/avatar1.jpg'] },
+        itemStruct: MOCK_ITEM_STRUCT,
       },
     },
-    {
-      cid: '7345000000000000002',
-      text: 'Need this in my life 😍',
-      digg_count: 42,
-      reply_comment_total: 0,
-      create_time: 1718002000,
-      user: {
-        uid: '100002',
-        unique_id: 'commenter2',
-        nickname: 'Design Fan',
-        avatar_thumb: { url_list: ['https://p16.tiktokcdn.com/avatar2.jpg'] },
-      },
-    },
-  ],
-  cursor: 20,
-  has_more: 0,
-  total: 2,
-};
+  },
+});
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-// We need to test the internal functions directly. Since the module uses
-// require-time side effects minimally, we can load and test the exported
-// scrape function's dependencies by testing the parsing logic indirectly.
-
-// Load the module — we only test pure functions, no network calls
-const scraperPath = require.resolve('../src/scrapers/tiktok.js');
-
-describe('TikTok Scraper — URL Detection', () => {
-  // Test URL patterns directly since they're regex-based
-  const VIDEO_RE = /tiktok\.com\/@[\w.]+\/video\/(\d+)/i;
-  const SHORT_RE = /vm\.tiktok\.com\/[\w]+/i;
-
-  it('should detect standard video URL', () => {
-    assert.ok(VIDEO_RE.test('https://www.tiktok.com/@creator/video/7345678901234567890'));
+describe('TikTok Scraper — URL Detection (Direct Module Calls)', () => {
+  it('should detect standard video URL via isVideoUrl', () => {
+    assert.equal(isVideoUrl('https://www.tiktok.com/@creator/video/7345678901234567890'), true);
   });
 
-  it('should extract video ID from URL', () => {
-    const match = 'https://www.tiktok.com/@creator/video/7345678901234567890'.match(VIDEO_RE);
-    assert.equal(match[1], '7345678901234567890');
+  it('should extract video ID from URL via extractVideoId', () => {
+    assert.equal(extractVideoId('https://www.tiktok.com/@creator/video/7345678901234567890'), '7345678901234567890');
   });
 
-  it('should detect short URL', () => {
-    assert.ok(SHORT_RE.test('https://vm.tiktok.com/ZMrABC123/'));
+  it('should detect short URL via isVideoUrl', () => {
+    assert.equal(isVideoUrl('https://vm.tiktok.com/ZMrABC123/'), true);
   });
 
-  it('should NOT detect keyword as URL', () => {
-    assert.ok(!VIDEO_RE.test('#tiktokmademebuyit'));
-    assert.ok(!SHORT_RE.test('pod trend custom mug'));
+  it('should return null when extracting video ID from non-video URL', () => {
+    assert.equal(extractVideoId('https://www.tiktok.com/@creator'), null);
   });
 
-  it('should handle URL with query params', () => {
-    assert.ok(VIDEO_RE.test('https://www.tiktok.com/@creator/video/7345678901234567890?is_from_webapp=1'));
+  it('should reject keywords and hashtags in isVideoUrl', () => {
+    assert.equal(isVideoUrl('#tiktokmademebuyit'), false);
+    assert.equal(isVideoUrl('pod trend custom mug'), false);
   });
 
-  it('should handle creator names with dots', () => {
-    assert.ok(VIDEO_RE.test('https://www.tiktok.com/@creator.name/video/7345678901234567890'));
+  it('should handle URL with query parameters', () => {
+    assert.equal(isVideoUrl('https://www.tiktok.com/@creator/video/7345678901234567890?is_from_webapp=1'), true);
+    assert.equal(extractVideoId('https://www.tiktok.com/@creator/video/7345678901234567890?is_from_webapp=1'), '7345678901234567890');
+  });
+
+  it('should handle creator handles containing dots and underscores', () => {
+    assert.equal(isVideoUrl('https://www.tiktok.com/@creator.name_official/video/7345678901234567890'), true);
+    assert.equal(extractVideoId('https://www.tiktok.com/@creator.name_official/video/7345678901234567890'), '7345678901234567890');
   });
 });
 
-describe('TikTok Scraper — Rehydration JSON Parsing', () => {
-  // Simulate what fetchVideoMetrics does internally
-  function parseRehydrationHTML(html) {
-    const scriptStart = html.indexOf('id="__UNIVERSAL_DATA_FOR_REHYDRATION__"');
-    if (scriptStart === -1) throw new Error('REHYDRATION_MISSING');
-
-    const jsonStart = html.indexOf('>', scriptStart) + 1;
-    const jsonEnd = html.indexOf('</script>', jsonStart);
-    const jsonStr = html.substring(jsonStart, jsonEnd).trim();
-    return JSON.parse(jsonStr);
-  }
-
-  it('should extract rehydration JSON from HTML', () => {
-    const data = parseRehydrationHTML(MOCK_REHYDRATION_HTML);
-    assert.ok(data.__DEFAULT_SCOPE__);
-    assert.ok(data.__DEFAULT_SCOPE__['webapp.video-detail']);
+describe('TikTok Scraper — Number Parsing (Direct Module Calls)', () => {
+  it('should parse raw numbers correctly', () => {
+    assert.equal(parseNum(15200), 15200);
+    assert.equal(parseNum(0), 0);
   });
 
-  it('should find itemStruct in rehydration data', () => {
-    const data = parseRehydrationHTML(MOCK_REHYDRATION_HTML);
-    const item = data.__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct;
-    assert.equal(item.id, '7345678901234567890');
-  });
-
-  it('should throw on missing rehydration script', () => {
-    assert.throws(
-      () => parseRehydrationHTML('<html><body>No script here</body></html>'),
-      /REHYDRATION_MISSING/
-    );
-  });
-});
-
-describe('TikTok Scraper — Item Parsing', () => {
-  // Replicate the parseItemStruct logic for testing
-  function parseNum(v) {
-    if (typeof v === 'number') return Number.isFinite(v) && v >= 0 ? Math.round(v) : 0;
-    const s = String(v ?? '');
-    const match = s.replace(/,/g, '').match(/([\d.]+)\s*([kmb])?/i);
-    if (!match) return 0;
-    const mult = { k: 1e3, m: 1e6, b: 1e9 }[String(match[2] || '').toLowerCase()] || 1;
-    return Math.round(parseFloat(match[1]) * mult) || 0;
-  }
-
-  it('should parse all core stats correctly', () => {
-    const stats = MOCK_ITEM_STRUCT.statsV2;
-    assert.equal(parseNum(stats.diggCount), 15200);
-    assert.equal(parseNum(stats.commentCount), 340);
-    assert.equal(parseNum(stats.shareCount), 1280);
-    assert.equal(parseNum(stats.collectCount), 890);
-    assert.equal(parseNum(stats.playCount), 524000);
-    assert.equal(parseNum(stats.repostCount), 45);
-  });
-
-  it('should parse shorthand numbers (K, M, B)', () => {
+  it('should parse string shorthand numbers (K, M, B)', () => {
     assert.equal(parseNum('1.5K'), 1500);
     assert.equal(parseNum('2.3M'), 2300000);
     assert.equal(parseNum('1B'), 1000000000);
     assert.equal(parseNum('524k'), 524000);
   });
 
-  it('should handle zero and null gracefully', () => {
-    assert.equal(parseNum(0), 0);
+  it('should handle null, undefined, empty string gracefully', () => {
     assert.equal(parseNum(null), 0);
     assert.equal(parseNum(undefined), 0);
     assert.equal(parseNum(''), 0);
     assert.equal(parseNum('no numbers here'), 0);
   });
 
-  it('should handle negative numbers as 0', () => {
+  it('should normalize negative sentinel values to 0', () => {
     assert.equal(parseNum(-1), 0);
     assert.equal(parseNum(-999), 0);
   });
+});
 
-  it('should extract author info', () => {
-    const a = MOCK_ITEM_STRUCT.author;
-    assert.equal(a.uniqueId, 'creatorname');
-    assert.equal(a.nickname, 'Creator Display Name');
-    assert.equal(a.verified, true);
-    assert.ok(a.signature.includes('POD creator'));
+describe('TikTok Scraper — parseItemStruct (Direct Module Calls)', () => {
+  const item = parseItemStruct(MOCK_ITEM_STRUCT);
+
+  it('should parse identity and URL', () => {
+    assert.equal(item.id, '7345678901234567890');
+    assert.equal(item.platform, 'tiktok_videos');
+    assert.equal(item.title, 'Check out this amazing POD trend! #tiktokmademebuyit #podtrend');
+    assert.equal(item.url, 'https://www.tiktok.com/@creatorname/video/7345678901234567890');
+    assert.equal(item.image, 'https://p16-sign.tiktokcdn.com/origin-cover.jpg');
   });
 
-  it('should extract hashtags from textExtra', () => {
-    const hashtags = MOCK_ITEM_STRUCT.textExtra
-      .filter(t => t.hashtagName)
-      .map(t => t.hashtagName);
-    assert.deepEqual(hashtags, ['tiktokmademebuyit', 'podtrend']);
+  it('should parse core engagement metrics and aliases', () => {
+    assert.equal(item.diggCount, 15200);
+    assert.equal(item.likes, 15200);
+    assert.equal(item.commentCount, 340);
+    assert.equal(item.comments, 340);
+    assert.equal(item.shareCount, 1280);
+    assert.equal(item.shares, 1280);
+    assert.equal(item.collectCount, 890);
+    assert.equal(item.playCount, 524000);
+    assert.equal(item.views, 524000);
+    assert.equal(item.repostCount, 45);
   });
 
-  it('should extract music info', () => {
-    const m = MOCK_ITEM_STRUCT.music;
-    assert.equal(m.title, 'Original Sound');
-    assert.equal(m.original, true);
-    assert.equal(m.duration, 15);
+  it('should extract detailed creator information', () => {
+    assert.equal(item.author.uniqueId, 'creatorname');
+    assert.equal(item.author.nickname, 'Creator Display Name');
+    assert.equal(item.author.verified, true);
+    assert.equal(item.author.followerCount, 1250000);
+    assert.equal(item.author.heartCount, 45000000);
+    assert.ok(item.author.signature.includes('POD creator'));
   });
 
-  it('should extract video metadata', () => {
-    const v = MOCK_ITEM_STRUCT.video;
-    assert.equal(v.duration, 15);
-    assert.equal(v.width, 576);
-    assert.equal(v.height, 1024);
-    assert.ok(v.originCover.includes('tiktokcdn.com'));
+  it('should extract music metadata', () => {
+    assert.equal(item.music.title, 'Original Sound');
+    assert.equal(item.music.authorName, 'creatorname');
+    assert.equal(item.music.original, true);
+    assert.equal(item.music.duration, 15);
   });
 
-  it('should extract POI (location)', () => {
-    const p = MOCK_ITEM_STRUCT.poi;
-    assert.equal(p.name, 'Ho Chi Minh City');
-    assert.equal(p.country, 'Vietnam');
+  it('should extract hashtags and challenges', () => {
+    assert.deepEqual(item.hashtags, ['tiktokmademebuyit', 'podtrend']);
+    assert.equal(item.challenges.length, 1);
+    assert.equal(item.challenges[0].title, 'tiktokmademebuyit');
   });
 
-  it('should extract shop product anchors', () => {
-    const anchors = MOCK_ITEM_STRUCT.anchors.filter(a => a.type === 6);
-    assert.equal(anchors.length, 1);
-    assert.equal(anchors[0].keyword, 'Custom T-Shirt');
+  it('should extract video media parameters', () => {
+    assert.equal(item.video.duration, 15);
+    assert.equal(item.video.ratio, '720p');
+    assert.equal(item.video.width, 576);
+    assert.equal(item.video.height, 1024);
+    assert.ok(item.video.coverUrl.includes('origin-cover.jpg'));
+    assert.ok(item.video.downloadUrl.includes('download.mp4'));
   });
 
-  it('should convert createTime to ISO date', () => {
-    const iso = new Date(MOCK_ITEM_STRUCT.createTime * 1000).toISOString();
-    assert.ok(iso.startsWith('2024-06-10'));
+  it('should extract POI geolocation and shop products', () => {
+    assert.equal(item.poi.name, 'Ho Chi Minh City');
+    assert.equal(item.poi.country, 'Vietnam');
+    assert.equal(item.shopProducts.length, 1);
+    assert.equal(item.shopProducts[0].productId, 'prod_001');
+    assert.equal(item.shopProducts[0].name, 'Custom T-Shirt');
+  });
+
+  it('should parse timestamps into ISO string', () => {
+    assert.ok(item.publishedAt.startsWith('2024-06-10'));
   });
 });
 
-describe('TikTok Scraper — Comment Parsing', () => {
-  it('should parse comment list response', () => {
-    const comments = MOCK_COMMENT_API_RESPONSE.comments;
-    assert.equal(comments.length, 2);
-    assert.equal(comments[0].text, 'This is amazing! Where can I buy?');
-    assert.equal(comments[0].digg_count, 150);
-    assert.equal(comments[0].reply_comment_total, 4);
-    assert.equal(comments[0].user.unique_id, 'commenter1');
+describe('TikTok Scraper — fetchVideoMetrics (Direct Module Call with Mock Fetch)', () => {
+  let originalFetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
   });
 
-  it('should detect has_more flag for pagination', () => {
-    assert.equal(MOCK_COMMENT_API_RESPONSE.has_more, 0);
-    assert.equal(MOCK_COMMENT_API_RESPONSE.cursor, 20);
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
   });
 
-  it('should extract avatar URLs from nested structure', () => {
-    const avatar = MOCK_COMMENT_API_RESPONSE.comments[0].user.avatar_thumb.url_list[0];
-    assert.ok(avatar.includes('tiktokcdn.com'));
+  it('should successfully fetch and parse metrics from rehydration HTML', async () => {
+    globalThis.fetch = async (url) => ({
+      ok: true,
+      status: 200,
+      text: async () => VALID_REHYDRATION_HTML,
+    });
+
+    const result = await fetchVideoMetrics('https://www.tiktok.com/@creator/video/7345678901234567890');
+    assert.equal(result.id, '7345678901234567890');
+    assert.equal(result.likes, 15200);
+    assert.equal(result.shares, 1280);
+    assert.equal(result.collectCount, 890);
+    assert.equal(result.views, 524000);
+    assert.equal(result.author.uniqueId, 'creatorname');
+  });
+
+  it('should throw HTTP status error when response is not ok', async () => {
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 404,
+      statusText: 'Not Found',
+    });
+
+    await assert.rejects(
+      () => fetchVideoMetrics('https://www.tiktok.com/@creator/video/9999999999999'),
+      /HTTP_404/
+    );
+  });
+
+  it('should throw REHYDRATION_MISSING when HTML lacks the script tag', async () => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => '<html><body><div>Bot blocked</div></body></html>',
+    });
+
+    await assert.rejects(
+      () => fetchVideoMetrics('https://www.tiktok.com/@creator/video/7345678901234567890'),
+      /REHYDRATION_MISSING/
+    );
+  });
+
+  it('should throw VIDEO_REMOVED when status code is 10204', async () => {
+    const removedHtml = makeRehydrationHtml({
+      __DEFAULT_SCOPE__: {
+        'webapp.video-detail': {
+          statusCode: 10204,
+        },
+      },
+    });
+
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => removedHtml,
+    });
+
+    await assert.rejects(
+      () => fetchVideoMetrics('https://www.tiktok.com/@creator/video/7345678901234567890'),
+      /VIDEO_REMOVED/
+    );
+  });
+
+  it('should throw REHYDRATION_JSON_INVALID when script contains malformed JSON', async () => {
+    const malformedHtml = `<html><body><script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">{invalid json</script></body></html>`;
+
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => malformedHtml,
+    });
+
+    await assert.rejects(
+      () => fetchVideoMetrics('https://www.tiktok.com/@creator/video/7345678901234567890'),
+      /REHYDRATION_JSON_INVALID/
+    );
   });
 });
 
-describe('TikTok Scraper — Module Interface', () => {
-  it('should export scrape function', () => {
-    const mod = require(scraperPath);
-    assert.equal(typeof mod.scrape, 'function');
+describe('TikTok Scraper — scrape() Single Video URL (Direct Module Call with Mock Fetch)', () => {
+  let originalFetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('should return valid crawl result object for a single video URL', async () => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => VALID_REHYDRATION_HTML,
+    });
+
+    const res = await scrape('https://www.tiktok.com/@creator/video/7345678901234567890');
+    assert.equal(res.source, 'tiktok_local');
+    assert.equal(res.isLive, true);
+    assert.equal(Array.isArray(res.items), true);
+    assert.equal(res.items.length, 1);
+
+    const first = res.items[0];
+    assert.equal(first.id, '7345678901234567890');
+    assert.equal(first.likes, 15200);
+    assert.equal(first.comments, 340);
+    assert.equal(first.shares, 1280);
+    assert.equal(first.views, 524000);
+    assert.equal(first.collectCount, 890);
   });
 });
 
-describe('TikTok Scraper — Normalizer Compatibility', () => {
-  // Verify that the output shape maps correctly to social-post normalizer
-  it('should have all fields the social-post normalizer reads', () => {
-    // These are the field names social-post.js reads on lines 171-174
-    const item = {
-      diggCount: 15200,     // → likes via raw.diggCount
-      commentCount: 340,    // → comments via raw.commentCount
-      shareCount: 1280,     // → shares via raw.shareCount
-      playCount: 524000,    // → views via raw.playCount
-      repostCount: 45,      // → shares via raw.repostCount
-    };
+describe('TikTok Scraper — Normalizer & Ingestion Pipeline Compatibility', () => {
+  it('should normalize cleanly through normalizeSocialPost without falling back to Twitter URL', () => {
+    const parsedItem = parseItemStruct(MOCK_ITEM_STRUCT);
+    const normalized = normalizeSocialPost(parsedItem, { platform: 'tiktok_videos' });
 
-    // Simulate normalizer's parseNum logic
-    function parseNum(v) {
-      if (typeof v === 'number') return Number.isFinite(v) && v > 0 ? Math.round(v) : 0;
-      return 0;
-    }
-
-    const likes = parseNum(item.diggCount);
-    const comments = parseNum(item.commentCount);
-    const shares = parseNum(item.shareCount);
-    const views = parseNum(item.playCount);
-
-    assert.equal(likes, 15200);
-    assert.equal(comments, 340);
-    assert.equal(shares, 1280);
-    assert.equal(views, 524000);
+    assert.equal(normalized.type, 'social_post');
+    assert.equal(normalized.platform, 'tiktok_videos');
+    assert.equal(normalized.author, 'creatorname');
+    assert.equal(normalized.url, 'https://www.tiktok.com/@creatorname/video/7345678901234567890');
+    assert.ok(!normalized.url.includes('x.com'), 'Must never fall back to x.com for TikTok video');
+    assert.equal(normalized.likes, 15200);
+    assert.equal(normalized.comments, 340);
+    assert.equal(normalized.shares, 1280);
+    assert.equal(normalized.views, 524000);
   });
 
-  it('should have image field for ingestion filter', () => {
-    // src/runs.service.js:122 filters items without image
-    const coverImage = MOCK_ITEM_STRUCT.video.originCover;
-    assert.ok(coverImage, 'Video must have a cover image to pass ingestion filter');
-    assert.ok(coverImage.startsWith('https://'), 'Cover image must be a valid HTTPS URL');
+  it('should carry a non-empty image URL to satisfy runs.service.js:122 ingestion filter', () => {
+    const parsedItem = parseItemStruct(MOCK_ITEM_STRUCT);
+    assert.ok(parsedItem.image, 'Must carry an image URL');
+    assert.ok(parsedItem.image.startsWith('https://'), 'Image URL must be secure HTTPS');
   });
 });

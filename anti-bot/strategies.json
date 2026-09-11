@@ -108,6 +108,6 @@
     "rateLimit": { "perMinute": 30 },
     "delay": { "min": 2000, "max": 4000 },
     "retry": { "maxAttempts": 5, "backoff": "exponential", "baseDelay": 3000 },
-    "proxy": { "required": true, "type": "residential" }
+    "proxy": { "required": false }
   }
 }

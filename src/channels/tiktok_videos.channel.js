@@ -70,7 +70,7 @@ module.exports = {
       name: 'local-scraper',
       kind: BACKEND_KIND.LOCAL,
       priority: 20,
-      enabled: true
+      enabled: false // Disabled: TikTok aggressively blocks direct datacenter IPs and SSR lacks comment text/saves. Primary execution routes through verified Apify actor.
     }
   ],
 

@@ -142,7 +142,7 @@ module.exports = function normalizeSocialPost(raw, context = { platform: 'social
   if (typeof raw.authorMeta === 'object' && raw.authorMeta) {
     author = raw.authorMeta.name || raw.authorMeta.nickName || raw.authorMeta.uniqueId || '';
   } else if (typeof raw.author === 'object' && raw.author) {
-    author = raw.author.name || raw.author.username || raw.author.userName || raw.author.screen_name || raw.author.nickName || '';
+    author = raw.author.name || raw.author.username || raw.author.userName || raw.author.uniqueId || raw.author.screen_name || raw.author.nickName || '';
   } else if (typeof raw.user === 'object' && raw.user) {
     author = raw.user.name || raw.user.screen_name || raw.user.username || '';
   } else {
