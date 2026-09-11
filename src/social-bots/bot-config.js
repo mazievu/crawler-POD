@@ -15,9 +15,10 @@ const DEFAULT_BOT_CONFIGS = {
     filters: { minLikes: 50, country: 'US' }
   },
   tiktok: {
-    platform: 'tiktok_videos',
+    platform: null,
     displayName: 'TikTok Trend Listening',
     enabled: false,
+    unsupportedReason: 'No tiktok_videos/hashtag channel implemented. Only tiktok_shop.channel.js exists (paid product-listing, different intelligence type). Do not enable until a real TikTok video/hashtag channel is built.',
     intervalMinutes: 180,
     queries: ['#tiktokmademebuyit', '#podtrend', '#custommerch', '#printondemand'],
     maxItems: 30,
