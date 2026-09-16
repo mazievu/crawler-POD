@@ -1319,7 +1319,7 @@ function parseItemData(item) {
   try { d = typeof item === 'string' ? JSON.parse(item) : item; } catch { d = {}; }
 
   const title = d.title || d.adTitle || d.productTitle || d.name || d.text || '';
-  const image = d.image || extractImage(d);
+  let image = d.image || extractImage(d);
   const archiveId = d.adArchiveId || d.adArchiveID || '';
   const adLibraryUrl = archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : '';
   const url = d.url || adLibraryUrl || d.permalink || d.adUrl || d.link || d.productUrl || '';
@@ -1404,16 +1404,26 @@ function parseItemData(item) {
         author: String(author).substring(0, 50)
       });
     }
-  } else if (!image && (title || d.body || d.text || d.content)) {
-    image = generateTextPostCapture({
-      platform: d.platform,
-      title: String(title).substring(0, 100),
-      body: d.body || d.content || d.full_text || d.text || d.message_rich || d.message || d.caption || d.selfText || d.postText || '',
-      author: String(author).substring(0, 50),
-      likes,
-      comments,
-      subreddit: d.subreddit || ''
-    });
+  } else if (!image) {
+    const isSocialOrPost = ['reddit', 'twitter', 'facebook_posts', 'tiktok_videos', 'threads', 'bluesky', 'pinterest', 'instagram'].includes(String(d.platform || '').toLowerCase())
+      || d.type === 'social_post'
+      || !!d.subreddit
+      || !!d.body
+      || !!d.content
+      || !!d.selfText
+      || !!d.postText;
+
+    if (isSocialOrPost && (title || d.body || d.text || d.content)) {
+      image = generateTextPostCapture({
+        platform: d.platform,
+        title: String(title).substring(0, 100),
+        body: d.body || d.content || d.full_text || d.text || d.message_rich || d.message || d.caption || d.selfText || d.postText || '',
+        author: String(author).substring(0, 50),
+        likes,
+        comments,
+        subreddit: d.subreddit || ''
+      });
+    }
   }
 
   return { videoUrl, mediaType, mediaCount, mediaItems, adCount, activeCountries,

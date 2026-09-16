@@ -137,6 +137,7 @@ test('ADS_CARD_SCHEMA has expected fields', () => {
 
 console.log('\n📋 database.js tests:');
 
+process.env.LEGACY_SNAPSHOT_WRITE = 'true';
 const db = require('../src/database');
 const { extractImage } = require('../src/image-utils');
 const { imageFromSearchResult, isMerchantResult } = require('../src/scrapers/search-discovery');
