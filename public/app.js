@@ -330,6 +330,7 @@ function toggleMetricPanel(forceOpen) {
  * the size of what was downloaded.
  */
 async function fetchItemsPage(params) {
+  // Server-side search & paging endpoint: apiFetch(`/api/items?${params}`)
   const res = await fetch(`/api/items?${params}`, { headers: { 'Content-Type': 'application/json' } });
   const text = await res.text();
   let data;
