@@ -325,20 +325,13 @@ function toggleMetricPanel(forceOpen) {
 /**
  * One page of items plus how many rows the filter matches in total.
  *
- * apiFetch() drops the response headers, and the total lives in X-Total-Count
- * — counted in SQL so the pager knows the real size of the table rather than
+ * Uses apiFetch with returnMeta: true to read the X-Total-Count header,
+ * counted in SQL so the pager knows the real size of the table rather than
  * the size of what was downloaded.
  */
 async function fetchItemsPage(params) {
-  // Server-side search & paging endpoint: apiFetch(`/api/items?${params}`)
-  const res = await fetch(`/api/items?${params}`, { headers: { 'Content-Type': 'application/json' } });
-  const text = await res.text();
-  let data;
-  try { data = JSON.parse(text); } catch {
-    throw new Error(`Lỗi máy chủ (${res.status}): phản hồi không phải JSON.`);
-  }
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-  const header = res.headers.get('X-Total-Count');
+  const { data, headers } = await apiFetch(`/api/items?${params}`, { returnMeta: true });
+  const header = headers.get('X-Total-Count');
   return { items: data, total: header === null ? data.length : Number(header) };
 }
 
@@ -1834,7 +1827,8 @@ async function deleteJob(id) {
 // ==================== Helpers ====================
 
 async function apiFetch(endpoint, options = {}) {
-  const res = await fetch(endpoint, { headers: { 'Content-Type': 'application/json', ...options.headers }, ...options });
+  const { returnMeta, ...fetchOpts } = options;
+  const res = await fetch(endpoint, { headers: { 'Content-Type': 'application/json', ...fetchOpts.headers }, ...fetchOpts });
   const rawText = await res.text();
   let data;
   try {
@@ -1844,6 +1838,7 @@ async function apiFetch(endpoint, options = {}) {
     throw new Error('Dữ liệu từ máy chủ không phải định dạng JSON hợp lệ.');
   }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (returnMeta) return { data, headers: res.headers, res };
   return data;
 }
 
