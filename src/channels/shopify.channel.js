@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'url',
   icon: '🏪',
   color: '#96bf48',
+  domain: 'shopify.com',
 
   intelligenceTypes: ["product_listing"],
 

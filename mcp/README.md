@@ -4,7 +4,7 @@ Two transports, for two different jobs:
 
 | File | Transport | Reach | Use it for |
 |---|---|---|---|
-| `crawler-pod-server.mjs` | stdio | this machine only | local work in Claude Code; queries PostgreSQL directly |
+| `crawler-pod-server.mjs` | stdio | this machine only | local work in Claude Code; queries PostgreSQL (directly, or through the app when PG_MODE=pglite — see below) |
 | `crawler-pod-http-server.mjs` | Streamable HTTP | LAN | another machine driving this one; goes through the crawler API |
 
 They are independent — running one does not affect the other.
@@ -25,12 +25,17 @@ drive crawler-POD directly instead of you running commands by hand.
   "mcpServers": {
     "crawler-pod": {
       "command": "node",
-      "args": ["mcp/crawler-pod-server.mjs"],
-      "env": { "PG_MODE": "pglite", "PGLITE_DIR": "data/pgdata" }
+      "args": ["mcp/crawler-pod-server.mjs"]
     }
   }
 }
 ```
+
+No `env` block is needed: the process loads this project's `.env` itself at
+startup (see "Database connection mode" below), so it always sees the same
+`PG_MODE`/`PGLITE_DIR`/`PORT` the app itself does. An `env` block here would
+still work — anything it sets simply overrides `.env` for this process only —
+but is not required.
 
 Reopen the project in Claude Code and approve the server when prompted. Check it
 with `/mcp` — `crawler-pod` should list 8 tools.
@@ -48,18 +53,39 @@ with `/mcp` — `crawler-pod` should list 8 tools.
 | `server_control` | `status` / `start` / `stop` the HTTP server (start is detached, logs to `logs/server.log`) |
 | `logs_tail` | Last lines of that log |
 
+## Database connection mode (PG_MODE)
+
+This process reads the same `.env` the app reads (it loads it itself at
+startup, since an MCP client launches it standalone — nothing else has
+loaded `.env` yet at that point). `PG_MODE` selects how it reaches
+PostgreSQL, exactly like the app:
+
+- **`PG_MODE` unset, or a real PostgreSQL server** — connects directly via
+  `src/database`. A real server safely accepts many concurrent connections,
+  so this process having its own is no different from any other client.
+- **`PG_MODE=pglite`** — PGlite (PostgreSQL compiled to WASM, stored in
+  `data/pgdata`) is **single-process**: only one Node process may hold that
+  directory open at a time, and the running app already does. This server
+  therefore does **not** open `data/pgdata` itself in that mode — every
+  `db_query`/`db_tables`/`health`/`runs_list`/`run_get`/`schedules_list` call
+  instead goes through the app's own `/api/internal/mcp-bridge/query`
+  endpoint (`src/routes/mcp-bridge.js`) or its existing REST API, over
+  `http://127.0.0.1:<PORT>`. **The app must be running** for any of these
+  tools to return data in this mode; if it is not, the affected tool returns
+  a clear error telling you to start it (`npm start`, or `server_control`)
+  rather than an empty result — and it never opens `data/pgdata` as a
+  fallback, which is exactly the two-writer scenario that risks corrupting
+  the database.
+
 ## Pointing at a real PostgreSQL server
 
-The `env` block above uses PGlite (PostgreSQL compiled to WASM, stored in
-`data/pgdata`). To use a PostgreSQL server instead, drop `PG_MODE`/`PGLITE_DIR`
-and let the process inherit the same variables the app uses:
+To use a real server instead of PGlite, set (in your shell/machine
+environment, or `.mcp.json`'s `env` block — do **not** put a password in
+`.mcp.json`, which is committed to the repository) and leave `PG_MODE` unset:
 
 ```
 PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE      # or a single DATABASE_URL
 ```
-
-Set them in your shell or machine environment — do **not** put a password in
-`.mcp.json`, which is committed to the repository.
 
 ## Security posture — read before exposing this
 

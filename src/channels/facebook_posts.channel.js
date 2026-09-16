@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '📘',
   color: '#4599ff',
+  domain: 'facebook.com',
 
   intelligenceTypes: ["social_post"],
 
@@ -27,15 +28,14 @@ module.exports = {
   },
 
   backends: [
-    
     {
       name: 'apify',
       kind: BACKEND_KIND.APIFY,
       priority: 20,
       enabled: true,
-      actorId: 'danek/facebook-search-ppr',
+      actorId: 'scraper_one/facebook-posts-search',
       requiresEnv: ['APIFY_TOKEN'],
-      actorEntitlement: "unverified",
+      actorEntitlement: "verified",
       availabilityMode: 'token_plus_actor_entitlement'
     }
   ],

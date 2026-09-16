@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '📦',
   color: '#ff9900',
+  domain: 'amazon.com',
 
   intelligenceTypes: ["product_listing"],
 

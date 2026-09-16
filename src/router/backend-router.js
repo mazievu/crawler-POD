@@ -104,22 +104,88 @@ class BackendRouter {
     const channel = this.registry.getChannel(channelName);
     if (!channel) throw new Error(`Unknown channel: ${channelName}`);
 
-    // If a specific backend was requested, execute it directly
+    // A requested backend is a PREFERENCE, not a pin. The Scheduler sets
+    // options.backend on EVERY dispatch (scheduler.js dispatchOptions), so this
+    // branch used to mean the priority-ordered fallback loop below never ran for
+    // any scheduled crawl: a channel whose second backend was perfectly healthy
+    // still failed outright when its first one did. Reddit exposed it - its local
+    // tier is dead on a host whose DNS resolves www.reddit.com to 127.0.0.1, and
+    // its Apify tier was never attempted.
+    //
+    // Fallback here is deliberately ONE-DIRECTIONAL. The Scheduler has already
+    // reserved RAM for the PLANNED execution class, so falling back to a heavier
+    // class would run work the resource accounting never budgeted for. Only a
+    // same-kind backend (same class, same reservation) or an apify/cloud backend
+    // (whose local cost is one HTTP request) is eligible - both are
+    // same-or-lighter than whatever was planned.
     if (options.backend) {
       const { adapter, config, version } = await this.selectBackend(channelName, options);
-      const result = await adapter.run(channel, config, query, options);
-      return {
-        channel: channelName,
-        activeBackend: config.name,
-        backendKind: config.kind,
-        backendStatus: 'ok',
-        backendVersion: version,
-        backendRunId: result.backendRunId,
-        datasetId: result.datasetId,
-        healthSnapshot: result.healthSnapshot,
-        items: result.items,
-        raw: result
-      };
+      try {
+        const result = await adapter.run(channel, config, query, options);
+        const hasData = result && Array.isArray(result.items) && result.items.length > 0;
+        const isSocialChannel = ['reddit', 'facebook_posts'].includes(channelName);
+        const lacksSocialData = isSocialChannel && hasData && config.kind === 'local' && !result.items.some(it => (it.image && it.image.length > 10) || (it.likes > 0 || it.comments > 0 || it.ups > 0));
+
+        if (!hasData || lacksSocialData) {
+          const reason = !hasData ? '0 items returned' : 'no images or metrics found in local items';
+          const lighterFallbacks = channel.backends
+            .filter((b) => b.enabled !== false && b.name !== config.name)
+            .filter((b) => b.kind === config.kind || b.kind === 'apify')
+            .sort((x, y) => (x.priority || 100) - (y.priority || 100));
+
+          if (lighterFallbacks.length > 0) {
+            console.warn(`[BackendRouter] Preferred backend ${config.name} for ${channelName} yielded insufficient data (${reason}). Trying fallback backend(s)...`);
+            throw new Error(`INSUFFICIENT_DATA: ${config.name} (${reason})`);
+          }
+        }
+
+        return {
+          channel: channelName,
+          activeBackend: config.name,
+          backendKind: config.kind,
+          backendStatus: 'ok',
+          backendVersion: version,
+          backendRunId: result.backendRunId,
+          datasetId: result.datasetId,
+          healthSnapshot: result.healthSnapshot,
+          items: result.items,
+          raw: result
+        };
+      } catch (preferredError) {
+        const lighterFallbacks = channel.backends
+          .filter((b) => b.enabled !== false && b.name !== config.name)
+          .filter((b) => b.kind === config.kind || b.kind === 'apify')
+          .sort((x, y) => (x.priority || 100) - (y.priority || 100));
+
+        if (lighterFallbacks.length === 0) throw preferredError;
+        console.warn(`[BackendRouter] Preferred backend ${config.name} failed for ${channelName}: ${preferredError.message}. Trying ${lighterFallbacks.length} same-or-lighter backend(s)...`);
+
+        for (const bConf of lighterFallbacks) {
+          const fbAdapter = this.adapters[bConf.kind];
+          if (!fbAdapter) continue;
+          try {
+            const probeResult = await fbAdapter.probe(channel, bConf, options);
+            if (!probeResult || (probeResult.status !== 'ok' && probeResult.status !== 'warn')) continue;
+            const result = await fbAdapter.run(channel, bConf, query, options);
+            console.warn(`[BackendRouter] ${channelName} recovered on fallback backend ${bConf.name}.`);
+            return {
+              channel: channelName,
+              activeBackend: bConf.name,
+              backendKind: bConf.kind,
+              backendStatus: 'ok',
+              backendVersion: probeResult.version,
+              backendRunId: result.backendRunId,
+              datasetId: result.datasetId,
+              healthSnapshot: result.healthSnapshot,
+              items: result.items,
+              raw: result
+            };
+          } catch (fbError) {
+            console.warn(`[BackendRouter] Fallback backend ${bConf.name} also failed for ${channelName}: ${fbError.message}`);
+          }
+        }
+        throw preferredError;
+      }
     }
 
     // Otherwise, iterate through candidate backends in priority order with fallback
@@ -135,6 +201,16 @@ class BackendRouter {
         const probeResult = await adapter.probe(channel, bConf, options);
         if (probeResult && (probeResult.status === 'ok' || probeResult.status === 'warn')) {
           const result = await adapter.run(channel, bConf, query, options);
+          const hasData = result && Array.isArray(result.items) && result.items.length > 0;
+          const isSocialChannel = ['reddit', 'facebook_posts'].includes(channelName);
+          const lacksSocialData = isSocialChannel && hasData && bConf.kind === 'local' && !result.items.some(it => (it.image && it.image.length > 10) || (it.likes > 0 || it.comments > 0 || it.ups > 0));
+
+          if (!hasData || lacksSocialData) {
+            const reason = !hasData ? '0 items returned' : 'no images or metrics found in local items';
+            console.warn(`[BackendRouter] Backend ${bConf.name} yielded insufficient data (${reason}). Trying next available backend...`);
+            continue;
+          }
+
           return {
             channel: channelName,
             activeBackend: bConf.name,

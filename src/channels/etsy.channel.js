@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '🧡',
   color: '#f1641e',
+  domain: 'etsy.com',
 
   intelligenceTypes: ["product_listing"],
 

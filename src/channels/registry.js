@@ -47,6 +47,11 @@ function getPlatformCompatibilityList() {
       countrySupport: c.availability.countrySupport ? 1 : 0,
       icon: c.icon,
       color: c.color,
+      // Real brand domain for the DuckDuckGo favicon proxy the frontend uses
+      // (icons.duckduckgo.com/ip3/<domain>.ico). Optional by design: a channel
+      // with no public-facing site of its own (e.g. `toidispy`, an internal
+      // CDP tool) omits it, and the frontend falls back to `icon` (emoji).
+      domain: c.domain,
       paid: c.availability.paid,
       disabled: c.availability.status === 'disabled',
       queryField: getPlatformQueryField(c.name),

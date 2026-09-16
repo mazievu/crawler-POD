@@ -4,6 +4,12 @@ const DEFAULT_QUERY_FIELD = {
   id: 'query', label: 'Search query', type: 'text', required: true, placeholder: 'Enter keyword...',
 };
 const MAX_COLLECTION_ITEMS = 10000;
+// Multi-keyword fan-out: how many independent keyword Tasks one submitted Run
+// may be split into. This is an INPUT bound (same role MAX_COLLECTION_ITEMS
+// plays for maxItems), not a concurrency limit — how many of these Tasks run at
+// the same time is still decided exclusively by WorkerPoolManager capacities +
+// ResourceMonitor RAM admission, which this feature does not touch.
+const MAX_CRAWL_KEYWORDS = 50;
 
 const schemas = {
   amazon: { fields: [] },
@@ -54,6 +60,43 @@ function isLocalCdpUrl(value) {
   }
 }
 
+/**
+ * Multi-keyword input parsing — ONE KEYWORD PER LINE.
+ *
+ * Newline, not comma: a single real keyword very often contains a comma
+ * ("press on nails, short square"), so comma-splitting would silently corrupt
+ * queries that work today. A line break never appears inside a keyword typed
+ * into a one-line box, which makes this a strictly additive interpretation of
+ * the existing `query` contract.
+ *
+ * Returns { keywords, duplicates } and THROWS on input that cannot be honoured
+ * (all-blank, or more lines than MAX_CRAWL_KEYWORDS) — §"no silent buttons":
+ * a rejected input must be named, never quietly dropped.
+ */
+function parseKeywordList(raw) {
+  const lines = Array.isArray(raw)
+    ? raw.map((entry) => String(entry ?? ''))
+    : String(raw ?? '').split(/\r?\n/);
+
+  const keywords = [];
+  const duplicates = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const keyword = line.trim();
+    if (keyword === '') continue; // Blank lines are formatting, not input.
+    const dedupeKey = keyword.toLowerCase();
+    if (seen.has(dedupeKey)) { duplicates.push(keyword); continue; }
+    seen.add(dedupeKey);
+    keywords.push(keyword);
+  }
+
+  if (keywords.length === 0) throw new Error('Enter at least one keyword (one per line).');
+  if (keywords.length > MAX_CRAWL_KEYWORDS) {
+    throw new Error(`Too many keywords: ${keywords.length}. The maximum per crawl is ${MAX_CRAWL_KEYWORDS} (one keyword per line).`);
+  }
+  return { keywords, duplicates };
+}
+
 function buildCollectionOptions(platform, values = {}) {
   const options = {
     maxItems: Math.min(MAX_COLLECTION_ITEMS, Math.max(1, Number.parseInt(values.maxItems, 10) || 20)),
@@ -101,7 +144,26 @@ function buildCollectionOptions(platform, values = {}) {
     if (selected.length > 0) options.metrics = selected;
   }
 
+  // Multi-keyword fan-out. Whitelisted HERE deliberately: this function drops
+  // anything it does not explicitly copy, and a previous feature already lost
+  // `options.metrics` exactly that way (the run reported success with the
+  // filter never applied). `keywords` must survive to the Scheduler, which is
+  // the layer that turns it into one child Run per keyword.
+  //
+  // Not a per-platform input field: keyword fan-out is a property of the shared
+  // crawl contract, not of any one channel's schema, so gating it on
+  // getPlatformInputFields() would silently disable it for every platform.
+  //
+  // Only set for 2+ keywords. With exactly one keyword the emitted options are
+  // byte-identical to what this function produced before this change, so the
+  // single-keyword path keeps its EXACT existing behaviour (no parent run, no
+  // child run, no fan-out).
+  if (values.keywords !== undefined) {
+    const { keywords } = parseKeywordList(values.keywords);
+    if (keywords.length > 1) options.keywords = keywords;
+  }
+
   return options;
 }
 
-module.exports = { MAX_COLLECTION_ITEMS, getPlatformQueryField, getPlatformInputFields, buildCollectionOptions, isLocalCdpUrl };
+module.exports = { MAX_COLLECTION_ITEMS, MAX_CRAWL_KEYWORDS, getPlatformQueryField, getPlatformInputFields, buildCollectionOptions, isLocalCdpUrl, parseKeywordList };

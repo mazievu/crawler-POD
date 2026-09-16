@@ -56,6 +56,34 @@ function extractRedditImage(d) {
   return '';
 }
 
+/**
+ * Reddit-hosted video (v.redd.it). This mapper used to emit no video field at
+ * all, so a v.redd.it post reached product_current with video_url='' even
+ * though the payload carried a playable URL — the post looked like a
+ * still-image post in the UI. The cover image is unaffected: extractRedditImage()
+ * still resolves preview/thumbnail, which is what a video post shows as poster.
+ *
+ * Shapes read, in the order Reddit populates them for a t3 listing:
+ *   media.reddit_video.fallback_url         native video upload
+ *   secure_media.reddit_video.fallback_url  same payload over the secure host
+ *   preview.reddit_video_preview.fallback_url  the mp4 preview Reddit renders
+ *                                           for an external (gfycat/imgur) link
+ * A post with none of these genuinely has no Reddit-hosted video and reports
+ * none — never a substitute, per the project's image-quality rule.
+ */
+function extractRedditVideo(d) {
+  const candidates = [
+    d.media?.reddit_video?.fallback_url,
+    d.secure_media?.reddit_video?.fallback_url,
+    d.preview?.reddit_video_preview?.fallback_url,
+  ];
+  for (const candidate of candidates) {
+    const url = String(candidate || '').trim().replace(/&amp;/g, '&');
+    if (/^https?:\/\//i.test(url)) return url;
+  }
+  return '';
+}
+
 function proxiedFetch(url, options, proxyUrl) {
   if (!proxyUrl) return fetch(url, options);
 
@@ -147,6 +175,10 @@ async function scrapeApi(query, options, baseUrl = BASE) {
         shares: 0,
         views: 0,
         image: extractRedditImage(d),
+        // Consumed by src/normalize/social-post.js -> extractMedia() via
+        // cleanMediaUrl(raw.videoUrl), then persisted to product_current.video_url
+        // by parseItemData(). Empty string when the post has no video.
+        videoUrl: extractRedditVideo(d),
         created_utc: d.created_utc ? new Date(d.created_utc * 1000).toISOString() : '',
         subreddit: d.subreddit || '',
         domain: d.domain || '',
@@ -300,11 +332,38 @@ async function scrapePublic(query, options) {
 const ENDPOINT_FAILURE_PATTERN = /BLOCKED_IP|HTTP 403|HTTP 404|Please wait for verification/i;
 const BOUNDED_RETRYABLE_PATTERN = /HTTP 429|HTTP 50[0234]|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|TimeoutError|socket hang up/i;
 
+/**
+ * Both patterns above were written against the codes `https.request` surfaces
+ * in `err.message` — which is what proxiedFetch() uses when a proxy is
+ * configured. The NO-proxy path uses global fetch(), and undici reports every
+ * network-level failure as the bare message "fetch failed", parking the real
+ * code (ECONNREFUSED / ENOTFOUND / ETIMEDOUT / ECONNRESET / EAI_AGAIN /
+ * UND_ERR_SOCKET) in `err.cause.code`, which nothing read.
+ *
+ * Consequence, observed 2026-09-15 on this host (www.reddit.com resolving to
+ * 127.0.0.1): scrapeApi() threw Error("fetch failed"), both classifiers
+ * returned false, and scrape() hit the "unclassified — propagate as-is" branch.
+ * The old.reddit tier AND the browser tier were both skipped, so the whole
+ * escalation chain this file documents in §16 never ran for any connection
+ * error. Flattening the cause chain restores the designed behaviour; it only
+ * ever ADDS matches, so anything already classified stays classified.
+ */
+function errorText(err) {
+  if (!err) return '';
+  const parts = [err.message || ''];
+  let cause = err.cause;
+  for (let depth = 0; depth < 3 && cause; depth++) {
+    parts.push(String(cause.code || ''), String(cause.message || ''));
+    cause = cause.cause;
+  }
+  return parts.join(' ');
+}
+
 function isEndpointFailure(err) {
-  return ENDPOINT_FAILURE_PATTERN.test(err?.message || '');
+  return ENDPOINT_FAILURE_PATTERN.test(errorText(err));
 }
 function isBoundedRetryable(err) {
-  return BOUNDED_RETRYABLE_PATTERN.test(err?.message || '');
+  return BOUNDED_RETRYABLE_PATTERN.test(errorText(err));
 }
 
 async function scrape(query, options) {
@@ -341,4 +400,7 @@ async function scrape(query, options) {
   }
 }
 
-module.exports = { scrape };
+// extractRedditImage/extractRedditVideo are exported for unit testing: the
+// scrape() path itself cannot be exercised offline (it needs reddit.com), so
+// the field mapping is verified directly against captured payload shapes.
+module.exports = { scrape, extractRedditImage, extractRedditVideo, isEndpointFailure, isBoundedRetryable };

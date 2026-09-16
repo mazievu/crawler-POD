@@ -16,7 +16,15 @@ const IMAGE_VALUE_KEYS = new Set([
   'original', 'originals', 'large', 'full', 'snapshot', 'originalimageurl', 'resizedimageurl',
   'pageprofilepictureurl', 'profile_image', 'profile_image_url', 'profilepicture',
   'uri', 'image_uri', 'profile_picture_url', 'profilepictureurl',
-  'avatar', 'avatar_url', 'authormeta', 'author_meta', 'album_preview', 'image_file_uri', 'imagefileuri'
+  'avatar', 'avatar_url', 'authormeta', 'author_meta', 'album_preview', 'image_file_uri', 'imagefileuri',
+  // Facebook's GraphQL post payloads nest the photo under `photo_image: {uri}`.
+  // sanitizeForStorage() already treats this key as image data (isImageField()
+  // matches /photo/), but extractImage() walks this explicit Set instead, so the
+  // subtree was skipped and a post whose only image sat there resolved to "".
+  // Adding the key only lets the walk descend further; it can never change a
+  // payload that already resolves.
+  'photo_image', 'photoimage',
+  'gallery_images', 'galleryimages', 'media_assets', 'mediaassets'
 ]);
 
 const MEDIA_URL_KEYS = new Set([
@@ -24,7 +32,7 @@ const MEDIA_URL_KEYS = new Set([
   'resizedimageurl', 'pageprofilepictureurl', 'uri', 'image_uri', 'profile_picture_url',
   'profilepictureurl', 'avatar', 'avatar_url', 'image_file_uri', 'imagefileuri',
   'mediaurl', 'media_url', 'coverurl', 'cover_url', 'displayurl', 'display_url',
-  'profilepicture', 'originalavatarurl'
+  'profilepicture', 'originalavatarurl', 'original_url', 'originalurl'
 ]);
 
 const INVALID_IMAGE_VALUES = new Set([
@@ -37,8 +45,18 @@ function cleanImageUrl(value) {
   const url = value.trim().replace(/&amp;/g, '&');
   if (!url || url.length < 10 || INVALID_IMAGE_VALUES.has(url.toLowerCase())) return '';
 
+  // SVG Data URI for generated post capture cards
+  if (/^data:image\/svg\+xml/i.test(url)) {
+    return url;
+  }
+
   // Exclude webpage URLs that are HTML pages, not direct image assets
   if (/facebook\.com\/(groups|posts|people|pages|watch|reel|events|ads\/library|[a-zA-Z0-9._-]+$)/i.test(url) && !/fbcdn\.net/i.test(url)) {
+    return '';
+  }
+
+  // Exclude subreddit icons and community avatars
+  if (/communityIcon|community_icon/i.test(url)) {
     return '';
   }
 
@@ -108,6 +126,63 @@ function extractTwitterImage(raw) {
         const cleaned = cleanImageUrl(url);
         if (cleaned) return cleaned;
       }
+    }
+  }
+
+  return '';
+}
+
+/**
+ * The playable video of an X/Twitter post.
+ *
+ * extractTwitterImage() above already commits to the `extended_entities.media[]`
+ * / `entities.media[]` shape for this platform, and the video lives in the SAME
+ * media object as the poster image it already reads — under
+ * `video_info.variants[]`. Nothing read it, so an X video post was stored with
+ * its poster image and video_url='' and rendered as a still.
+ *
+ * Only `video.twimg.com` mp4/m3u8 URLs are accepted, so this can never return a
+ * URL belonging to another platform even though the social-post normalizer is
+ * shared. The highest-bitrate mp4 variant wins; variants without a bitrate
+ * (the HLS playlist) are used only when no mp4 exists.
+ */
+function extractTwitterVideo(raw) {
+  if (!raw || typeof raw !== 'object') return '';
+
+  const mediaLists = [
+    raw.extended_entities?.media,
+    raw.entities?.media,
+    raw.videos,
+    raw.media,
+  ];
+
+  let best = '';
+  let bestBitrate = -1;
+  for (const list of mediaLists) {
+    if (!Array.isArray(list)) continue;
+    for (const media of list) {
+      const variants = media?.video_info?.variants;
+      if (!Array.isArray(variants)) continue;
+      for (const variant of variants) {
+        const url = cleanImageUrl(variant?.url);
+        if (!url || !/^https:\/\/video\.twimg\.com\//i.test(url)) continue;
+        const bitrate = Number.isFinite(variant?.bitrate) ? variant.bitrate : 0;
+        if (bitrate > bestBitrate) {
+          bestBitrate = bitrate;
+          best = url;
+        }
+      }
+    }
+  }
+  if (best) return best;
+
+  // Some actors flatten the same field to a list of plain URL strings.
+  for (const key of ['videoUrls', 'video_urls', 'mediaUrls']) {
+    const list = raw[key];
+    if (!Array.isArray(list)) continue;
+    for (const entry of list) {
+      const url = cleanImageUrl(entry);
+      if (url && /^https:\/\/video\.twimg\.com\//i.test(url)) return url;
     }
   }
 
@@ -191,10 +266,170 @@ function sanitizeForStorage(value, imageContext = false) {
   return sanitized;
 }
 
+function escapeXml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function wrapText(text, maxCharsPerLine = 48, maxLines = 4) {
+  const words = String(text || '').replace(/\s+/g, ' ').trim().split(' ');
+  const lines = [];
+  let currentLine = '';
+  for (const word of words) {
+    if (!word) continue;
+    if ((currentLine ? currentLine + ' ' + word : word).length <= maxCharsPerLine) {
+      currentLine = currentLine ? currentLine + ' ' + word : word;
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+      if (lines.length >= maxLines - 1) break;
+    }
+  }
+  if (currentLine && lines.length < maxLines) lines.push(currentLine);
+  if (lines.length === maxLines && words.length > 0 && !lines[maxLines - 1].endsWith('...')) {
+    lines[maxLines - 1] = lines[maxLines - 1].slice(0, maxCharsPerLine - 3) + '...';
+  }
+  return lines;
+}
+
+/**
+ * Extract cover/poster/thumbnail URL for a video item.
+ */
+function extractVideoCover(raw) {
+  if (!raw || typeof raw !== 'object') return '';
+  const candidates = [
+    raw.videoMeta?.coverUrl,
+    raw.videoMeta?.dynamicCover,
+    raw.videoMeta?.originCover,
+    raw.coverUrl,
+    raw.cover_url,
+    raw.cover,
+    raw.originCover,
+    raw.dynamicCover,
+    raw.poster,
+    raw.posterUrl,
+    raw.poster_url,
+    raw.thumbnail,
+    raw.thumbnailUrl,
+    raw.thumbnail_url,
+    raw.video?.cover,
+    raw.video?.originCover,
+    raw.video?.dynamicCover,
+    raw.preview?.images?.[0]?.source?.url,
+    raw.preview?.images?.[0]?.resolutions?.slice(-1)[0]?.url,
+    Array.isArray(raw.attachments) ? (raw.attachments[0]?.thumbnail || raw.attachments[0]?.picture || (raw.attachments[0]?.type !== 'video' ? raw.attachments[0]?.url : '')) : '',
+    raw.displayUrl,
+  ];
+  for (const c of candidates) {
+    const cleaned = cleanImageUrl(c);
+    if (cleaned) return cleaned;
+  }
+  return '';
+}
+
+/**
+ * Generate a visual capture card for a text-only post without image.
+ * Returns an SVG Data URI that renders directly in <img> tags.
+ */
+function generateTextPostCapture({ platform = 'reddit', title = '', body = '', author = '', likes = 0, comments = 0, subreddit = '' } = {}) {
+  const brandColors = {
+    reddit: { bg1: '#1a1a1b', bg2: '#2b140e', accent: '#ff4500', name: 'Reddit', badge: subreddit ? `r/${subreddit}` : 'r/reddit' },
+    twitter: { bg1: '#000000', bg2: '#15202b', accent: '#1d9bf0', name: 'X (Twitter)', badge: author ? `@${author}` : 'Post' },
+    facebook_posts: { bg1: '#0c1b33', bg2: '#13284d', accent: '#1877f2', name: 'Facebook', badge: 'Facebook Post' },
+    facebook_ads: { bg1: '#0c1b33', bg2: '#13284d', accent: '#1877f2', name: 'Facebook Ad', badge: 'Sponsored' },
+    tiktok_videos: { bg1: '#010101', bg2: '#161823', accent: '#fe2c55', name: 'TikTok', badge: 'Post' },
+    pinterest: { bg1: '#1f1315', bg2: '#301317', accent: '#e60023', name: 'Pinterest', badge: 'Pin' },
+  };
+
+  const brand = brandColors[platform] || { bg1: '#18181b', bg2: '#27272a', accent: '#6366f1', name: platform || 'Social', badge: platform || 'Post' };
+  const authorDisplay = author || brand.badge;
+  const initial = (authorDisplay.replace(/^[@ru]\//i, '')[0] || 'P').toUpperCase();
+
+  const displayTitle = title || body || 'Text Post';
+  const displayBody = (body && body !== title) ? body : '';
+  const bodyLines = wrapText(displayBody || displayTitle, 46, 4);
+
+  const linesSvg = bodyLines.map((l, i) =>
+    `<text x="40" y="${170 + i * 26}" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,sans-serif" font-size="15" fill="#e5e7eb" font-weight="400">${escapeXml(l)}</text>`
+  ).join('\n    ');
+
+  const likesText = likes > 0 ? `❤️ ${likes.toLocaleString()}` : '';
+  const commentsText = comments > 0 ? `💬 ${comments.toLocaleString()}` : '';
+  const metricsText = [likesText, commentsText].filter(Boolean).join('   ');
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 360" width="600" height="360">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="${brand.bg1}"/>
+      <stop offset="100%" stop-color="${brand.bg2}"/>
+    </linearGradient>
+  </defs>
+  <rect width="600" height="360" rx="16" fill="url(#bg)"/>
+  <rect width="600" height="360" rx="16" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="1.5"/>
+  <circle cx="50" cy="50" r="100" fill="${brand.accent}" opacity="0.12"/>
+  <text x="520" y="140" font-family="Georgia, serif" font-size="120" fill="#ffffff" opacity="0.04" text-anchor="middle">“</text>
+  <circle cx="60" cy="58" r="22" fill="${brand.accent}" opacity="0.9"/>
+  <text x="60" y="65" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="18" font-weight="700" fill="#ffffff" text-anchor="middle">${escapeXml(initial)}</text>
+  <text x="96" y="54" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="700" fill="#ffffff">${escapeXml(authorDisplay.slice(0, 28))}</text>
+  <text x="96" y="72" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="500" fill="${brand.accent}">${escapeXml(brand.badge.slice(0, 32))}</text>
+  <rect x="460" y="42" width="105" height="26" rx="13" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.15"/>
+  <text x="512" y="59" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="11" font-weight="600" fill="#e5e7eb" text-anchor="middle">${escapeXml(brand.name.toUpperCase())}</text>
+  <line x1="40" y1="100" x2="560" y2="100" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <text x="40" y="132" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="18" font-weight="700" fill="#f9fafb">${escapeXml(displayTitle.slice(0, 52) + (displayTitle.length > 52 ? '...' : ''))}</text>
+  ${linesSvg}
+  <line x1="40" y1="305" x2="560" y2="305" stroke="#ffffff" stroke-opacity="0.08" stroke-width="1"/>
+  <text x="40" y="333" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="13" font-weight="600" fill="#9ca3af">${escapeXml(metricsText || '📄 Text Post Preview')}</text>
+  <text x="560" y="333" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="11" font-weight="500" fill="#6b7280" text-anchor="end">📸 Post Capture</text>
+</svg>`;
+
+  return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
+}
+
+/**
+ * Generate a visual poster for a video that has no remote thumbnail URL.
+ */
+function generateVideoCoverCapture({ platform = 'video', title = '', author = '' } = {}) {
+  const brandColors = {
+    tiktok_videos: { bg1: '#010101', bg2: '#161823', accent: '#fe2c55', name: 'TikTok' },
+    reddit: { bg1: '#1a1a1b', bg2: '#2b140e', accent: '#ff4500', name: 'Reddit Video' },
+    twitter: { bg1: '#000000', bg2: '#15202b', accent: '#1d9bf0', name: 'X Video' },
+    facebook_posts: { bg1: '#0c1b33', bg2: '#13284d', accent: '#1877f2', name: 'Facebook Video' },
+  };
+  const brand = brandColors[platform] || { bg1: '#0f172a', bg2: '#1e293b', accent: '#3b82f6', name: 'Video' };
+  const displayTitle = title || 'Video Content';
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 360" width="600" height="360">
+  <defs>
+    <linearGradient id="vbg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="${brand.bg1}"/>
+      <stop offset="100%" stop-color="${brand.bg2}"/>
+    </linearGradient>
+  </defs>
+  <rect width="600" height="360" rx="16" fill="url(#vbg)"/>
+  <rect width="600" height="360" rx="16" fill="none" stroke="#ffffff" stroke-opacity="0.15" stroke-width="1.5"/>
+  <circle cx="300" cy="160" r="46" fill="${brand.accent}" opacity="0.9"/>
+  <polygon points="292,142 316,160 292,178" fill="#ffffff"/>
+  <rect x="250" y="222" width="100" height="24" rx="12" fill="#000000" fill-opacity="0.6"/>
+  <text x="300" y="238" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="12" font-weight="700" fill="#ffffff" text-anchor="middle">▶ VIDEO</text>
+  <text x="300" y="290" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="16" font-weight="700" fill="#ffffff" text-anchor="middle">${escapeXml(displayTitle.slice(0, 50))}</text>
+  <text x="300" y="315" font-family="-apple-system,BlinkMacSystemFont,sans-serif" font-size="13" font-weight="500" fill="#9ca3af" text-anchor="middle">${escapeXml(author ? `by ${author}` : brand.name)}</text>
+</svg>`;
+
+  return 'data:image/svg+xml;base64,' + Buffer.from(svg).toString('base64');
+}
+
 module.exports = {
   cleanImageUrl,
   extractImage,
   extractTwitterImage,
+  extractTwitterVideo,
+  extractVideoCover,
+  generateTextPostCapture,
+  generateVideoCoverCapture,
   hasImage,
   sanitizeForStorage,
 };

@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '📌',
   color: '#ff6b6b',
+  domain: 'pinterest.com',
 
   intelligenceTypes: ["social_post"],
 

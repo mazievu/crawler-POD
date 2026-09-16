@@ -11,13 +11,29 @@ const { openDatabase } = require('./database/pg-client');
 const path = require('path');
 const fs = require('fs');
 const { PLATFORMS } = require('./platform-config');
-const { cleanImageUrl, extractImage, sanitizeForStorage } = require('./image-utils');
+const {
+  cleanImageUrl,
+  extractImage,
+  sanitizeForStorage,
+  extractVideoCover,
+  generateTextPostCapture,
+  generateVideoCoverCapture
+} = require('./image-utils');
 // schema-v2's initSchemaV2/migrate* helpers were SQLite in-place upgrade paths
 // (PRAGMA probe + ALTER TABLE). pg-schema.sql declares those columns up front,
 // so they are no longer imported here.
 const { createProductCurrentOps } = require('./database/product-current');
 const { createDailyHistoryOps, normalizeLegacyUtcTimestamp } = require('./database/daily-history');
 const { createWeeklySummaryOps } = require('./database/weekly-summary');
+// Job History "stuck" filter (getRunsFiltered() below) must reuse the exact
+// thresholds StuckDetector itself enforces, never a re-typed copy — see
+// reliability/stuck-detector.js. Safe to require at module scope: that file's
+// own top-level requires (./heartbeat, ./retry-policy, ./execution-lease,
+// ./execution-control) do not require this module back, so there is no
+// circular-require cycle (only their lazily-evaluated constructor bodies do,
+// e.g. `this.db = options.database || require('../database')`, which only
+// runs later once this module has already finished loading).
+const { DEFAULT_STUCK_TIMEOUTS_MS } = require('./reliability/stuck-detector');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
@@ -100,6 +116,22 @@ const stmt = {
   findQueuedRuns: db.prepare("SELECT * FROM runs WHERE status IN ('queued', 'pending') ORDER BY id ASC LIMIT ?"),
   findAllRuns: db.prepare('SELECT * FROM runs ORDER BY created_at DESC LIMIT ?'),
   findRunsByStatus: db.prepare('SELECT * FROM runs WHERE status = ? ORDER BY id ASC'),
+  // Job History server-side filters (getRunsFiltered() below) — ADDITIVE
+  // ONLY. findAllRuns/findRunsByStatus above are untouched and keep serving
+  // their existing callers (scheduler.js's 'sharded' lookup, restart-
+  // recovery.js's orphaned-'running' sweep, the runs_list MCP tool). Every
+  // value is a bound `?` parameter, never string-concatenated.
+  findRunsByStatusLimited: db.prepare('SELECT * FROM runs WHERE status = ? ORDER BY created_at DESC LIMIT ?'),
+  findRunsByPlatformLimited: db.prepare('SELECT * FROM runs WHERE platform = ? ORDER BY created_at DESC LIMIT ?'),
+  findRunsByStatusAndPlatform: db.prepare('SELECT * FROM runs WHERE status = ? AND platform = ? ORDER BY created_at DESC LIMIT ?'),
+  // "stuck" candidates for getRunsFiltered(): literal status='stuck' rows
+  // UNION still-'running'/'pending' rows, which getRunsFiltered() then
+  // screens in JS for progress staleness. No existing SQL JSON-operator
+  // precedent in this codebase for the TEXT health_snapshot column, so JSON
+  // parsing stays in JS — the same pattern server.js's
+  // JSON.parse(health_snapshot) already uses.
+  findStuckCandidateRuns: db.prepare("SELECT * FROM runs WHERE status = 'stuck' OR status IN ('running', 'pending') ORDER BY created_at DESC"),
+  findStuckCandidateRunsByPlatform: db.prepare("SELECT * FROM runs WHERE (status = 'stuck' OR status IN ('running', 'pending')) AND platform = ? ORDER BY created_at DESC"),
   // Final Implementation Closure Â§2: completed_at must only be stamped on a
   // terminal transition, never on a routine heartbeat/progress update â€” those
   // call updateRun() too (via HeartbeatTracker.persist()) while the Run is
@@ -352,6 +384,78 @@ async function getRunById(id) { return await stmt.findRunById.get(id); }
 async function getQueuedRuns(limit = 10) { return await stmt.findQueuedRuns.all(limit); }
 async function getAllRuns(limit = 100) { return await stmt.findAllRuns.all(limit); }
 async function getRunsByStatus(status) { return await stmt.findRunsByStatus.all(status); }
+
+/**
+ * Job History filter support for GET /api/runs (server.js). Additive only —
+ * does not change getAllRuns/getRunsByStatus above, which keep their exact
+ * existing behavior for their existing callers.
+ *
+ * `status`/`platform` are expected pre-whitelisted by the caller (server.js
+ * checks `status` against a fixed set of known values and `platform` against
+ * src/platform-config.js's channel registry before calling this). Values are
+ * still only ever bound as `?` parameters here, never string-concatenated,
+ * as defense in depth.
+ *
+ * status === 'stuck' is NOT a new/invented condition — it mirrors
+ * src/reliability/stuck-detector.js exactly (DEFAULT_STUCK_TIMEOUTS_MS is
+ * imported from that file above, not re-typed):
+ *   (a) rows already written status='stuck' by StuckDetector.recoverExecution()
+ *       once retries are exhausted / cleanup unconfirmed / a remote Apify
+ *       actor is still active. This is the same literal value
+ *       public/app.js's loadJobs() already renders as the "Stuck" badge —
+ *       not a new status.
+ *   (b) rows still 'running'/'pending' whose last recorded progress
+ *       (health_snapshot.lastProgressAt — the exact PROGRESS signal
+ *       StuckDetector.checkStuckRuns() reads as hb.idleSinceProgressMs) is
+ *       older than the LARGEST class-specific timeout in
+ *       DEFAULT_STUCK_TIMEOUTS_MS. Case (b) exists because StuckDetector only
+ *       evaluates runs present in its in-memory heartbeat registry
+ *       (src/reliability/heartbeat.js) — a run orphaned by e.g. a server
+ *       restart, before any heartbeat re-registers, would otherwise stay
+ *       'running' forever without ever being caught. The single largest
+ *       configured threshold (currently CLOUD_API's 420000ms/7min) is used
+ *       as a conservative cutoff — not a new number, just Math.max() over
+ *       the same imported object — because the persisted row does not
+ *       reliably carry the per-class executionClass StuckDetector keys off
+ *       of, so the largest threshold avoids flagging a healthy
+ *       still-within-allowance run as stuck.
+ */
+async function getRunsFiltered({ status, platform, limit = 100 } = {}) {
+  const boundedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 1000);
+
+  if (status === 'stuck') {
+    const candidates = platform
+      ? await stmt.findStuckCandidateRunsByPlatform.all(platform)
+      : await stmt.findStuckCandidateRuns.all();
+    const nowMs = Date.now();
+    const maxStuckTimeoutMs = Math.max(...Object.values(DEFAULT_STUCK_TIMEOUTS_MS));
+    return candidates.filter((run) => isRunStuck(run, nowMs, maxStuckTimeoutMs)).slice(0, boundedLimit);
+  }
+
+  if (status && platform) return await stmt.findRunsByStatusAndPlatform.all(status, platform, boundedLimit);
+  if (status) return await stmt.findRunsByStatusLimited.all(status, boundedLimit);
+  if (platform) return await stmt.findRunsByPlatformLimited.all(platform, boundedLimit);
+  return await stmt.findAllRuns.all(boundedLimit);
+}
+
+// See getRunsFiltered()'s doc comment above for where this definition comes
+// from — not invented here.
+function isRunStuck(run, nowMs, maxStuckTimeoutMs) {
+  if (run.status === 'stuck') return true;
+  if (run.status !== 'running' && run.status !== 'pending') return false;
+  let referenceMs = NaN;
+  try {
+    const snap = run.health_snapshot ? JSON.parse(run.health_snapshot) : null;
+    if (snap && snap.lastProgressAt) referenceMs = new Date(snap.lastProgressAt).getTime();
+  } catch (_e) {
+    // Malformed snapshot JSON -- fall back to created_at below.
+  }
+  if (!Number.isFinite(referenceMs)) {
+    referenceMs = new Date(normalizeLegacyUtcTimestamp(run.created_at)).getTime();
+  }
+  return Number.isFinite(referenceMs) && (nowMs - referenceMs) > maxStuckTimeoutMs;
+}
+
 async function deleteRun(id) { await stmt.deleteRun.run(id); }
 
 /**
@@ -1288,6 +1392,30 @@ function parseItemData(item) {
   const mediaCount = parseNum(d.mediaCount ?? d.media_count ?? (Array.isArray(d.mediaItems) ? d.mediaItems.length : 0));
   const mediaItems = Array.isArray(d.mediaItems) ? d.mediaItems : [];
 
+  const isVideo = mediaType === 'video' || !!videoUrl || String(d.type || '').toLowerCase() === 'video' || !!d.videoMeta;
+  if (isVideo) {
+    if (!image) {
+      image = extractVideoCover(d);
+    }
+    if (!image) {
+      image = generateVideoCoverCapture({
+        platform: d.platform,
+        title: String(title).substring(0, 100),
+        author: String(author).substring(0, 50)
+      });
+    }
+  } else if (!image && (title || d.body || d.text || d.content)) {
+    image = generateTextPostCapture({
+      platform: d.platform,
+      title: String(title).substring(0, 100),
+      body: d.body || d.content || d.full_text || d.text || d.message_rich || d.message || d.caption || d.selfText || d.postText || '',
+      author: String(author).substring(0, 50),
+      likes,
+      comments,
+      subreddit: d.subreddit || ''
+    });
+  }
+
   return { videoUrl, mediaType, mediaCount, mediaItems, adCount, activeCountries,
     returnPosition, sold30d, gmv, shopUrl, country,
     title: String(title).substring(0, 200), image, url, author: String(author).substring(0, 100),
@@ -1330,6 +1458,16 @@ function generateUid(platform, query, parsed) {
 
 async function getProductCurrent(options = {}) {
   return await productCurrentOps.listCurrent(options);
+}
+
+/** Total rows matching the same filter, so the grid can page. */
+async function countProductCurrent(options = {}) {
+  return await productCurrentOps.countCurrent(options);
+}
+
+/** Per-platform row counts for the tab counters, in one query. */
+async function countProductCurrentByPlatform() {
+  return await productCurrentOps.countByPlatform();
 }
 
 /**
@@ -1961,13 +2099,13 @@ const api = {
   // it is memoised and every async export below also waits on it (see the
   // wrapper at the end of this file), so no caller can race an empty database.
   initDatabase,
-  getAllPlatforms, createRun, getRunById, getQueuedRuns, getAllRuns, getRunsByStatus, getChildRuns, updateRun, deleteRun,
+  getAllPlatforms, createRun, getRunById, getQueuedRuns, getAllRuns, getRunsByStatus, getRunsFiltered, getChildRuns, updateRun, deleteRun,
   deleteItem, deleteAllItems,
   saveComments, getComments,
   reserveSocialBotWindow, markSocialBotDispatched, markSocialBotFailed, releaseSocialBotWindow,
   getLastDispatchedSocialBotWindow, countDispatchedSocialBotRuns, recoverStalePendingSocialBotWindows,
   insertSnapshots, getLatestSnapshots, getLatestSnapshotByUid, getSnapshotHistory, getSnapshotsByRunId, getRunItems, backfillRunResultItems,
-  getProductCurrent, getProductCurrentByUid, getProductHistory, getProductHistoryWithMetadata, getProductWeekly, backfillSnapshotsToV2, getDatabaseHealth, formatVietnamTime,
+  getProductCurrent, countProductCurrent, countProductCurrentByPlatform, getProductCurrentByUid, getProductHistory, getProductHistoryWithMetadata, getProductWeekly, backfillSnapshotsToV2, getDatabaseHealth, formatVietnamTime,
   getPendingV2WriteFailures, repairPendingV2WriteFailures, checkV2Parity, normalizeLegacyUtcTimestamp,
   getSnapshotsMissingEtsyImages, updateSnapshotImage, getSnapshotsMatchingQuery,
   getStats, getRunStats,

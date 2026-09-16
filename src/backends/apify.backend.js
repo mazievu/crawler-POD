@@ -222,9 +222,20 @@ class ApifyBackend extends BaseBackend {
       const remaining = requestedItems - collected.length;
       if (remaining <= 0) break;
 
+      // The page size stays pinned to pageCap for EVERY page, never trimmed to
+      // the remainder. These actors derive their offset from the page size, so
+      // page=2 with limit=2 means "items 3-4", not "items 11-12" - it re-serves
+      // rows page 1 already returned, the product_id de-dup below drops all of
+      // them, and the run ends short. Observed on run #815: page 1 returned 10,
+      // page 2 returned 2, and collected stayed at 10/12.
+      //
+      // Cost note: a constant page size can over-fetch by up to pageCap-1 items
+      // on the final page, and these are pay-per-result actors. The surplus is
+      // discarded by the slice() below. That is the price of a correct offset;
+      // asking for a partial page returns duplicates and costs the same.
       const pageResult = await this.run(channel, backendConfig, query, {
         ...options,
-        maxItems: Math.min(pageCap, remaining),
+        maxItems: pageCap,
         page,
       });
 
@@ -242,7 +253,7 @@ class ApifyBackend extends BaseBackend {
       console.log(`[Apify] ${channel.name} page ${page}/${pages}: ${pageItems.length} item(s), ${collected.length}/${requestedItems} collected`);
 
       // Short page = end of results for this query.
-      if (pageItems.length < Math.min(pageCap, remaining)) break;
+      if (pageItems.length < pageCap) break;
     }
 
     return {

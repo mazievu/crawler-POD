@@ -37,6 +37,7 @@ import express from 'express';
 import { spawn } from 'node:child_process';
 import { timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,15 +45,24 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
+const require = createRequire(import.meta.url);
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LOG_FILE = path.join(PROJECT_ROOT, 'logs', 'crawler.log');
 const PID_FILE = path.join(PROJECT_ROOT, 'logs', 'crawler.pid');
+
+// This process is launched standalone (npm run mcp:http), not through
+// server.js, so nothing else has loaded .env yet — load it explicitly so
+// CRAWLER_PORT/PORT below see the same values server.js itself would.
+require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
 
 const HOST = process.env.MCP_HTTP_HOST || '0.0.0.0';
 const PORT = Number(process.env.MCP_HTTP_PORT) || 20130;
 const TOKEN = process.env.MCP_HTTP_TOKEN || null;
 const ALLOW_ANON = process.env.MCP_HTTP_ALLOW_ANON === '1';
-const CRAWLER_PORT = Number(process.env.CRAWLER_PORT) || Number(process.env.PORT) || 9999;
+// 20129 matches this app's own default (server.js: `process.env.PORT || 3000`
+// combined with .env's PORT=20129) — NOT the unrelated docker-compose
+// HOST_PORT=9999 mapping, which is a different port on a different surface.
+const CRAWLER_PORT = Number(process.env.CRAWLER_PORT) || Number(process.env.PORT) || 20129;
 const CRAWLER_BASE = process.env.CRAWLER_BASE_URL || `http://127.0.0.1:${CRAWLER_PORT}`;
 
 const text = (value) => ({

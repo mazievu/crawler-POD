@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '📸',
   color: '#e4405f',
+  domain: 'instagram.com',
 
   intelligenceTypes: ["social_post"],
 

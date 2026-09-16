@@ -18,7 +18,7 @@ const schema = {
 };
 
 async function handler(args = {}, db) {
-  const sources = db.listPlatformsWithStats();
+  const sources = await db.listPlatformsWithStats();
   const filtered = args.only_with_data ? sources.filter((s) => s.item_count > 0) : sources;
 
   return {

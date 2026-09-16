@@ -1,160 +1,183 @@
 'use strict';
 
+/**
+ * src/mcp/db.js used to open ./data/collector.db directly with a read-only
+ * better-sqlite3 handle (readonly: true, fileMustExist: true, and immediate
+ * `PRAGMA query_only = ON`). It has been ported to read PostgreSQL instead
+ * (see that file's own module doc): createReadOnlyDb() is now ASYNC, takes
+ * no `{ dbPath }` option, and talks to Postgres either via a dedicated
+ * pg.Pool (src/database/pg-client.js) or, when PG_MODE=pglite, via the
+ * app's own mcp-bridge HTTP endpoint (src/routes/mcp-bridge.js).
+ *
+ * These tests never open a real PostgreSQL/PGlite connection — per the
+ * task's environment rule ("if a test needs the DB layer, stub it"), the
+ * ONLY thing stubbed is the actual network driver that pg-client.js's
+ * createPool() hands back. Everything above that — PgDatabase, Statement,
+ * translateDialect, translateParams, and all of src/mcp/db.js's own SQL —
+ * still runs for REAL, so these tests exercise db.js's actual SQL text and
+ * actual parameter binding, not a hand-written imitation of it.
+ *
+ * HOW THE STUB WORKS
+ * pg-client.js's `createPool` export is destructured by src/mcp/db.js at
+ * require-time into a local const. So the monkeypatch below replaces
+ * pg-client.js's `createPool` property with a stable wrapper BEFORE the
+ * first `require('../../src/mcp/db')` in this process — the wrapper reads a
+ * mutable closure variable (`currentDriver`), so later tests can swap fake
+ * drivers freely even though db.js's own reference to `createPool` itself
+ * never changes after that first require.
+ */
+
 const test = require('node:test');
 const assert = require('node:assert');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const Database = require('better-sqlite3');
+
+delete process.env.PG_MODE; // force the direct pg.Pool branch, never the pglite bridge
+
+const pgClient = require('../../src/database/pg-client');
+let currentDriver = null;
+pgClient.createPool = () => currentDriver;
+
 const { createReadOnlyDb } = require('../../src/mcp/db');
+const { assertReadOnlySql } = require('../../src/routes/mcp-bridge');
 
-// Helper to create an isolated temporary test database
-function createTempTestDb() {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-safety-test-'));
-  const dbPath = path.join(tempDir, 'test-collector.db');
-
-  const db = new Database(dbPath);
-  db.exec(`
-    CREATE TABLE platforms (
-      id INTEGER PRIMARY KEY,
-      name TEXT UNIQUE,
-      display_name TEXT,
-      description TEXT,
-      query_type TEXT DEFAULT 'keyword',
-      actor_id TEXT,
-      country_support INTEGER DEFAULT 0,
-      icon TEXT DEFAULT '🔗',
-      color TEXT DEFAULT '#888888'
-    );
-    CREATE TABLE runs (
-      id INTEGER PRIMARY KEY,
-      platform TEXT,
-      query TEXT,
-      status TEXT DEFAULT 'pending',
-      apify_run_id TEXT,
-      apify_dataset_id TEXT,
-      items_count INTEGER DEFAULT 0,
-      new_count INTEGER DEFAULT 0,
-      active_count INTEGER DEFAULT 0,
-      dropped_count INTEGER DEFAULT 0,
-      error_message TEXT,
-      max_items INTEGER DEFAULT 100,
-      country TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      completed_at DATETIME
-    );
-    CREATE TABLE snapshots (
-      id INTEGER PRIMARY KEY,
-      run_id INTEGER,
-      platform TEXT,
-      query TEXT,
-      item_uid TEXT,
-      raw_data TEXT,
-      title TEXT,
-      url TEXT,
-      image TEXT,
-      author TEXT,
-      price REAL,
-      rating REAL,
-      reviews INTEGER,
-      sold_count INTEGER,
-      likes INTEGER,
-      comments INTEGER,
-      shares INTEGER,
-      views INTEGER,
-      status TEXT DEFAULT 'new',
-      prev_snapshot_id INTEGER,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    INSERT INTO platforms (id, name, display_name, description) VALUES (1, 'etsy', 'Etsy', 'Etsy platform');
-    INSERT INTO runs (id, platform, query, status, created_at, completed_at) VALUES (1, 'etsy', 'gift', 'done', '2026-08-01 10:00:00', '2026-08-01 10:05:00');
-    INSERT INTO snapshots (id, run_id, platform, query, item_uid, raw_data, title, url, price, likes, status, created_at)
-    VALUES (1, 1, 'etsy', 'gift', 'etsy:https://etsy.com/1', '{"price": 19.99, "currency": "USD"}', 'Personalized Gift', 'https://etsy.com/1', 19.99, 50, 'new', '2026-08-01 10:01:00');
-  `);
-  db.close();
-
-  return { tempDir, dbPath };
+/**
+ * A fake node-postgres-shaped driver. PgDatabase/Statement (pg-client.js)
+ * only ever call `.query(text, values)` and `.end()` on it — never anything
+ * SQLite-specific — so this is a faithful stand-in for a real pg.Pool.
+ * `handlers` is tried in order; the first whose `match` regex tests true
+ * against the (already dialect-translated) SQL text answers the query.
+ */
+function createFakeDriver(handlers) {
+  const calls = [];
+  return {
+    calls,
+    async query(text, values) {
+      calls.push({ text, values });
+      const handler = handlers.find((h) => h.match.test(text));
+      if (!handler) throw new Error(`fake pg driver: no canned handler for query:\n${text}`);
+      return handler.respond(text, values);
+    },
+    async end() {},
+  };
 }
 
-test('Read-only DB Safety: fail startup if database file does not exist', () => {
-  const nonExistentPath = path.join(os.tmpdir(), 'non-existent-db-' + Date.now() + '.db');
-  assert.throws(
-    () => {
-      createReadOnlyDb({ dbPath: nonExistentPath });
-    },
-    {
-      code: 'SQLITE_CANTOPEN',
+const OK_HANDLER = { match: /^SELECT 1 AS ok$/, respond: () => ({ rows: [{ ok: 1 }] }) };
+const TABLES_PRESENT_HANDLER = {
+  match: /information_schema\.tables/,
+  respond: () => ({ rows: [{ table_name: 'platforms' }, { table_name: 'runs' }, { table_name: 'snapshots' }] }),
+};
+
+test('createReadOnlyDb: rejects (does not silently return empty data) when PostgreSQL is unreachable', async () => {
+  currentDriver = createFakeDriver([
+    { match: /^SELECT 1 AS ok$/, respond: () => { throw new Error('ECONNREFUSED 127.0.0.1:1'); } },
+  ]);
+
+  await assert.rejects(
+    () => createReadOnlyDb(),
+    (err) => {
+      assert.strictEqual(err.code, 'PG_CONNECT_FAILED');
+      assert.match(err.message, /Could not reach PostgreSQL/);
+      return true;
     }
   );
 });
 
-test('Read-only DB Safety: PRAGMA query_only strictly blocks INSERT, UPDATE, DELETE, DROP on read-only connection', () => {
-  const { tempDir, dbPath } = createTempTestDb();
+test('createReadOnlyDb: rejects when PostgreSQL is missing a required table', async () => {
+  currentDriver = createFakeDriver([
+    OK_HANDLER,
+    { match: /information_schema\.tables/, respond: () => ({ rows: [{ table_name: 'platforms' }] }) }, // runs, snapshots missing
+  ]);
 
-  try {
-    const readOnlyDb = createReadOnlyDb({ dbPath });
-    assert.ok(readOnlyDb.db);
+  await assert.rejects(() => createReadOnlyDb(), /missing required table\(s\): runs, snapshots/);
+});
 
-    // 1. Verify INSERT fails
-    assert.throws(
-      () => {
-        readOnlyDb.db.prepare("INSERT INTO platforms (name, display_name) VALUES ('test', 'Test')").run();
-      },
-      /attempt to write a readonly database|cannot execute.*in a read-only transaction/i
-    );
+test('createReadOnlyDb: exposes no raw SQL/write surface — only the five named read methods, dbPath, and close()', async () => {
+  currentDriver = createFakeDriver([OK_HANDLER, TABLES_PRESENT_HANDLER]);
+  const db = await createReadOnlyDb();
 
-    // 2. Verify UPDATE fails
-    assert.throws(
-      () => {
-        readOnlyDb.db.prepare("UPDATE platforms SET display_name = 'Modified' WHERE id = 1").run();
-      },
-      /attempt to write a readonly database|cannot execute.*in a read-only transaction/i
-    );
+  assert.deepStrictEqual(Object.keys(db).sort(), [
+    'close',
+    'dbPath',
+    'getInsightsSummary',
+    'getItemByUid',
+    'getItemHistory',
+    'listPlatformsWithStats',
+    'searchItems',
+  ]);
+  // The old SQLite wrapper exposed `.db`, a raw better-sqlite3 handle, that
+  // any caller could run arbitrary SQL against (mitigated only by the
+  // engine-level PRAGMA query_only lock). There is no such escape hatch at
+  // all on the new contract — no raw handle, no prepare/exec/query passthrough.
+  assert.strictEqual(db.db, undefined);
+  assert.strictEqual(db.prepare, undefined);
+  assert.strictEqual(db.exec, undefined);
+  assert.strictEqual(db.query, undefined);
 
-    // 3. Verify DELETE fails
-    assert.throws(
-      () => {
-        readOnlyDb.db.prepare('DELETE FROM platforms WHERE id = 1').run();
-      },
-      /attempt to write a readonly database|cannot execute.*in a read-only transaction/i
-    );
+  await db.close();
+});
 
-    // 4. Verify DROP TABLE fails
-    assert.throws(
-      () => {
-        readOnlyDb.db.prepare('DROP TABLE snapshots').run();
-      },
-      /attempt to write a readonly database|cannot execute.*in a read-only transaction/i
-    );
+test('createReadOnlyDb: every SQL statement its methods issue is a single read-only SELECT/WITH (no write/DDL keyword, ever)', async () => {
+  currentDriver = createFakeDriver([
+    OK_HANDLER,
+    TABLES_PRESENT_HANDLER,
+    { match: /stats\.item_count/, respond: () => ({ rows: [] }) }, // listPlatformsWithStats
+    { match: /latest_snapshots/, respond: () => ({ rows: [] }) }, // searchItems
+    { match: /first_s\.first_seen_at/, respond: () => ({ rows: [] }) }, // getItemByUid
+    { match: /run_query/, respond: () => ({ rows: [] }) }, // getItemHistory
+    { match: /price_known_count/, respond: () => ({ rows: [{}] }) }, // getInsightsSummary stats
+    { match: /GROUP BY s\.platform/, respond: () => ({ rows: [] }) }, // getInsightsSummary platform dist
+    { match: /GROUP BY s\.status/, respond: () => ({ rows: [] }) }, // getInsightsSummary status dist
+  ]);
 
-    // 5. Verify SELECT succeeds
-    const platforms = readOnlyDb.db.prepare('SELECT * FROM platforms').all();
-    assert.strictEqual(platforms.length, 1);
-    assert.strictEqual(platforms[0].name, 'etsy');
+  const db = await createReadOnlyDb();
+  await db.listPlatformsWithStats();
+  await db.searchItems({ keyword: 'nails', platform: 'etsy' });
+  await db.getItemByUid('etsy:item1');
+  await db.getItemHistory('etsy:item1', {});
+  await db.getInsightsSummary({});
+  await db.close();
 
-    readOnlyDb.close();
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
+  assert.ok(currentDriver.calls.length >= 7, 'expected connectivity + table check + 5 data queries');
+  for (const { text } of currentDriver.calls) {
+    // Reuses the SAME validator the bridge applies to arbitrary caller SQL
+    // (src/routes/mcp-bridge.js, already covered by test/routes/mcp-bridge.test.js).
+    // db.js's own SQL is fixed, not caller-built, so it does not run through
+    // that validator in production — but it is a real, honest property that
+    // every statement db.js issues would ALSO pass it.
+    assert.doesNotThrow(() => assertReadOnlySql(text), `not a safe read-only statement:\n${text}`);
   }
 });
 
-test('Read-only DB Safety: Parameterized queries prevent SQL injection payloads', () => {
-  const { tempDir, dbPath } = createTempTestDb();
+test('createReadOnlyDb: searchItems binds attacker-controlled input as parameters — it never gets concatenated into SQL text', async () => {
+  currentDriver = createFakeDriver([
+    OK_HANDLER,
+    TABLES_PRESENT_HANDLER,
+    { match: /latest_snapshots/, respond: () => ({ rows: [] }) },
+  ]);
 
-  try {
-    const readOnlyDb = createReadOnlyDb({ dbPath });
+  const db = await createReadOnlyDb();
 
-    // Injection attempt 1: OR 1=1 in keyword
-    const search1 = readOnlyDb.searchItems({ keyword: "' OR 1=1 --" });
-    assert.strictEqual(search1.rows.length, 0);
+  // Keyword is tokenized into wildcarded %term% bind values (see db.js's
+  // searchItems), never inlined into the SQL string.
+  const keywordPayload = "' OR 1=1 --";
+  const searchByKeyword = await db.searchItems({ keyword: keywordPayload });
+  assert.strictEqual(searchByKeyword.rows.length, 0);
 
-    // Injection attempt 2: UNION SELECT in platform
-    const search2 = readOnlyDb.searchItems({ platform: "etsy' UNION SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24 --" });
-    assert.strictEqual(search2.rows.length, 0);
+  // Platform is bound verbatim as a single parameter, never inlined either.
+  const platformPayload = "etsy' UNION SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24 --";
+  const searchByPlatform = await db.searchItems({ platform: platformPayload });
+  assert.strictEqual(searchByPlatform.rows.length, 0);
 
-    readOnlyDb.close();
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
+  await db.close();
+
+  const searchCalls = currentDriver.calls.filter((c) => /latest_snapshots/.test(c.text));
+  assert.strictEqual(searchCalls.length, 2);
+
+  for (const call of searchCalls) {
+    assert.ok(!call.text.includes('UNION SELECT'), `injected SQL leaked into query text:\n${call.text}`);
+    assert.ok(!call.text.includes('1=1'), `injected SQL leaked into query text:\n${call.text}`);
+    assert.ok(/\$\d/.test(call.text), `expected $n bind placeholders, got:\n${call.text}`);
   }
+
+  // The platform payload reaches Postgres only as a bound value, verbatim.
+  assert.ok(searchCalls[1].values.includes(platformPayload));
 });

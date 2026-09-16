@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '🏷️',
   color: '#e53238',
+  domain: 'ebay.com',
 
   intelligenceTypes: ["product_listing"],
 

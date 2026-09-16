@@ -417,7 +417,8 @@
       }
 
       tbody.innerHTML = items.map((item, idx) => {
-        const img = item.image ? `<img src="${escapeAttr(item.image)}" class="product-img" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'48\' height=\'48\' fill=\'%23cbd5e1\'><rect width=\'100%\' height=\'100%\'/></svg>'">` : `<div class="product-img d-flex align-items-center justify-content-center text-muted fs-12">No img</div>`;
+        const platformBg = item.platform === 'reddit' ? '#ff4500' : (item.platform === 'twitter' ? '#1d9bf0' : (item.platform === 'tiktok_videos' ? '#fe2c55' : '#4f46e5'));
+        const img = item.image ? `<img src="${escapeAttr(item.image)}" class="product-img" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'48\' height=\'48\' fill=\'%231f2937\'><rect width=\'100%\' height=\'100%\'/><text x=\'50%\' y=\'55%\' fill=\'%239ca3af\' font-size=\'9\' font-family=\'sans-serif\' text-anchor=\'middle\'>No Img</text></svg>'">` : `<div class="product-img d-flex flex-column align-items-center justify-content-center text-white" style="background:${platformBg};font-size:10px;font-weight:700"><span>📸</span><span>Post</span></div>`;
         const price = item.price ? `$${Number(item.price).toFixed(2)}` : (item.price === 0 ? '$0.00' : '-');
         const rating = item.rating ? `⭐ ${item.rating} <span class="text-muted fs-12">(${item.reviews || 0})</span>` : '-';
         const soldOrEngage = item.sold_count ? `${item.sold_count} sold` : (item.likes ? `${item.likes} likes` : '-');

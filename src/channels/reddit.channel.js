@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '🔴',
   color: '#ff6b3d',
+  domain: 'reddit.com',
 
   intelligenceTypes: ["social_post","trend_signal"],
 
@@ -38,7 +39,7 @@ module.exports = {
       kind: BACKEND_KIND.APIFY,
       priority: 20,
       enabled: true,
-      actorId: 'automation-lab/reddit-scraper',
+      actorId: 'fatihtahta/reddit-scraper-search-fast',
       requiresEnv: ['APIFY_TOKEN'],
       actorEntitlement: "verified",
       availabilityMode: 'token_plus_actor_entitlement'

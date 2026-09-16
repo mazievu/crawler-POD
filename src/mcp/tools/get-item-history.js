@@ -94,7 +94,7 @@ async function handler(args = {}, db) {
     };
   }
 
-  const { rows, nextCursor } = db.getItemHistory(item_uid.trim(), { from, to, limit, cursor });
+  const { rows, nextCursor } = await db.getItemHistory(item_uid.trim(), { from, to, limit, cursor });
 
   const historyEntries = [];
   for (let i = 0; i < rows.length; i++) {

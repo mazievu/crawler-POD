@@ -24,7 +24,14 @@ function parseDate(v) {
   return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 }
 
-const { extractImage, cleanImageUrl } = require('../image-utils');
+const {
+  extractImage,
+  cleanImageUrl,
+  extractTwitterVideo,
+  extractVideoCover,
+  generateTextPostCapture,
+  generateVideoCoverCapture
+} = require('../image-utils');
 
 /**
  * Media extraction, written from the raw output of two real
@@ -88,6 +95,39 @@ function extractMedia(raw) {
       const node = mediaNode(child);
       if (node) mediaItems.push(node);
     }
+  } else if (Array.isArray(raw.attachments) && raw.attachments.length > 0) {
+    for (const att of raw.attachments) {
+      const isVid = att.type === 'video';
+      const attImg = !isVid ? cleanImageUrl(att.url || att.displayUrl) : '';
+      const attVid = isVid ? cleanMediaUrl(att.url || att.videoUrl) : '';
+      if (attImg || attVid) {
+        mediaItems.push({
+          type: isVid ? 'video' : 'image',
+          imageUrl: attImg,
+          videoUrl: attVid,
+        });
+      }
+    }
+  } else if (Array.isArray(raw.gallery_images) && raw.gallery_images.length > 0) {
+    for (const g of raw.gallery_images) {
+      const imgUrl = cleanImageUrl(g?.url || g?.original_url || g);
+      if (imgUrl && !mediaItems.some((m) => m.imageUrl === imgUrl)) {
+        mediaItems.push({ type: 'image', imageUrl: imgUrl, videoUrl: '' });
+      }
+    }
+  } else if (Array.isArray(raw.media_assets) && raw.media_assets.length > 0) {
+    for (const m of raw.media_assets) {
+      const isVid = String(m?.type || '').toLowerCase() === 'video';
+      const imgUrl = !isVid ? cleanImageUrl(m?.original_url || m?.url) : '';
+      const vidUrl = isVid ? cleanMediaUrl(m?.original_url || m?.url) : '';
+      if (imgUrl || vidUrl) {
+        mediaItems.push({
+          type: isVid ? 'video' : 'image',
+          imageUrl: imgUrl,
+          videoUrl: vidUrl
+        });
+      }
+    }
   } else {
     const node = mediaNode(raw);
     if (node) mediaItems.push(node);
@@ -100,13 +140,32 @@ function extractMedia(raw) {
         }
       }
     }
+    // Reddit old.reddit HTML table post preview
+    if (mediaItems.length === 0 && raw.html && typeof raw.html === 'string' && /<img[^>]+src=/i.test(raw.html)) {
+      const imgMatch = raw.html.match(/<img[^>]+src=["']([^"']+)["']/i);
+      if (imgMatch && imgMatch[1]) {
+        const htmlImg = cleanImageUrl(imgMatch[1]);
+        if (htmlImg) {
+          mediaItems.push({ type: 'image', imageUrl: htmlImg, videoUrl: '' });
+        }
+      }
+    }
   }
 
   // Cover image: the post's own displayUrl when it has one, else the first
-  // child carrying an image. Never an avatar — a post with no media of its own
-  // reports none, which is a fact about the post rather than a gap to paper over.
-  const image = cleanImageUrl(raw.displayUrl) || mediaItems.find((m) => m.imageUrl)?.imageUrl || extractImage(raw);
-  const videoUrl = cleanMediaUrl(raw.videoUrl) || mediaItems.find((m) => m.videoUrl)?.videoUrl || '';
+  // child carrying an image.
+  let image = cleanImageUrl(raw.displayUrl) || mediaItems.find((m) => m.imageUrl)?.imageUrl || extractImage(raw);
+  if (!image) {
+    image = extractVideoCover(raw);
+  }
+  // Last resort only: X/Twitter keeps its playable video inside the same
+  // extended_entities.media[] object image extraction already reads, under
+  // video_info.variants[]. extractTwitterVideo() accepts nothing but a
+  // video.twimg.com URL, so a non-Twitter payload reaching this shared function
+  // can never pick one up, and a payload that already resolved a videoUrl above
+  // never reaches it.
+  const videoUrl = cleanMediaUrl(raw.videoUrl) || mediaItems.find((m) => m.videoUrl)?.videoUrl
+    || extractTwitterVideo(raw) || '';
 
   let mediaType = MEDIA_TYPE_BY_RAW_TYPE[String(raw.type || '').toLowerCase()] || '';
   if (!mediaType) {
@@ -132,7 +191,7 @@ module.exports = function normalizeSocialPost(raw, context = { platform: 'social
     ? (raw.id_str ? `https://x.com/i/web/status/${raw.id_str}` : (raw.id ? `https://x.com/i/web/status/${raw.id}` : ''))
     : '';
   const url = raw.url || raw.permalink || raw.link || raw.webVideoUrl || raw.twitterUrl || twitterFallback || '';
-  const title = raw.title || raw.text || raw.full_text || raw.message || raw.message_rich || raw.caption || raw.description || '';
+  const title = raw.title || raw.text || raw.full_text || raw.message || raw.message_rich || raw.caption || raw.description || raw.postText || '';
   
   let author = '';
   // clockworks/tiktok-scraper nests the creator under authorMeta and leaves
@@ -171,23 +230,55 @@ module.exports = function normalizeSocialPost(raw, context = { platform: 'social
   // serving it as `image` made a post with no media indistinguishable from one
   // with media. extractMedia() resolves the real media, or reports none.
   const media = extractMedia(raw);
-  const image = media.image;
+  let image = media.image;
+  const likes = parseNum(raw.likes || raw.likeCount || raw.likesCount || raw.reactionsCount || raw.favorite_count || raw.favoriteCount || raw.favorites || raw.upvotes || raw.upVotes || raw.ups || raw.score || raw.reactions_count || raw.reactionCounts || raw.totalReactionCount || (typeof raw.reactions === 'number' ? raw.reactions : (raw.reactions?.like || 0)) || raw.diggCount || 0);
+  const comments = parseNum(raw.comments || raw.commentCount || raw.commentsCount || raw.replyCount || raw.reply_count || raw.replies || raw.conversation_count || raw.num_comments || raw.numComments || raw.comments_count || raw.numberOfComments || 0);
+
+  const isVideo = media.mediaType === 'video' || !!media.videoUrl || String(raw.type || '').toLowerCase() === 'video' || !!raw.videoMeta || String(raw.kind || '').toLowerCase() === 'video';
+
+  if (isVideo) {
+    if (!image) {
+      image = extractVideoCover(raw);
+    }
+    if (!image) {
+      image = generateVideoCoverCapture({
+        platform: context.platform,
+        title: String(title).substring(0, 100),
+        author: String(author).substring(0, 50)
+      });
+    }
+    if (media.mediaItems.length === 1 && !media.mediaItems[0].imageUrl && image) {
+      media.mediaItems[0].imageUrl = image;
+    }
+  } else if (!image) {
+    // If text-only post without image, generate a visual post capture card
+    image = generateTextPostCapture({
+      platform: context.platform,
+      title: String(title).substring(0, 100),
+      body: raw.body || raw.content || raw.full_text || raw.text || raw.message_rich || raw.message || raw.caption || raw.selfText || raw.postText || '',
+      author: String(author).substring(0, 50),
+      likes,
+      comments,
+      subreddit: raw.subreddit || (context.platform === 'reddit' ? (raw.subreddit_name_prefixed || '') : '')
+    });
+  }
 
   return {
-    uid: `${context.platform}:${raw.id || raw.id_str || raw.post_id || url || title}`,
+    uid: `${context.platform}:${raw.id || raw.id_str || raw.post_id || raw.postId || url || title}`,
     type: 'social_post',
     platform: context.platform,
     author: String(author).substring(0, 100),
     title: String(title).substring(0, 200),
-    body: raw.body || raw.content || raw.full_text || raw.text || raw.message_rich || raw.message || raw.caption || raw.selfText || '',
+    body: raw.body || raw.content || raw.full_text || raw.text || raw.message_rich || raw.message || raw.caption || raw.selfText || raw.postText || '',
     url: url,
     image,
+    captureImage: image,
     videoUrl: media.videoUrl,
-    mediaType: media.mediaType,
-    mediaCount: media.mediaCount,
+    mediaType: media.mediaType || (isVideo ? 'video' : (image ? 'image' : '')),
+    mediaCount: media.mediaCount || (image ? 1 : 0),
     mediaItems: media.mediaItems,
-    likes: parseNum(raw.likes || raw.likeCount || raw.likesCount || raw.favorite_count || raw.favoriteCount || raw.favorites || raw.upvotes || raw.score || raw.reactions_count || raw.reactionCounts || raw.totalReactionCount || raw.reactions || raw.diggCount || 0),
-    comments: parseNum(raw.comments || raw.commentCount || raw.commentsCount || raw.replyCount || raw.reply_count || raw.replies || raw.conversation_count || raw.num_comments || raw.numComments || raw.comments_count || 0),
+    likes,
+    comments,
     shares: parseNum(raw.shares || raw.shareCount || raw.sharesCount || raw.retweetCount || raw.retweet_count || raw.retweets || raw.repostCount || raw.reshare_count || raw.repin_count || raw.repinCount || raw.saves || 0),
     views: parseNum(raw.views || raw.viewCount || raw.viewsCount || raw.impressions || raw.impression_count || raw.view_count || raw.playCount || raw.video_view_count || 0),
     // Saves ("Lưu") is its own signal, not a share: TikTok reports collectCount

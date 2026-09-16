@@ -11,10 +11,26 @@
  * can reach it. Driving this from a REMOTE machine needs a different transport
  * (streamable HTTP) plus authentication — see mcp/README.md.
  *
+ * DATABASE CONNECTION MODE
+ *   PG_MODE (read from .env, same variable the app itself uses) selects how
+ *   this process reaches PostgreSQL:
+ *     - PG_MODE unset / anything other than "pglite" (a real PostgreSQL
+ *       server): this process connects directly via ./src/database, exactly
+ *       as before. A real server safely accepts many concurrent connections.
+ *     - PG_MODE=pglite: PGlite is single-process — only one Node process may
+ *       hold PGLITE_DIR at a time, and the app server already does while it
+ *       is running. This process must NOT also open it (a second opener on
+ *       the same directory risks corrupting the database), so every read
+ *       instead goes through the app's own /api/internal/mcp-bridge/query
+ *       endpoint (src/routes/mcp-bridge.js). If the app is not reachable on
+ *       its port, the affected tool refuses cleanly with an actionable error
+ *       instead of returning an empty result or opening PGLITE_DIR itself.
+ *
  * DELIBERATE LIMITS
  *   - db_query accepts read-only statements only (SELECT / WITH …). Writes,
  *     DDL and multi-statement input are refused, so a mis-generated query
- *     cannot damage the database.
+ *     cannot damage the database. The validator is shared with
+ *     src/routes/mcp-bridge.js — see assertReadOnlySql below.
  *   - There is no generic "run any shell command" tool. Server lifecycle is a
  *     narrow start/stop/status tool instead; an arbitrary exec endpoint is the
  *     one thing that turns a convenience server into a remote shell, and it
@@ -37,8 +53,30 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const LOG_FILE = path.join(PROJECT_ROOT, 'logs', 'server.log');
 const PID_FILE = path.join(PROJECT_ROOT, 'logs', 'server.pid');
 
+// This process is launched standalone by an MCP client (see .mcp.json), not
+// through server.js, so nothing else has loaded .env yet. PG_MODE has to be
+// known BEFORE the first database access to decide direct-vs-bridge routing
+// below, so .env is loaded here explicitly — same path server.js/src/database.js
+// resolve (`<project root>/.env`), so this sees exactly the same PG_MODE they do.
+require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env') });
+
+const { assertReadOnlySql, QUERY_PATH: BRIDGE_QUERY_PATH } = require(
+  path.join(PROJECT_ROOT, 'src', 'routes', 'mcp-bridge.js')
+);
+
+const DEFAULT_APP_PORT = 20129;
+function resolveAppPort() {
+  return Number(process.env.PORT) || DEFAULT_APP_PORT;
+}
+function usesPglite() {
+  return (process.env.PG_MODE || '').toLowerCase() === 'pglite';
+}
+const offlineMessage = (port) =>
+  `the crawler-POD server is not running on port ${port}; start it with the server_control tool or \`npm start\`.`;
+
 /** src/database is CommonJS and opens the pool on first require — load it lazily
- *  so a tool that never touches the database does not force a connection. */
+ *  so a tool that never touches the database does not force a connection.
+ *  Only used when PG_MODE is NOT pglite — see the module doc above. */
 let dbPromise = null;
 function db() {
   // Memoise the PROMISE, not the module: tool calls arrive concurrently, and
@@ -69,7 +107,7 @@ const TOOLS = [
       'Overall health of crawler-POD: PostgreSQL size and row counts, whether the HTTP server is responding, and the scheduler snapshot it reports.',
     inputSchema: {
       type: 'object',
-      properties: { port: { type: 'number', description: 'Port the app listens on (default 9999).' } },
+      properties: { port: { type: 'number', description: `Port the app listens on (default ${DEFAULT_APP_PORT}).` } },
     },
   },
   {
@@ -127,7 +165,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['status', 'start', 'stop'], description: 'What to do.' },
-        port: { type: 'number', description: 'Port for start/status (default 3000).' },
+        port: { type: 'number', description: `Port for start/status (default ${DEFAULT_APP_PORT}).` },
       },
       required: ['action'],
     },
@@ -144,70 +182,95 @@ const TOOLS = [
 
 // ==================== Tool implementations ====================
 
-/** Single read-only statement, no writes, no stacking. */
-function assertReadOnlySql(sql) {
-  const stripped = String(sql)
-    .replace(/--.*$/gm, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .trim()
-    .replace(/;\s*$/, '');
-
-  if (!/^\s*(select|with)\b/i.test(stripped)) {
-    throw new Error('db_query accepts only SELECT or WITH statements.');
-  }
-  if (stripped.includes(';')) {
-    throw new Error('db_query accepts a single statement; remove the extra ";".');
-  }
-  const forbidden = /\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|copy|vacuum|call|do)\b/i;
-  if (forbidden.test(stripped)) {
-    throw new Error('db_query refused: the statement contains a write or DDL keyword.');
-  }
-  return stripped;
-}
-
-async function httpJson(url, timeoutMs = 4000) {
+async function httpJson(url, { method = 'GET', body, timeoutMs = 8000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, { signal: controller.signal });
-    return { ok: response.ok, status: response.status, body: await response.json() };
+    const response = await fetch(url, {
+      method,
+      signal: controller.signal,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const raw = await response.text();
+    let parsed;
+    try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = raw; }
+    return { ok: response.ok, status: response.status, body: parsed };
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, offline: true, error: err.message };
   } finally {
     clearTimeout(timer);
   }
 }
 
+/** Sends one already-validated read-only statement through the app's
+ *  mcp-bridge endpoint (src/routes/mcp-bridge.js) and returns its rows. Only
+ *  used in PG_MODE=pglite — see the module doc above for why. */
+async function bridgeQuery(sql, params, port) {
+  const res = await httpJson(`http://127.0.0.1:${port}${BRIDGE_QUERY_PATH}`, {
+    method: 'POST',
+    body: { sql, params },
+  });
+  if (res.offline) throw new Error(offlineMessage(port));
+  if (!res.ok) throw new Error((res.body && res.body.error) || `mcp-bridge query failed (HTTP ${res.status})`);
+  return res.body.rows;
+}
+
+/** Runs one read-only statement directly against PostgreSQL when a real
+ *  server is configured, or through the bridge when PG_MODE=pglite. */
+async function runReadOnly(sql, params = [], port = resolveAppPort()) {
+  if (usesPglite()) return bridgeQuery(sql, params, port);
+  const database = await db();
+  return database._connection.prepare(sql).all(...params);
+}
+
 const handlers = {
-  async health({ port = Number(process.env.PORT) || 9999 } = {}) {
+  async health({ port = resolveAppPort() } = {}) {
+    const scheduler = await httpJson(`http://127.0.0.1:${port}/api/scheduler/status`);
+    const httpServer = scheduler.ok
+      ? { reachable: true, port }
+      : { reachable: false, port, detail: scheduler.error || `HTTP ${scheduler.status}` };
+
+    if (usesPglite()) {
+      // PGlite is single-process: this tool must never open data/pgdata
+      // itself while the app already holds it (see module doc above), so
+      // database health comes from the app's own endpoint, not a second
+      // local connection.
+      if (!scheduler.ok) {
+        return text({
+          database: `unavailable — PG_MODE=pglite and ${offlineMessage(port)}`,
+          httpServer,
+          scheduler: null,
+        });
+      }
+      const dbRes = await httpJson(`http://127.0.0.1:${port}/api/database/health`);
+      return text({
+        database: dbRes.ok ? dbRes.body : `unavailable (${dbRes.error || dbRes.status})`,
+        httpServer,
+        scheduler: scheduler.body,
+      });
+    }
+
     const database = await db();
     const dbHealth = await database.getDatabaseHealth();
-    const scheduler = await httpJson(`http://127.0.0.1:${port}/api/scheduler/status`);
-    return text({
-      database: dbHealth,
-      httpServer: scheduler.ok
-        ? { reachable: true, port }
-        : { reachable: false, port, detail: scheduler.error || `HTTP ${scheduler.status}` },
-      scheduler: scheduler.ok ? scheduler.body : null,
-    });
+    return text({ database: dbHealth, httpServer, scheduler: scheduler.ok ? scheduler.body : null });
   },
 
   async db_tables() {
-    const database = await db();
-    const connection = database._connection;
-    const tables = await connection
-      .prepare(
-        `SELECT table_name FROM information_schema.tables
-         WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
-         ORDER BY table_name`
-      )
-      .all();
+    const port = resolveAppPort();
+    const tables = await runReadOnly(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+       ORDER BY table_name`,
+      [],
+      port
+    );
 
     const rows = [];
     let total = 0;
     for (const t of tables) {
-      const { count } = await connection.prepare(`SELECT COUNT(*) AS count FROM "${t.table_name}"`).get();
-      const n = Number(count);
+      const countRows = await runReadOnly(`SELECT COUNT(*) AS count FROM "${t.table_name}"`, [], port);
+      const n = Number(countRows[0] && countRows[0].count);
       total += n;
       rows.push({ table: t.table_name, rows: n });
     }
@@ -217,14 +280,39 @@ const handlers = {
   async db_query({ sql, limit = 100 }) {
     const safeSql = assertReadOnlySql(sql);
     const cap = Math.min(Math.max(Number(limit) || 100, 1), 1000);
-    const database = await db();
-    const rows = await database._connection.prepare(`SELECT * FROM (${safeSql}) AS q LIMIT ${cap}`).all();
+    const rows = await runReadOnly(`SELECT * FROM (${safeSql}) AS q LIMIT ${cap}`, []);
     return text({ rowCount: rows.length, cappedAt: cap, rows });
   },
 
-  async runs_list({ limit = 20, status = null, platform = null }) {
-    const database = await db();
+  async runs_list({ limit = 20, status = null, platform = null } = {}) {
     const cap = Math.min(Math.max(Number(limit) || 20, 1), 200);
+
+    if (usesPglite()) {
+      const port = resolveAppPort();
+      const qs = new URLSearchParams();
+      if (status) qs.set('status', status);
+      if (platform) qs.set('platform', platform);
+      qs.set('limit', String(cap));
+      const res = await httpJson(`http://127.0.0.1:${port}/api/runs?${qs.toString()}`);
+      if (res.offline) return failure(offlineMessage(port));
+      if (!res.ok) return failure((res.body && res.body.error) || `GET /api/runs failed (HTTP ${res.status})`);
+      const runs = Array.isArray(res.body) ? res.body : [];
+      return text(
+        runs.slice(0, cap).map((r) => ({
+          id: r.id,
+          platform: r.platform,
+          query: r.query,
+          status: r.status,
+          items: r.items_count,
+          backend: r.active_backend,
+          createdAt: r.created_at,
+          completedAt: r.completed_at,
+          error: r.error_message,
+        }))
+      );
+    }
+
+    const database = await db();
     let runs = status ? await database.getRunsByStatus(status) : await database.getAllRuns(cap * 3);
     if (platform) runs = runs.filter((r) => r.platform === platform);
     return text(
@@ -243,6 +331,17 @@ const handlers = {
   },
 
   async run_get({ runId, includeItems = true }) {
+    if (usesPglite()) {
+      const port = resolveAppPort();
+      const res = await httpJson(`http://127.0.0.1:${port}/api/runs/${Number(runId)}`);
+      if (res.offline) return failure(offlineMessage(port));
+      if (res.status === 404) return failure(`Run ${runId} not found.`);
+      if (!res.ok) return failure((res.body && res.body.error) || `GET /api/runs/${runId} failed (HTTP ${res.status})`);
+      const { snapshots, children, ...run } = res.body || {};
+      const items = includeItems ? snapshots : undefined;
+      return text({ run, itemCount: items ? items.length : undefined, items, ...(children ? { children } : {}) });
+    }
+
     const database = await db();
     const run = await database.getRunById(Number(runId));
     if (!run) return failure(`Run ${runId} not found.`);
@@ -251,11 +350,21 @@ const handlers = {
   },
 
   async schedules_list() {
+    if (usesPglite()) {
+      const port = resolveAppPort();
+      const res = await httpJson(`http://127.0.0.1:${port}/api/marketplace-capture-schedules`);
+      if (res.offline) return failure(offlineMessage(port));
+      if (!res.ok) {
+        return failure((res.body && res.body.error) || `GET /api/marketplace-capture-schedules failed (HTTP ${res.status})`);
+      }
+      return text(res.body);
+    }
+
     const database = await db();
     return text(await database.getMarketplaceCaptureSchedules());
   },
 
-  async server_control({ action, port = Number(process.env.PORT) || 9999 }) {
+  async server_control({ action, port = resolveAppPort() }) {
     if (action === 'status') {
       const probe = await httpJson(`http://127.0.0.1:${port}/api/platforms`);
       const pid = fs.existsSync(PID_FILE) ? fs.readFileSync(PID_FILE, 'utf8').trim() : null;
