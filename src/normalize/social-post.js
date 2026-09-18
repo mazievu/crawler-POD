@@ -29,6 +29,8 @@ const {
   cleanImageUrl,
   extractTwitterVideo,
   extractVideoCover,
+  extractExplicitVideoCover,
+  isVideoFileUrl,
   generateTextPostCapture,
   generateVideoCoverCapture
 } = require('../image-utils');
@@ -82,6 +84,46 @@ function mediaNode(node) {
     imageUrl,
     videoUrl,
   };
+}
+
+/*
+ * Keys whose subtree describes the PERSON who posted, never the post's media.
+ * Removed from the payload before the generic image walk runs for a video, so
+ * an avatar can never be served as a video's cover frame.
+ * `authorMeta` is TikTok's (clockworks), `author` Facebook posts' and X's,
+ * `user` the older Twitter shape, `owner`/`pinner` Instagram's and Pinterest's.
+ */
+const AUTHOR_SUBTREE_KEYS = new Set([
+  'authorMeta', 'author_meta', 'author', 'user', 'owner', 'pinner', 'profile', 'channel',
+]);
+
+function withoutAuthorSubtrees(raw) {
+  const copy = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (AUTHOR_SUBTREE_KEYS.has(key)) continue;
+    copy[key] = value;
+  }
+  return copy;
+}
+
+/*
+ * Does this item carry a video at all?
+ *
+ * Every signal here was read off a real payload rather than guessed:
+ *   videoMeta            clockworks/tiktok-scraper  (dataset 2VvOrR0hbk1BfqcFJ)
+ *   attachments[].type   apify facebook-posts       (dataset est9wYPdtqkvHl4sf)
+ *   is_video             reddit scraper             (dataset g53s9RBM6uK3Qe8QH)
+ *   isVideo              pinterest scraper          (dataset zrgo7ZUG2DwRemVQv)
+ *   videoUrl / type      reddit + instagram scraper shapes
+ */
+function isVideoPayload(raw, mediaItems) {
+  if (!raw || typeof raw !== 'object') return false;
+  if (raw.videoMeta && typeof raw.videoMeta === 'object') return true;
+  if (cleanMediaUrl(raw.videoUrl)) return true;
+  if (String(raw.type || '').toLowerCase() === 'video') return true;
+  if (String(raw.kind || '').toLowerCase() === 'video') return true;
+  if (raw.is_video === true || raw.isVideo === true) return true;
+  return Array.isArray(mediaItems) && mediaItems.some((m) => m && m.videoUrl);
 }
 
 function extractMedia(raw) {
@@ -152,9 +194,45 @@ function extractMedia(raw) {
     }
   }
 
+  const hasVideo = isVideoPayload(raw, mediaItems);
+
   // Cover image: the post's own displayUrl when it has one, else the first
   // child carrying an image.
-  let image = cleanImageUrl(raw.displayUrl) || mediaItems.find((m) => m.imageUrl)?.imageUrl || extractImage(raw);
+  let image = cleanImageUrl(raw.displayUrl) || mediaItems.find((m) => m.imageUrl)?.imageUrl || '';
+
+  /*
+   * A VIDEO's poster is resolved from the field the payload names for it BEFORE
+   * the generic extractImage() walk gets a turn.
+   *
+   * Why the order matters — tiktok_videos, run 949 / dataset 2VvOrR0hbk1BfqcFJ
+   * (2026-09-18). clockworks/tiktok-scraper emits its top-level keys in this
+   * order: ... isAd, authorMeta, musicMeta, webVideoUrl, videoMeta ...
+   * `authormeta` and `avatar` are both in IMAGE_VALUE_KEYS, so the generic walk
+   * — which iterates insertion order — descended into authorMeta and returned
+   * `authorMeta.avatar` before it ever reached `videoMeta.coverUrl`. Every
+   * TikTok row in that run was stored wearing its creator's profile picture:
+   *   stored image = https://p16-common-sign.tiktokcdn-us.com/tos-alisg-avt-0068/...
+   *   real cover   = https://p19-common-sign.tiktokcdn-us.com/tos-alisg-p-0037/...
+   * (`avt` = avatar). extractVideoCover() already knew the right field; nothing
+   * ever called it, because the avatar made `image` truthy first.
+   *
+   * extractExplicitVideoCover() holds only keys that unambiguously mean "poster
+   * of this video", so running it early cannot override a payload that states
+   * its post image outright (the reddit/twitter scraper shapes, which put the
+   * poster in `image` / extended_entities, still resolve through the walk).
+   */
+  if (!image && hasVideo) {
+    image = extractExplicitVideoCover(raw);
+  }
+
+  if (!image) {
+    // For a video, the walk runs with the author subtree removed: an avatar is
+    // a picture of the poster, not of the post, and standing one in for a
+    // missing cover is exactly the defect above. A video with no cover
+    // anywhere must report none and let the caller generate a poster.
+    const generic = extractImage(hasVideo ? withoutAuthorSubtrees(raw) : raw);
+    image = isVideoFileUrl(generic) ? '' : generic;
+  }
   if (!image) {
     image = extractVideoCover(raw);
   }
@@ -170,7 +248,12 @@ function extractMedia(raw) {
   let mediaType = MEDIA_TYPE_BY_RAW_TYPE[String(raw.type || '').toLowerCase()] || '';
   if (!mediaType) {
     if (mediaItems.length > 1) mediaType = 'carousel';
-    else if (videoUrl) mediaType = 'video';
+    // `hasVideo` joins `videoUrl` here because a TikTok item proves it is a
+    // video through videoMeta (duration 8s, format mp4) while carrying no
+    // playable URL at all — the actor runs with shouldDownloadVideos:false and
+    // returns mediaUrls: []. Judged on videoUrl alone, every TikTok video was
+    // stored as mediaType "image".
+    else if (videoUrl || hasVideo) mediaType = 'video';
     else if (image) mediaType = 'image';
   }
 

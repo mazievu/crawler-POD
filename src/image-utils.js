@@ -297,14 +297,71 @@ function wrapText(text, maxCharsPerLine = 48, maxLines = 4) {
 }
 
 /**
+ * True when a URL points at a video FILE rather than a picture.
+ *
+ * An image field must never hold one. Facebook post payloads are why this
+ * exists: apify facebook-posts items describe a reel as
+ * `attachments: [{ type: "video", url: "https://video-iad6-1.xx.fbcdn.net/....mp4" }]`
+ * and carry no picture anywhere (verified exhaustively on dataset
+ * est9wYPdtqkvHl4sf, 2026-09-18 — the only other URLs in the whole item are the
+ * permalink, the author's avatar and the author's profile link). The generic
+ * walk reads `attachments` then `url`, so the mp4 itself was being stored as
+ * the post's `image` and rendered into an <img>.
+ *
+ * This is a predicate only. cleanImageUrl() deliberately still accepts these
+ * URLs, because extractTwitterVideo() validates video variants through it.
+ */
+function isVideoFileUrl(value) {
+  if (typeof value !== 'string' || !value) return false;
+  const withoutQuery = value.split('?')[0].split('#')[0];
+  return /\.(mp4|m3u8|mpd|mov|webm|avi|mkv)$/i.test(withoutQuery);
+}
+
+/**
+ * The cover frame a payload explicitly names for ITS OWN video.
+ *
+ * Separate from extractVideoCover() below, which also accepts generic
+ * `thumbnail` / `displayUrl` / first-attachment fields. Only unambiguous
+ * "this is the poster of this video" keys live here, so this list can be
+ * consulted BEFORE the generic extractImage() walk without overriding a
+ * payload that already states its post image outright.
+ *
+ * tiktok_videos (clockworks/tiktok-scraper): `videoMeta.coverUrl`, confirmed on
+ * run 949 / dataset 2VvOrR0hbk1BfqcFJ (2026-09-18). `originalCoverUrl` sits
+ * beside it in the same object and is the un-resized original.
+ */
+function extractExplicitVideoCover(raw) {
+  if (!raw || typeof raw !== 'object') return '';
+  const vm = raw.videoMeta || raw.video_meta || {};
+  const vid = (raw.video && typeof raw.video === 'object') ? raw.video : {};
+  const candidates = [
+    vm.coverUrl, vm.cover_url, vm.originalCoverUrl, vm.original_cover_url,
+    vm.dynamicCover, vm.dynamic_cover, vm.originCover, vm.origin_cover, vm.cover,
+    vid.coverUrl, vid.cover, vid.originCover, vid.dynamicCover, vid.poster,
+    raw.videoPreviewImageUrl, raw.video_preview_image_url,
+    raw.videoThumbnail, raw.video_thumbnail,
+    raw.coverUrl, raw.cover_url, raw.originCover, raw.dynamicCover,
+    raw.poster, raw.posterUrl, raw.poster_url,
+  ];
+  for (const c of candidates) {
+    const cleaned = cleanImageUrl(c);
+    if (cleaned && !isVideoFileUrl(cleaned)) return cleaned;
+  }
+  return '';
+}
+
+/**
  * Extract cover/poster/thumbnail URL for a video item.
  */
 function extractVideoCover(raw) {
   if (!raw || typeof raw !== 'object') return '';
   const candidates = [
     raw.videoMeta?.coverUrl,
+    raw.videoMeta?.originalCoverUrl,
     raw.videoMeta?.dynamicCover,
     raw.videoMeta?.originCover,
+    raw.videoPreviewImageUrl,
+    raw.video_preview_image_url,
     raw.coverUrl,
     raw.cover_url,
     raw.cover,
@@ -326,7 +383,10 @@ function extractVideoCover(raw) {
   ];
   for (const c of candidates) {
     const cleaned = cleanImageUrl(c);
-    if (cleaned) return cleaned;
+    // `attachments[0].url` above is only skipped when the attachment says
+    // type==="video"; an actor that labels it differently would otherwise hand
+    // back the mp4 as a poster.
+    if (cleaned && !isVideoFileUrl(cleaned)) return cleaned;
   }
   return '';
 }
@@ -428,6 +488,8 @@ module.exports = {
   extractTwitterImage,
   extractTwitterVideo,
   extractVideoCover,
+  extractExplicitVideoCover,
+  isVideoFileUrl,
   generateTextPostCapture,
   generateVideoCoverCapture,
   hasImage,

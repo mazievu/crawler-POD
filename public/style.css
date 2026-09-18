@@ -151,6 +151,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .crawl-filter-summary.active { color: var(--primary); }
 .crawl-filter-body { padding-top: 10px; }
 
+/* Minimum-value row. Sits directly under the tick boxes because it modifies
+   them — the number is meaningless on its own, and putting it anywhere else
+   would read as a second, independent filter. */
+.crawl-filter-min-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.crawl-filter-min-label { font-size: 12px; font-weight: 700; color: var(--text-1); margin: 0; }
+.crawl-filter-min { width: 120px; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12px; font-weight: 600; color: var(--text-1); background: white; }
+.crawl-filter-min:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.12); }
+.crawl-filter-min-note { font-size: 11px; color: var(--text-3); flex: 1 1 180px; min-width: 0; }
+
+/* Metric panel: the ALL notice is a sentence, not a chip list, so it is allowed
+   to wrap and use the full width instead of being clipped to one line. */
+.metric-boxes-empty { display: block; line-height: 1.5; }
+
 .crawl-filter .metric-row { flex-wrap: nowrap; gap: 6px; }
 .crawl-filter .crawl-field { min-width: 0; flex: 1 1 auto; }
 .crawl-filter .crawl-op { min-width: 56px; flex: 0 0 auto; }
@@ -226,11 +239,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   border: 1px solid var(--border);
   transition: all 0.2s ease;
   cursor: pointer;
+  display: flex;
+  flex-direction: column;
 }
 .item-card:hover {
   box-shadow: var(--shadow-hover);
   transform: translateY(-2px);
-  border-color: transparent;
+  border-color: #cbd5e1;
 }
 
 /* Card Image */
@@ -273,6 +288,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   font-size: 40px;
   opacity: 0.3;
 }
+.img-bottom-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(243, 244, 246, 0.94);
+  color: #374151;
+  font-size: 11px;
+  font-weight: 500;
+  text-align: center;
+  padding: 3px 6px;
+  border-top: 1px solid rgba(229, 231, 235, 0.8);
+  backdrop-filter: blur(2px);
+  z-index: 2;
+  pointer-events: none;
+}
 .active-tag { background: rgba(39,174,96,0.9) !important; }
 .new-tag { background: rgba(79,110,247,0.9) !important; }
 .dropped-tag { background: rgba(231,76,60,0.9) !important; }
@@ -313,7 +344,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .growth-down { font-size: 10px; color: var(--danger); font-weight: 600; margin-left: 3px; }
 
 /* Card Body */
-.item-body { padding: 10px 12px; }
+.item-body {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
 .item-title {
   font-size: 13px;
   font-weight: 600;
@@ -322,9 +358,133 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  line-height: 1.4;
+  line-height: 1.35;
+  margin-bottom: 4px;
+}
+.item-author-row {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+  line-height: 1.3;
+}
+.item-rating-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+  font-size: 11.5px;
+}
+.item-rating-row .stars {
+  color: #111827;
+  letter-spacing: 1px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.item-rating-row .review-count {
+  color: #6b7280;
+  font-size: 11px;
+}
+.item-price-row {
+  margin-top: 2px;
   margin-bottom: 6px;
 }
+.item-card .item-price {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111827;
+  margin-top: 0;
+}
+.item-card .item-price .original {
+  font-size: 12px;
+  color: #6b7280;
+  text-decoration: line-through;
+  font-weight: 400;
+  margin-left: 5px;
+}
+.item-card .item-price .discount {
+  font-size: 11px;
+  color: #15803d;
+  font-weight: 500;
+  margin-left: 4px;
+}
+.badge-shipping {
+  display: inline-block;
+  background: #dcfce7;
+  color: #15803d;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  letter-spacing: 0.2px;
+}
+.badge-bestseller {
+  display: inline-block;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  letter-spacing: 0.2px;
+}
+
+/* 5-row Metrics Box */
+.item-metrics-box {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-top: auto;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  border-bottom: 1px solid #f1f5f9;
+  font-size: 12px;
+}
+.metric-row:last-child {
+  border-bottom: none;
+}
+.metric-label {
+  color: #111827;
+  font-weight: 500;
+  font-size: 12px;
+}
+.metric-val {
+  font-weight: 700;
+  font-size: 12px;
+  text-align: right;
+}
+.metric-val.val-red {
+  color: #dc2626;
+}
+.metric-val.val-blue {
+  color: #2563eb;
+}
+.metric-val.val-teal {
+  color: #0d9488;
+}
+.metric-val.val-orange {
+  color: #ea580c;
+}
+
+/* Movement indicator, now inline in a form row instead of on its own horizontal
+   line. Kept lighter than the value so the number stays the thing you read. */
+.metric-change {
+  font-size: 10.5px;
+  font-weight: 600;
+  margin-left: 5px;
+  white-space: nowrap;
+}
+.metric-row .metric-val {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0;
+}
+
 .item-source {
   font-size: 11px;
   color: var(--text-3);

@@ -20,3 +20,9 @@ logs/
 # encrypted marketplace session cookies. Never commit them; the packet builder
 # should write outside the repo.
 docs/DATA_PACKETS/
+
+# Images downloaded by src/media-cache.js during a crawl, so a provider whose
+# links expire (pratikdani's TikTok Shop proxy answered 200 one day and 403
+# three days later) still has a viewable picture. Runtime output that grows
+# with every crawl — a cache, not source.
+public/media/

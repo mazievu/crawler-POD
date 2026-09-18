@@ -7,6 +7,7 @@ const doctorModule = require('./doctor');
 const { getOrCreateTracker, removeTracker, STAGES } = require('./reliability/heartbeat');
 const { defaultRetryPolicy } = require('./reliability/retry-policy');
 const { isCurrentOwner } = require('./reliability/execution-lease');
+const { persistEphemeralImages } = require('./media-cache');
 const { registerExecution, markExecutionSettled, unregisterExecution } = require('./reliability/execution-control');
 
 const router = new BackendRouter({ registry, doctor: doctorModule });
@@ -122,6 +123,18 @@ async function executeRun(runId, platform, query, options = {}) {
     // threw away nearly everything it fetched and reported a successful run
     // that stored almost nothing, with the reason only ever visible in the
     // server log. The UI marks an imageless item instead of hiding it.
+    /*
+     * Some providers hand back a link to their own image proxy rather than the
+     * platform's CDN, and those links expire — pratikdani's TikTok Shop images
+     * answered 200 on 2026-09-15 and 403 three days later, blanking every
+     * stored product. Fetch those bytes now, while the link is still alive, and
+     * store a local path instead. Durable hosts are untouched.
+     */
+    const mediaSummary = await persistEphemeralImages(normalizedItems);
+    if (mediaSummary.considered > 0) {
+      console.log(`Run ${runId}: media cache — ${mediaSummary.cached} downloaded, ${mediaSummary.reused} reused, ${mediaSummary.failed} failed of ${mediaSummary.considered} expiring image(s)`);
+    }
+
     const collectedItems = normalizedItems;
     const itemsWithoutImage = normalizedItems.filter((item) => !item.image).length;
 

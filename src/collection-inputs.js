@@ -1,4 +1,4 @@
-const { parseConditions, parseMetricSelection } = require('./filters/metric-conditions');
+const { parseConditions, parseMetricSelection, parseMetricNumber } = require('./filters/metric-conditions');
 
 const DEFAULT_QUERY_FIELD = {
   id: 'query', label: 'Search query', type: 'text', required: true, placeholder: 'Enter keyword...',
@@ -142,6 +142,59 @@ function buildCollectionOptions(platform, values = {}) {
       throw new Error(`Unknown metric(s): ${invalid.join(', ')}`);
     }
     if (selected.length > 0) options.metrics = selected;
+  }
+
+  /*
+   * MINIMUM VALUE for the ticked crawl metrics.
+   *
+   * WHITELISTED HERE DELIBERATELY, and for the same reason `keywords` and
+   * `metrics` are: this function copies only what it names, so an option it
+   * does not name is dropped without a word — which is exactly how an earlier
+   * feature's `options.metrics` disappeared and let a run report success with
+   * the filter never applied.
+   *
+   * SEMANTICS — one number, every ticked metric, AND, `>=`:
+   *   metrics = ['likes','views'], metricMin = 1000
+   *     -> conditions = [likes >= 1000, views >= 1000]
+   *   and an item is kept only if it satisfies BOTH, which is the AND the panel
+   *   already advertises ("Tích nhiều ô = sản phẩm phải đạt tất cả").
+   *   No metricMin  -> no conditions added, and a tick keeps its existing
+   *   meaning exactly: the item must REPORT the metric, highest first.
+   *
+   * WHY IT BECOMES `conditions` RATHER THAN A NEW PIPELINE INPUT: the crawl
+   * pipeline already evaluates `options.conditions` after normalization and
+   * before persistence (runs.service.js -> applyConditions), with AND across
+   * entries and "metric not reported" counting as a REJECT. A threshold is
+   * precisely a condition, so expressing it as one means no new evaluation path
+   * — and no second place where "minimum" could come to mean something else.
+   * Expanding it HERE rather than in the browser also means the pairing of
+   * threshold-to-metrics cannot be got wrong by a client.
+   *
+   * `metricMin` itself is kept on the options so the run row records the number
+   * the user typed, not only the conditions it became.
+   */
+  if (values.metricMin !== undefined && values.metricMin !== null && String(values.metricMin).trim() !== '') {
+    const min = parseMetricNumber(values.metricMin);
+    if (min === null) throw new Error(`Minimum metric value must be a number (got ${JSON.stringify(values.metricMin)}).`);
+    if (min < 0) throw new Error(`Minimum metric value must not be negative (got ${min}).`);
+
+    const targets = options.metrics || [];
+    // A threshold with nothing to apply to is refused, never ignored: silently
+    // dropping it would run the crawl WITHOUT the limit the user asked for and
+    // still report success.
+    if (targets.length === 0) {
+      throw new Error('A minimum metric value needs at least one selected metric to apply to. Tick the metric(s) it applies to, or clear the minimum.');
+    }
+    const explicit = new Set((options.conditions || []).map((c) => c.field));
+    const clash = targets.filter((field) => explicit.has(field));
+    if (clash.length > 0) {
+      throw new Error(`Minimum metric value conflicts with an explicit condition on: ${clash.join(', ')}. Use one or the other.`);
+    }
+
+    options.metricMin = min;
+    options.conditions = (options.conditions || []).concat(
+      targets.map((field) => ({ field, operator: 'gte', value: min })),
+    );
   }
 
   // Multi-keyword fan-out. Whitelisted HERE deliberately: this function drops

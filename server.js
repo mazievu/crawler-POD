@@ -978,6 +978,12 @@ async function mapProductCurrentToItemShape(p, preloadedRunMeta = null) {
     views: p.current_views,
     status: p.status,
     created_at: p.last_crawled_at,
+    first_seen_at: p.first_seen_at,
+    last_seen_at: p.last_seen_at,
+    last_crawled_at: p.last_crawled_at,
+    delta_24h_views: p.delta_24h_views,
+    delta_24h_likes: p.delta_24h_likes,
+    delta_24h_sold: p.delta_24h_sold,
     ...richMeta,
     growth: {
       likes: p.delta_likes || 0,
@@ -1044,13 +1050,24 @@ app.get('/api/item-metrics', (req, res) => {
  * idx_product_current_platform_crawled. Ordering the grid by any other column
  * would order it by a value the user is never shown.
  */
-const TIME_SORT_COLUMNS = { recent: 'last_crawled_at' };
+/*
+ * The two orderings that mean something for EVERY platform, and therefore the
+ * only two the ALL selection offers. Each carries its own default direction:
+ * "oldest" is not a direction applied to "recent", it is its own request, and
+ * making the caller remember to also send dir=asc is how an ordering silently
+ * comes back newest-first. An explicit `dir` still wins when one is supplied.
+ */
+const TIME_SORT_COLUMNS = {
+  recent: { column: 'last_crawled_at', direction: 'DESC' },
+  oldest: { column: 'last_crawled_at', direction: 'ASC' },
+};
 
 function buildTimeSqlOrder(sortField, sortDirection) {
-  const column = TIME_SORT_COLUMNS[String(sortField || '').trim().toLowerCase()];
-  if (!column) return null;
-  const direction = String(sortDirection || 'desc').trim().toLowerCase() === 'asc' ? 'ASC' : 'DESC';
-  return `${column} ${direction} NULLS LAST`;
+  const spec = TIME_SORT_COLUMNS[String(sortField || '').trim().toLowerCase()];
+  if (!spec) return null;
+  const requested = String(sortDirection || '').trim().toLowerCase();
+  const direction = requested === 'asc' ? 'ASC' : requested === 'desc' ? 'DESC' : spec.direction;
+  return `${spec.column} ${direction} NULLS LAST`;
 }
 
 app.get('/api/items', async (req, res) => {
