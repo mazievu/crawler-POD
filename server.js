@@ -577,17 +577,56 @@ app.get('/api/html-capture-jobs/:id', (req, res) => {
 });
 
 /** Submits a marketplace capture through the shared Resource Scheduler (BROWSER pool) instead of launching a browser directly. */
+/*
+ * WHAT IS PROVEN: this used to `return snapshotObj.result` unguarded. When a
+ * run reaches 'done' carrying no `result`, that returns `undefined`, the route
+ * below does `res.json(undefined)`, and Express answers 201 with a ZERO-LENGTH
+ * BODY. The caller's `response.json()` then throws "Unexpected end of JSON
+ * input" — an error that says nothing about whether the capture worked. That is
+ * the exact stack CI reported for `capture API returns a successful saved
+ * capture instead of starting a browser again` (test/marketplace-api.test.js:131).
+ * Its sibling submitMarketplaceDiscoveryViaScheduler() already guards the
+ * identical spot with `|| { items: [] }`; only this one did not.
+ *
+ * WHAT IS NOT PROVEN: why a 'done' run can carry no result. The obvious
+ * candidate — status and result being two separate writes — was checked and
+ * RULED OUT: managed-execution.js writes both in a single updateRun call. The
+ * flake is real (commit a3fb325 failed one CI run and passed the next on
+ * identical code, and main has been red on this same test since 2026-09-11) but
+ * its cause is still UNCONFIRMED. The bounded re-read below is therefore
+ * defensive, not a claimed fix: it costs at most one second and covers a
+ * late-visible write from a writer other than the one we waited on.
+ *
+ * What this DOES settle is the failure mode: never an empty body. Either a
+ * result, or a named error.
+ */
+const CAPTURE_RESULT_SETTLE_ATTEMPTS = 10;
+const CAPTURE_RESULT_SETTLE_MS = 100;
+
 async function submitMarketplaceCaptureViaScheduler(payload) {
   const run = await db.createRun({ platform: payload.platform || 'marketplace', query: payload.url || 'capture', maxItems: 1, options: { jobKind: 'marketplace_capture', ...payload } });
   await scheduler.submitRun(run);
-  const finished = await scheduler.waitForCompletion(run.id, { pollMs: 150, timeoutMs: 180000 });
-  const snapshotObj = JSON.parse(finished.health_snapshot || '{}');
+  let finished = await scheduler.waitForCompletion(run.id, { pollMs: 150, timeoutMs: 180000 });
+
   if (finished.status !== 'done') {
     const err = new Error(finished.error_message || 'Capture failed');
     err.status = 400;
     throw err;
   }
-  return snapshotObj.result;
+
+  let result = JSON.parse(finished.health_snapshot || '{}').result;
+  for (let attempt = 0; result === undefined && attempt < CAPTURE_RESULT_SETTLE_ATTEMPTS; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, CAPTURE_RESULT_SETTLE_MS));
+    finished = await db.getRunById(run.id);
+    result = JSON.parse((finished && finished.health_snapshot) || '{}').result;
+  }
+
+  if (result === undefined) {
+    const err = new Error(`Capture run ${run.id} finished without a result payload`);
+    err.status = 500;
+    throw err;
+  }
+  return result;
 }
 
 app.post('/api/html-captures', async (req, res) => {
