@@ -101,6 +101,8 @@ configured flush interval`. Test đó assert **đồng bộ** `writes.length` ng
 
 ### Runtime Evidence
 
+Local (PGlite sạch, `test/reliability.test.js`):
+
 ```
 ✔ ManagedExecution: the executor result survives the heartbeat tracker's own snapshot write
 ✔ ManagedExecution: a falsy-but-defined executor result is still readable back
@@ -108,6 +110,21 @@ configured flush interval`. Test đó assert **đồng bộ** `writes.length` ng
 ✔ ManagedExecution: a failing executor still reports its error rather than a half-written snapshot
 ℹ tests 28 | pass 28 | fail 0
 ```
+
+CI (PostgreSQL thật, full suite, PR #16 — đây mới là môi trường tái hiện được
+lỗi gốc, vì dưới PGlite test đó bị skip theo thiết kế):
+
+```
+ok 154 - capture API returns a successful saved capture instead of starting a browser again
+ok 332 - ManagedExecution: the executor result survives the heartbeat tracker's own snapshot write
+ok 333 - ManagedExecution: a falsy-but-defined executor result is still readable back
+ok 334 - ManagedExecution: the last health_snapshot write of a successful run is the one carrying the result
+ok 335 - ManagedExecution: a failing executor still reports its error rather than a half-written snapshot
+# pass 445 | fail 0 | skipped 7
+```
+
+Test 154 chính là test hay hỏng. Log xác nhận nó **chạy thật**, không nằm trong
+7 test bị skip.
 
 ### Problems And Failures
 
@@ -137,8 +154,11 @@ configured flush interval`. Test đó assert **đồng bộ** `writes.length` ng
 ### Remaining Risks
 
 - Đây là sửa vào **shared component** (§14). Mọi executor không-channel đi qua
-  đây: `user_journey`, `marketplace_capture`, `marketplace_discovery`. Đã chạy
-  hồi quy reliability 28/28 và full suite.
+  đây: `user_journey`, `marketplace_capture`, `marketplace_discovery`. Hồi quy:
+  reliability 28/28 local, và full suite 445/0 trên CI với PostgreSQL thật.
+- Chạy full suite **local** không dùng làm bằng chứng được: nó treo vô hạn ở
+  `test/amazon-user-journey-fix.test.js` (cần browser/mạng, `--test-timeout=0`).
+  Không liên quan thay đổi này — CI chạy đúng file đó và pass.
 - Lỗi gốc chỉ tái hiện trên CI với PostgreSQL thật. Dưới PGlite hai test
   cross-process bị skip theo thiết kế. Bằng chứng tất định đến từ test mới, không
   từ chính test hay hỏng.
