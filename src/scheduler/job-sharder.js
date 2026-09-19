@@ -22,6 +22,54 @@ function needsSharding(plan) {
 }
 
 /**
+ * Multi-keyword fan-out (TASK-2).
+ *
+ * A submitted Run carrying N keywords is not one crawl of an N-keyword string —
+ * it is N independent Tasks (§4: "Task = đơn vị công việc độc lập bên trong
+ * Run ... ví dụ product, listing URL, capture URL, query"). A query is already
+ * named in the rules as a Task unit, so this adds no new concept: it splits a
+ * parent Run into one child Run per keyword, exactly the way planShards()
+ * splits it into one child Run per size shard, and the SAME scheduler
+ * admission path (pool slot + RAM reservation per child) then gives each
+ * keyword its own Worker.
+ */
+function needsKeywordFanOut(plan) {
+  const keywords = plan && plan.options ? plan.options.keywords : null;
+  return Array.isArray(keywords) && keywords.length > 1;
+}
+
+/**
+ * Splits a parent run into one child descriptor per keyword. Like planShards()
+ * this touches no database — the scheduler persists these via db.createRun with
+ * parentRunId set.
+ *
+ * maxItems SEMANTICS (rules §5.4) — PER KEYWORD, not divided across keywords:
+ *
+ *   planShards() divides maxItems because its shards partition ONE result set:
+ *   items 0..99 and 100..199 of the same query are the same list, so the parts
+ *   must add up to N.
+ *
+ *   Keywords are DIFFERENT result sets. There is nothing to partition. The
+ *   existing single-keyword contract is "return up to maxItems for this query",
+ *   and each keyword here IS such a query, so each keeps the full budget.
+ *   Dividing instead would make the depth of every keyword depend on how many
+ *   other keywords the user happened to type (maxItems=20 over 4 keywords
+ *   would become a top-5 crawl), silently changing the meaning of a number the
+ *   user set. Upper bound for the whole submission is therefore
+ *   maxItems x keywordCount — surfaced in the UI before the user submits.
+ */
+function planKeywordTasks(run, plan) {
+  const keywords = plan.options.keywords;
+  const maxItems = Number(plan.maxItems || (run && run.max_items) || 0) || 1;
+  return keywords.map((keyword, index) => ({
+    keyword,
+    keywordIndex: index,
+    keywordCount: keywords.length,
+    maxItems
+  }));
+}
+
+/**
  * Splits a parent run into `shardCount` child run descriptors. Does not touch
  * the database — callers (the scheduler) persist these via db.createRun with
  * parentRunId set.
@@ -75,4 +123,4 @@ function allShardsTerminal(childRuns) {
   return childRuns.length > 0 && childRuns.every(c => ['done', 'failed', 'stuck'].includes(c.status));
 }
 
-module.exports = { needsSharding, planShards, aggregateShardResults, allShardsTerminal };
+module.exports = { needsSharding, planShards, needsKeywordFanOut, planKeywordTasks, aggregateShardResults, allShardsTerminal };

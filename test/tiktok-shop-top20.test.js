@@ -96,7 +96,7 @@ test('TikTok Shop channel: product actors only, video scraper gone', () => {
   assert.ok(!actorIds.includes('clockworks/tiktok-scraper'));
 
   const byPriority = [...tiktokShopChannel.backends].sort((a, b) => a.priority - b.priority);
-  assert.equal(byPriority[0].actorId, 'unseenuser/TikTok-Shop-Scraper');
+  assert.equal(byPriority[0].actorId, 'pratikdani/tiktok-shop-search-scraper');
 });
 
 test('production schedule: daily 09:00 Vietnam time, 20 items, US market', () => {

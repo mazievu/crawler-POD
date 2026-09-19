@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '🐦',
   color: '#1da1f2',
+  domain: 'x.com',
 
   intelligenceTypes: ["social_post"],
 

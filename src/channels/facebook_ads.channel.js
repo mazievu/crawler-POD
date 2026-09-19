@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '📢',
   color: '#4599ff',
+  domain: 'facebook.com',
 
   intelligenceTypes: ["ad_creative"],
 

@@ -34,7 +34,7 @@ const schema = {
 
 async function handler(args = {}, db) {
   const { platform, keyword, from, to } = args;
-  const result = db.getInsightsSummary({ platform, keyword, from, to });
+  const result = await db.getInsightsSummary({ platform, keyword, from, to });
   const s = result.stats || {};
 
   const totalSnapshots = s.total_snapshots || 0;

@@ -151,6 +151,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .crawl-filter-summary.active { color: var(--primary); }
 .crawl-filter-body { padding-top: 10px; }
 
+/* Minimum-value row. Sits directly under the tick boxes because it modifies
+   them — the number is meaningless on its own, and putting it anywhere else
+   would read as a second, independent filter. */
+.crawl-filter-min-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.crawl-filter-min-label { font-size: 12px; font-weight: 700; color: var(--text-1); margin: 0; }
+.crawl-filter-min { width: 120px; flex: 0 0 auto; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 12px; font-weight: 600; color: var(--text-1); background: white; }
+.crawl-filter-min:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.12); }
+.crawl-filter-min-note { font-size: 11px; color: var(--text-3); flex: 1 1 180px; min-width: 0; }
+
+/* Metric panel: the ALL notice is a sentence, not a chip list, so it is allowed
+   to wrap and use the full width instead of being clipped to one line. */
+.metric-boxes-empty { display: block; line-height: 1.5; }
+
 .crawl-filter .metric-row { flex-wrap: nowrap; gap: 6px; }
 .crawl-filter .crawl-field { min-width: 0; flex: 1 1 auto; }
 .crawl-filter .crawl-op { min-width: 56px; flex: 0 0 auto; }
@@ -179,6 +192,36 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .pill { display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px; border: 1px solid var(--border); border-radius: 16px; background: white; font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: all 0.15s; color: var(--text-2); }
 .pill:hover { border-color: var(--primary); }
 .pill.active { background: var(--primary); color: white; border-color: var(--primary); }
+
+/* A platform pill wears that platform's brand colour, so it matches the
+   .platform-tag badge on every card it filters to. `--pill-color` is set
+   inline by renderFilterPills() from the same platformColor() the card badge
+   uses — this file never names a platform colour itself.
+   color-mix keeps the resting state a readable tint rather than a solid block
+   of brand colour on every pill; the active pill goes solid, which is the
+   exact colour the card badges carry. */
+.pill[data-platform] {
+  border-color: color-mix(in srgb, var(--pill-color) 45%, transparent);
+  background: color-mix(in srgb, var(--pill-color) 8%, white);
+  color: color-mix(in srgb, var(--pill-color) 72%, #1f2330);
+}
+.pill[data-platform]:hover {
+  border-color: var(--pill-color);
+  background: color-mix(in srgb, var(--pill-color) 16%, white);
+}
+.pill[data-platform].active {
+  background: var(--pill-color);
+  border-color: var(--pill-color);
+  color: white;
+}
+.pill[data-platform].active .pill-dot { background: white !important; }
+
+/* Safari/Chromium without color-mix() still gets a brand-coloured border and
+   a brand-coloured active fill; only the resting tint degrades to white. */
+@supports not (color: color-mix(in srgb, red 50%, white)) {
+  .pill[data-platform] { background: white; border-color: var(--pill-color); color: var(--text-2); }
+  .pill[data-platform]:hover { background: white; }
+}
 .pill-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .pill-count { font-size: 10px; opacity: 0.7; }
 
@@ -196,11 +239,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   border: 1px solid var(--border);
   transition: all 0.2s ease;
   cursor: pointer;
+  display: flex;
+  flex-direction: column;
 }
 .item-card:hover {
   box-shadow: var(--shadow-hover);
   transform: translateY(-2px);
-  border-color: transparent;
+  border-color: #cbd5e1;
 }
 
 /* Card Image */
@@ -243,6 +288,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   font-size: 40px;
   opacity: 0.3;
 }
+.img-bottom-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: rgba(243, 244, 246, 0.94);
+  color: #374151;
+  font-size: 11px;
+  font-weight: 500;
+  text-align: center;
+  padding: 3px 6px;
+  border-top: 1px solid rgba(229, 231, 235, 0.8);
+  backdrop-filter: blur(2px);
+  z-index: 2;
+  pointer-events: none;
+}
 .active-tag { background: rgba(39,174,96,0.9) !important; }
 .new-tag { background: rgba(79,110,247,0.9) !important; }
 .dropped-tag { background: rgba(231,76,60,0.9) !important; }
@@ -283,7 +344,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .growth-down { font-size: 10px; color: var(--danger); font-weight: 600; margin-left: 3px; }
 
 /* Card Body */
-.item-body { padding: 10px 12px; }
+.item-body {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
 .item-title {
   font-size: 13px;
   font-weight: 600;
@@ -292,9 +358,133 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  line-height: 1.4;
+  line-height: 1.35;
+  margin-bottom: 4px;
+}
+.item-author-row {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-bottom: 4px;
+  line-height: 1.3;
+}
+.item-rating-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+  font-size: 11.5px;
+}
+.item-rating-row .stars {
+  color: #111827;
+  letter-spacing: 1px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.item-rating-row .review-count {
+  color: #6b7280;
+  font-size: 11px;
+}
+.item-price-row {
+  margin-top: 2px;
   margin-bottom: 6px;
 }
+.item-card .item-price {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111827;
+  margin-top: 0;
+}
+.item-card .item-price .original {
+  font-size: 12px;
+  color: #6b7280;
+  text-decoration: line-through;
+  font-weight: 400;
+  margin-left: 5px;
+}
+.item-card .item-price .discount {
+  font-size: 11px;
+  color: #15803d;
+  font-weight: 500;
+  margin-left: 4px;
+}
+.badge-shipping {
+  display: inline-block;
+  background: #dcfce7;
+  color: #15803d;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  letter-spacing: 0.2px;
+}
+.badge-bestseller {
+  display: inline-block;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  letter-spacing: 0.2px;
+}
+
+/* 5-row Metrics Box */
+.item-metrics-box {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-top: auto;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  border-bottom: 1px solid #f1f5f9;
+  font-size: 12px;
+}
+.metric-row:last-child {
+  border-bottom: none;
+}
+.metric-label {
+  color: #111827;
+  font-weight: 500;
+  font-size: 12px;
+}
+.metric-val {
+  font-weight: 700;
+  font-size: 12px;
+  text-align: right;
+}
+.metric-val.val-red {
+  color: #dc2626;
+}
+.metric-val.val-blue {
+  color: #2563eb;
+}
+.metric-val.val-teal {
+  color: #0d9488;
+}
+.metric-val.val-orange {
+  color: #ea580c;
+}
+
+/* Movement indicator, now inline in a form row instead of on its own horizontal
+   line. Kept lighter than the value so the number stays the thing you read. */
+.metric-change {
+  font-size: 10.5px;
+  font-weight: 600;
+  margin-left: 5px;
+  white-space: nowrap;
+}
+.metric-row .metric-val {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0;
+}
+
 .item-source {
   font-size: 11px;
   color: var(--text-3);
@@ -341,15 +531,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .engagement-stat.commented .eng-val { color: var(--warning); }
 .engagement-stat.shared .eng-val { color: var(--success); }
 
-/* ===== Platform Colors ===== */
-.tag-facebook { background: rgba(69,153,255,0.9); color: white; }
-.tag-tiktok { background: rgba(255,77,138,0.9); color: white; }
-.tag-pinterest { background: rgba(255,107,107,0.9); color: white; }
-.tag-etsy { background: rgba(241,100,30,0.9); color: white; }
-.tag-amazon { background: rgba(255,153,0,0.9); color: white; }
-.tag-reddit { background: rgba(255,107,61,0.9); color: white; }
-.tag-google_shopping { background: rgba(107,163,247,0.9); color: white; }
-.tag-shopify { background: rgba(150,191,72,0.9); color: white; }
+/* ===== Platform Colors =====
+   The hardcoded `.tag-<platform>` table that used to live here is GONE. It was
+   a second copy of the brand colours already declared per channel in
+   src/channels/*.channel.js, and it had drifted: it covered 8 names, two of
+   which (`tag-facebook`, `tag-tiktok`) match no current platform, while eBay,
+   TikTok Shop, TikTok Videos, Twitter/X, Instagram and both Facebook channels
+   had no rule at all and rendered an untinted badge.
+
+   There is now exactly ONE source: registry color -> /api/platforms ->
+   platformColor() in app.js, which tints both the item card's .platform-tag
+   and the matching filter pill (--pill-color below). */
 
 /* ===== Collect Modal ===== */
 .platform-grid { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -410,3 +602,33 @@ body.modal-open #__everbee_ai_bee {
 .comment-pin { font-size: 10px; }
 .comment-text { font-size: 12px; color: var(--text-1); margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
 .engagement-stat.saved .eng-val { color: #7c3aed; }
+
+/* Server-side pager under the item grid. Empty means one page fits, so the
+   controls disappear entirely rather than sitting there disabled. */
+.items-pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 14px 0 4px; }
+.items-pager:empty { display: none; }
+.pager-btn { border: 1px solid var(--border); background: white; color: var(--text-1); border-radius: 8px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+.pager-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.pager-btn:disabled { opacity: 0.4; cursor: default; }
+.pager-info { font-size: 12px; color: var(--text-2); }
+
+/* Jump-to-page box. With four-digit page counts the prev/next buttons alone
+   are not navigation, so the pager carries a direct entry too. */
+.pager-jump { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); }
+.pager-jump-input { width: 72px; border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12px; text-align: center; }
+.pager-jump-input:focus { outline: none; border-color: var(--primary); }
+.pager-jump-max { color: var(--text-3); }
+
+/* TASK-2 multi-keyword crawl. The plan box states what "Crawl Now" is about to
+   do (how many tasks, per-keyword budget, what was dropped) BEFORE it is
+   pressed, so a refused or trimmed input is never silent. */
+.keyword-plan { font-size: 11.5px; line-height: 1.5; margin-top: 6px; }
+.keyword-plan:empty { display: none; }
+.keyword-plan-info { background: #eef4ff; border: 1px solid #ccdcff; border-radius: 8px; padding: 7px 10px; color: var(--text-1); }
+.keyword-plan-error { background: #fdecec; border: 1px solid #f5bcbc; border-radius: 8px; padding: 7px 10px; color: #a12424; font-weight: 600; }
+.keyword-plan-warn { display: block; color: #8a5a00; }
+.keyword-plan-list { margin: 5px 0 0; padding-left: 20px; color: var(--text-2); }
+.keyword-plan-list li { margin: 1px 0; }
+
+/* Job History: marks a child task row with the parent run it belongs to. */
+.job-child-marker { color: var(--text-3); font-size: 11px; font-weight: 600; white-space: nowrap; }

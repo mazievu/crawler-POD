@@ -33,7 +33,7 @@ async function handler(args = {}, db) {
     };
   }
 
-  const result = db.getItemByUid(item_uid.trim());
+  const result = await db.getItemByUid(item_uid.trim());
 
   if (!result || result.isDropped || !result.row) {
     return {

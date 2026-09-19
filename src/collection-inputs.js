@@ -1,9 +1,15 @@
-const { parseConditions, parseMetricSelection } = require('./filters/metric-conditions');
+const { parseConditions, parseMetricSelection, parseMetricNumber } = require('./filters/metric-conditions');
 
 const DEFAULT_QUERY_FIELD = {
   id: 'query', label: 'Search query', type: 'text', required: true, placeholder: 'Enter keyword...',
 };
 const MAX_COLLECTION_ITEMS = 10000;
+// Multi-keyword fan-out: how many independent keyword Tasks one submitted Run
+// may be split into. This is an INPUT bound (same role MAX_COLLECTION_ITEMS
+// plays for maxItems), not a concurrency limit — how many of these Tasks run at
+// the same time is still decided exclusively by WorkerPoolManager capacities +
+// ResourceMonitor RAM admission, which this feature does not touch.
+const MAX_CRAWL_KEYWORDS = 50;
 
 const schemas = {
   amazon: { fields: [] },
@@ -54,6 +60,43 @@ function isLocalCdpUrl(value) {
   }
 }
 
+/**
+ * Multi-keyword input parsing — ONE KEYWORD PER LINE.
+ *
+ * Newline, not comma: a single real keyword very often contains a comma
+ * ("press on nails, short square"), so comma-splitting would silently corrupt
+ * queries that work today. A line break never appears inside a keyword typed
+ * into a one-line box, which makes this a strictly additive interpretation of
+ * the existing `query` contract.
+ *
+ * Returns { keywords, duplicates } and THROWS on input that cannot be honoured
+ * (all-blank, or more lines than MAX_CRAWL_KEYWORDS) — §"no silent buttons":
+ * a rejected input must be named, never quietly dropped.
+ */
+function parseKeywordList(raw) {
+  const lines = Array.isArray(raw)
+    ? raw.map((entry) => String(entry ?? ''))
+    : String(raw ?? '').split(/\r?\n/);
+
+  const keywords = [];
+  const duplicates = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const keyword = line.trim();
+    if (keyword === '') continue; // Blank lines are formatting, not input.
+    const dedupeKey = keyword.toLowerCase();
+    if (seen.has(dedupeKey)) { duplicates.push(keyword); continue; }
+    seen.add(dedupeKey);
+    keywords.push(keyword);
+  }
+
+  if (keywords.length === 0) throw new Error('Enter at least one keyword (one per line).');
+  if (keywords.length > MAX_CRAWL_KEYWORDS) {
+    throw new Error(`Too many keywords: ${keywords.length}. The maximum per crawl is ${MAX_CRAWL_KEYWORDS} (one keyword per line).`);
+  }
+  return { keywords, duplicates };
+}
+
 function buildCollectionOptions(platform, values = {}) {
   const options = {
     maxItems: Math.min(MAX_COLLECTION_ITEMS, Math.max(1, Number.parseInt(values.maxItems, 10) || 20)),
@@ -101,7 +144,79 @@ function buildCollectionOptions(platform, values = {}) {
     if (selected.length > 0) options.metrics = selected;
   }
 
+  /*
+   * MINIMUM VALUE for the ticked crawl metrics.
+   *
+   * WHITELISTED HERE DELIBERATELY, and for the same reason `keywords` and
+   * `metrics` are: this function copies only what it names, so an option it
+   * does not name is dropped without a word — which is exactly how an earlier
+   * feature's `options.metrics` disappeared and let a run report success with
+   * the filter never applied.
+   *
+   * SEMANTICS — one number, every ticked metric, AND, `>=`:
+   *   metrics = ['likes','views'], metricMin = 1000
+   *     -> conditions = [likes >= 1000, views >= 1000]
+   *   and an item is kept only if it satisfies BOTH, which is the AND the panel
+   *   already advertises ("Tích nhiều ô = sản phẩm phải đạt tất cả").
+   *   No metricMin  -> no conditions added, and a tick keeps its existing
+   *   meaning exactly: the item must REPORT the metric, highest first.
+   *
+   * WHY IT BECOMES `conditions` RATHER THAN A NEW PIPELINE INPUT: the crawl
+   * pipeline already evaluates `options.conditions` after normalization and
+   * before persistence (runs.service.js -> applyConditions), with AND across
+   * entries and "metric not reported" counting as a REJECT. A threshold is
+   * precisely a condition, so expressing it as one means no new evaluation path
+   * — and no second place where "minimum" could come to mean something else.
+   * Expanding it HERE rather than in the browser also means the pairing of
+   * threshold-to-metrics cannot be got wrong by a client.
+   *
+   * `metricMin` itself is kept on the options so the run row records the number
+   * the user typed, not only the conditions it became.
+   */
+  if (values.metricMin !== undefined && values.metricMin !== null && String(values.metricMin).trim() !== '') {
+    const min = parseMetricNumber(values.metricMin);
+    if (min === null) throw new Error(`Minimum metric value must be a number (got ${JSON.stringify(values.metricMin)}).`);
+    if (min < 0) throw new Error(`Minimum metric value must not be negative (got ${min}).`);
+
+    const targets = options.metrics || [];
+    // A threshold with nothing to apply to is refused, never ignored: silently
+    // dropping it would run the crawl WITHOUT the limit the user asked for and
+    // still report success.
+    if (targets.length === 0) {
+      throw new Error('A minimum metric value needs at least one selected metric to apply to. Tick the metric(s) it applies to, or clear the minimum.');
+    }
+    const explicit = new Set((options.conditions || []).map((c) => c.field));
+    const clash = targets.filter((field) => explicit.has(field));
+    if (clash.length > 0) {
+      throw new Error(`Minimum metric value conflicts with an explicit condition on: ${clash.join(', ')}. Use one or the other.`);
+    }
+
+    options.metricMin = min;
+    options.conditions = (options.conditions || []).concat(
+      targets.map((field) => ({ field, operator: 'gte', value: min })),
+    );
+  }
+
+  // Multi-keyword fan-out. Whitelisted HERE deliberately: this function drops
+  // anything it does not explicitly copy, and a previous feature already lost
+  // `options.metrics` exactly that way (the run reported success with the
+  // filter never applied). `keywords` must survive to the Scheduler, which is
+  // the layer that turns it into one child Run per keyword.
+  //
+  // Not a per-platform input field: keyword fan-out is a property of the shared
+  // crawl contract, not of any one channel's schema, so gating it on
+  // getPlatformInputFields() would silently disable it for every platform.
+  //
+  // Only set for 2+ keywords. With exactly one keyword the emitted options are
+  // byte-identical to what this function produced before this change, so the
+  // single-keyword path keeps its EXACT existing behaviour (no parent run, no
+  // child run, no fan-out).
+  if (values.keywords !== undefined) {
+    const { keywords } = parseKeywordList(values.keywords);
+    if (keywords.length > 1) options.keywords = keywords;
+  }
+
   return options;
 }
 
-module.exports = { MAX_COLLECTION_ITEMS, getPlatformQueryField, getPlatformInputFields, buildCollectionOptions, isLocalCdpUrl };
+module.exports = { MAX_COLLECTION_ITEMS, MAX_CRAWL_KEYWORDS, getPlatformQueryField, getPlatformInputFields, buildCollectionOptions, isLocalCdpUrl, parseKeywordList };

@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '🛍️',
   color: '#6ba3f7',
+  domain: 'google.com',
 
   intelligenceTypes: ["product_listing"],
 

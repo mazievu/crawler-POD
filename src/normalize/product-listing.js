@@ -53,7 +53,15 @@ module.exports = function normalizeProductListing(raw, context = { platform: 'pr
   // real_price/original_price with "*". avg_price is the single number that
   // represents the listing; min_price is the fallback when it is absent.
   const price = parseNum(raw.price || raw.product_price || raw.priceNumeric || raw.currentPrice || raw.salePrice || raw.avg_price || raw.min_price || raw.minPrice || raw.formatPrice || 0);
-  const likes = parseCount(raw.likes || raw.likeCount || raw.like_count || raw.diggCount || raw.favorites || reviews || 0);
+  /*
+   * No `|| reviews` fallback. It used to be the last term here, so every TikTok
+   * Shop listing was stored with current_likes EXACTLY equal to current_reviews
+   * (20670/20670, 2890/2890, 2550/2550, 3440/3440 on run #914) and the card
+   * showed a "Likes" figure that was really the review count. A marketplace
+   * that publishes no like count should report none — borrowing a neighbouring
+   * metric's number invents data the source never stated.
+   */
+  const likes = parseCount(raw.likes || raw.likeCount || raw.like_count || raw.diggCount || raw.favorites || 0);
 
   return {
     uid: `${context.platform}:${raw.itemId || raw.listingId || raw.productId || raw.product_id || raw.asin || raw.id || url || title}`,

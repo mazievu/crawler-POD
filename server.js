@@ -13,12 +13,17 @@ const { getDefaultFilters, getFiltersForUI, POSTS_CARD_SCHEMA, ADS_CARD_SCHEMA }
 const { runDoctor } = require('./src/doctor');
 const { executeRun, router } = require('./src/runs.service');
 const { getPlatformQueryField, buildCollectionOptions } = require('./src/collection-inputs');
+// Label used for a multi-keyword parent run's `query` column (display only —
+// the parent never executes; one child run per keyword does the crawling).
+const KEYWORD_DISPLAY_SEPARATOR = ' | ';
 const { createMarketplaceLoginManager } = require('./src/marketplaces/login-manager');
 const { createCaptureJobQueue } = require('./src/marketplaces/capture-jobs');
 const { createMarketplaceCaptureScheduler } = require('./src/marketplaces/capture-scheduler');
 const { discoverMarketplaceListingsViaEverbeeHost } = require('./src/marketplaces/everbee-host-client');
 const { getScheduler } = require('./src/scheduler/scheduler');
 const { getSocialScheduler, createSocialBotsRouter } = require('./src/social-bots');
+// Lets an MCP process read the database without opening PGLITE_DIR a second time.
+const { createMcpBridgeRouter } = require('./src/routes/mcp-bridge');
 const { getStuckDetector } = require('./src/reliability/stuck-detector');
 const { recoverOrphanedRuns } = require('./src/reliability/restart-recovery');
 const { runManaged } = require('./src/reliability/managed-execution');
@@ -205,6 +210,7 @@ app.use((req, res, next) => {
 });
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0 }));
 app.use(createSocialBotsRouter({ socialScheduler }));
+app.use(createMcpBridgeRouter({ database: db }));
 
 // ==================== Routes ====================
 
@@ -571,17 +577,56 @@ app.get('/api/html-capture-jobs/:id', (req, res) => {
 });
 
 /** Submits a marketplace capture through the shared Resource Scheduler (BROWSER pool) instead of launching a browser directly. */
+/*
+ * WHAT IS PROVEN: this used to `return snapshotObj.result` unguarded. When a
+ * run reaches 'done' carrying no `result`, that returns `undefined`, the route
+ * below does `res.json(undefined)`, and Express answers 201 with a ZERO-LENGTH
+ * BODY. The caller's `response.json()` then throws "Unexpected end of JSON
+ * input" — an error that says nothing about whether the capture worked. That is
+ * the exact stack CI reported for `capture API returns a successful saved
+ * capture instead of starting a browser again` (test/marketplace-api.test.js:131).
+ * Its sibling submitMarketplaceDiscoveryViaScheduler() already guards the
+ * identical spot with `|| { items: [] }`; only this one did not.
+ *
+ * WHAT IS NOT PROVEN: why a 'done' run can carry no result. The obvious
+ * candidate — status and result being two separate writes — was checked and
+ * RULED OUT: managed-execution.js writes both in a single updateRun call. The
+ * flake is real (commit a3fb325 failed one CI run and passed the next on
+ * identical code, and main has been red on this same test since 2026-09-11) but
+ * its cause is still UNCONFIRMED. The bounded re-read below is therefore
+ * defensive, not a claimed fix: it costs at most one second and covers a
+ * late-visible write from a writer other than the one we waited on.
+ *
+ * What this DOES settle is the failure mode: never an empty body. Either a
+ * result, or a named error.
+ */
+const CAPTURE_RESULT_SETTLE_ATTEMPTS = 10;
+const CAPTURE_RESULT_SETTLE_MS = 100;
+
 async function submitMarketplaceCaptureViaScheduler(payload) {
   const run = await db.createRun({ platform: payload.platform || 'marketplace', query: payload.url || 'capture', maxItems: 1, options: { jobKind: 'marketplace_capture', ...payload } });
   await scheduler.submitRun(run);
-  const finished = await scheduler.waitForCompletion(run.id, { pollMs: 150, timeoutMs: 180000 });
-  const snapshotObj = JSON.parse(finished.health_snapshot || '{}');
+  let finished = await scheduler.waitForCompletion(run.id, { pollMs: 150, timeoutMs: 180000 });
+
   if (finished.status !== 'done') {
     const err = new Error(finished.error_message || 'Capture failed');
     err.status = 400;
     throw err;
   }
-  return snapshotObj.result;
+
+  let result = JSON.parse(finished.health_snapshot || '{}').result;
+  for (let attempt = 0; result === undefined && attempt < CAPTURE_RESULT_SETTLE_ATTEMPTS; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, CAPTURE_RESULT_SETTLE_MS));
+    finished = await db.getRunById(run.id);
+    result = JSON.parse((finished && finished.health_snapshot) || '{}').result;
+  }
+
+  if (result === undefined) {
+    const err = new Error(`Capture run ${run.id} finished without a result payload`);
+    err.status = 500;
+    throw err;
+  }
+  return result;
 }
 
 app.post('/api/html-captures', async (req, res) => {
@@ -634,7 +679,28 @@ app.get('/api/doctor', async (req, res) => {
 
 // Runs
 app.get('/api/runs', async (req, res) => {
-  try { res.json(await db.getAllRuns(100)); }
+  try {
+    // Job History filters (status/platform/limit) — whitelisted, bound
+    // parameters only; no string concatenation into SQL (actual query lives
+    // in src/database.js's getRunsFiltered()). `status` values mirror the
+    // literal values runs.status actually takes (pg-schema.sql), including
+    // 'stuck' (src/reliability/stuck-detector.js writes this when recovery
+    // is exhausted; public/app.js's loadJobs() already renders it as the
+    // "Stuck" badge — not a new status). `platform` is checked against the
+    // channel registry — the same getPlatform() check the POST /api/runs
+    // handler below already applies to a submitted platform.
+    const ALLOWED_RUN_STATUS_FILTERS = new Set(['running', 'done', 'failed', 'stuck']);
+    const rawStatus = typeof req.query.status === 'string' ? req.query.status.trim().toLowerCase() : '';
+    const status = ALLOWED_RUN_STATUS_FILTERS.has(rawStatus) ? rawStatus : undefined;
+
+    const rawPlatform = typeof req.query.platform === 'string' ? req.query.platform.trim() : '';
+    const platform = rawPlatform && require('./src/platform-config').getPlatform(rawPlatform) ? rawPlatform : undefined;
+
+    const parsedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 1000) : 100;
+
+    res.json(await db.getRunsFiltered({ status, platform, limit }));
+  }
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -646,6 +712,11 @@ app.get('/api/runs/:id', async (req, res) => {
     // depending on READ_MODEL_V2 — this route never depends on legacy rows
     // existing for a post-cutover Run.
     run.snapshots = await db.getRunItems(run.id);
+    // TASK-2: a multi-keyword parent (and a size-shard parent) stores nothing
+    // itself — every item belongs to one of its children. Attached only when
+    // children actually exist, so an ordinary run's response shape is unchanged.
+    const children = await db.getChildRuns(run.id);
+    if (children.length > 0) run.children = children;
     res.json(run);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -676,7 +747,16 @@ app.post('/api/runs', async (req, res) => {
 
     const maxItems = normalizedOptions.maxItems;
     const country = normalizedOptions.country || null;
-    const run = await db.createRun({ platform, query, maxItems, country, options: normalizedOptions });
+    // TASK-2 multi-keyword: buildCollectionOptions() only sets `keywords` for 2+
+    // keywords, so a single-keyword submission keeps its exact previous shape.
+    // For a fan-out submission the parent run never executes (the Scheduler
+    // parks it as 'sharded' and runs one child per keyword), so its `query`
+    // column is a display label — make it show every keyword rather than
+    // whichever one the client happened to put in `query`.
+    const parentQuery = Array.isArray(normalizedOptions.keywords)
+      ? normalizedOptions.keywords.join(KEYWORD_DISPLAY_SEPARATOR)
+      : query;
+    const run = await db.createRun({ platform, query: parentQuery, maxItems, country, options: normalizedOptions });
 
     // Submit to Resource-Aware Scheduler with queue admission control
     scheduler.submitRun(run).catch(console.error);
@@ -879,11 +959,18 @@ async function getRunRichMetaMap(runId) {
   }
 }
 
-async function mapProductCurrentToItemShape(p) {
+/**
+ * @param {object} p               a product_current row
+ * @param {Map=}   preloadedRunMeta runId -> meta map, resolved once per request
+ *   by the caller. Without it this falls back to a per-item lookup, which is
+ *   correct but is what made a large page slow.
+ */
+async function mapProductCurrentToItemShape(p, preloadedRunMeta = null) {
   let richMeta = {};
   try {
     if (p.last_run_id) {
-      const runMetaMap = await getRunRichMetaMap(p.last_run_id);
+      const runMetaMap = preloadedRunMeta?.get(Number(p.last_run_id))
+        ?? await getRunRichMetaMap(p.last_run_id);
       if (runMetaMap && runMetaMap.has(p.item_uid)) {
         const match = runMetaMap.get(p.item_uid);
         richMeta = {
@@ -930,6 +1017,12 @@ async function mapProductCurrentToItemShape(p) {
     views: p.current_views,
     status: p.status,
     created_at: p.last_crawled_at,
+    first_seen_at: p.first_seen_at,
+    last_seen_at: p.last_seen_at,
+    last_crawled_at: p.last_crawled_at,
+    delta_24h_views: p.delta_24h_views,
+    delta_24h_likes: p.delta_24h_likes,
+    delta_24h_sold: p.delta_24h_sold,
     ...richMeta,
     growth: {
       likes: p.delta_likes || 0,
@@ -979,6 +1072,43 @@ app.get('/api/item-metrics', (req, res) => {
   });
 });
 
+/*
+ * Non-metric sort keys for /api/items.
+ *
+ * buildSqlOrder (src/filters/metric-conditions.js) only knows the METRIC
+ * columns — likes, price, rating and so on. "Most Recent" is not a metric, it
+ * is a time column, so it is resolved here instead.
+ *
+ * WHICH time column, and why: product_current has NO `created_at` column. Its
+ * time columns are first_seen_at / last_seen_at / last_crawled_at, and
+ * `last_crawled_at` is the one this endpoint already publishes to the UI under
+ * the name `created_at` (mapProductCurrentToItemShape), the one the detail view
+ * labels "Lần cào mới nhất", the one the CSV export writes, and the one the
+ * default ranking already uses as its tie-breaker. It is also the only one with
+ * an index for this query — idx_product_current_last_crawled and
+ * idx_product_current_platform_crawled. Ordering the grid by any other column
+ * would order it by a value the user is never shown.
+ */
+/*
+ * The two orderings that mean something for EVERY platform, and therefore the
+ * only two the ALL selection offers. Each carries its own default direction:
+ * "oldest" is not a direction applied to "recent", it is its own request, and
+ * making the caller remember to also send dir=asc is how an ordering silently
+ * comes back newest-first. An explicit `dir` still wins when one is supplied.
+ */
+const TIME_SORT_COLUMNS = {
+  recent: { column: 'last_crawled_at', direction: 'DESC' },
+  oldest: { column: 'last_crawled_at', direction: 'ASC' },
+};
+
+function buildTimeSqlOrder(sortField, sortDirection) {
+  const spec = TIME_SORT_COLUMNS[String(sortField || '').trim().toLowerCase()];
+  if (!spec) return null;
+  const requested = String(sortDirection || '').trim().toLowerCase();
+  const direction = requested === 'asc' ? 'ASC' : requested === 'desc' ? 'DESC' : spec.direction;
+  return `${spec.column} ${direction} NULLS LAST`;
+}
+
 app.get('/api/items', async (req, res) => {
   try {
     if (READ_MODEL_V2) {
@@ -988,11 +1118,26 @@ app.get('/api/items', async (req, res) => {
       //
       //   ?conditions=[{"field":"likes","operator":">=","value":1000},
       //                {"field":"shares","operator":">=","value":100}]
-      //   ?sort=likes&dir=desc
+      //   ?sort=likes&dir=desc     (metric column)
+      //   ?sort=recent&dir=desc    (time column — see TIME_SORT_COLUMNS)
       //
       // Multiple conditions are ANDed by metric-conditions.evaluate/buildSql.
       let { conditions, invalid } = parseItemConditions(req.query);
-      let orderBy = buildSqlOrder(req.query.sort, req.query.dir);
+      const rawSort = String(req.query.sort ?? '').trim();
+      let orderBy = buildSqlOrder(req.query.sort, req.query.dir)
+        || buildTimeSqlOrder(req.query.sort, req.query.dir);
+
+      // An unrecognised `sort` used to fall through to the default ranking
+      // without a word, so the caller got rows in an order it never asked for
+      // and had no way to tell. Say so instead.
+      if (rawSort && !orderBy) {
+        const { METRICS } = require('./src/filters/metric-conditions');
+        return res.status(400).json({
+          error: 'Unknown sort field',
+          invalid: [rawSort],
+          hint: `sort must be one of: ${[...Object.keys(METRICS), ...Object.keys(TIME_SORT_COLUMNS)].join(', ')}`,
+        });
+      }
 
       // Ticked-metric filter (?metrics=likes,comments&dir=desc). Ticking a
       // metric means "only items that report it, ranked by it" — there is no
@@ -1022,18 +1167,44 @@ app.get('/api/items', async (req, res) => {
         });
       }
 
-      const current = await db.getProductCurrent({
+      // Paging is server-side so a tab holding tens of thousands of rows costs
+      // one page, not the whole table. `limit` is capped: an unbounded limit
+      // from the query string would defeat the point.
+      const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+      const offset = Math.max(Number(req.query.offset) || 0, 0);
+      const filter = {
         platform: req.query.platform || null,
         search: req.query.search || null,
-        limit: req.query.limit ? Number(req.query.limit) : 100,
         conditions,
-        orderBy,
-      });
-      // Pre-warm the run items cache for all unique runIds in parallel
-      const uniqueRunIds = [...new Set(current.map((p) => p.last_run_id).filter(Boolean))];
-      await Promise.all(uniqueRunIds.map((runId) => getRunRichMetaMap(runId)));
+      };
 
-      return res.json(await Promise.all(current.map(mapProductCurrentToItemShape)));
+      const [current, total] = await Promise.all([
+        db.getProductCurrent({ ...filter, limit, offset, orderBy }),
+        db.countProductCurrent(filter),
+      ]);
+
+      /*
+       * Run metadata for exactly the runs on THIS page, resolved once and
+       * handed to the mapper.
+       *
+       * The previous code pre-warmed a module-level LRU that holds 20 runs and
+       * then let each item look itself up. One page of 100 items can easily
+       * span more than 20 runs, at which point the warm-up evicts its own
+       * entries and every later item re-reads the run row and re-parses its
+       * whole result_items_json — the cost grew with the number of distinct
+       * runs, which is exactly what grows as the database fills up.
+       */
+      const uniqueRunIds = [...new Set(current.map((p) => p.last_run_id).filter(Boolean))];
+      const runMeta = new Map();
+      await Promise.all(uniqueRunIds.map(async (runId) => {
+        runMeta.set(Number(runId), await getRunRichMetaMap(runId));
+      }));
+
+      // Total rides on a header so the body stays a plain array — every
+      // existing caller of this endpoint keeps working unchanged.
+      res.set('X-Total-Count', String(total));
+      res.set('Access-Control-Expose-Headers', 'X-Total-Count');
+      return res.json(await Promise.all(current.map((p) => mapProductCurrentToItemShape(p, runMeta))));
     }
 
     const snapshots = await db.getLatestSnapshots({
@@ -1148,9 +1319,15 @@ app.get('/api/database/parity', async (req, res) => {
 // Stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const stats = await db.getStats();
-    const runStats = await db.getRunStats();
-    res.json({ ...stats, platforms: runStats });
+    const [stats, runStats, tabCounts] = await Promise.all([
+      db.getStats(),
+      db.getRunStats(),
+      // Counted the same way /api/items lists, so a tab's counter and its
+      // contents agree. `platformCounts` above keeps its old meaning (live
+      // items only) for existing consumers.
+      db.countProductCurrentByPlatform(),
+    ]);
+    res.json({ ...stats, platforms: runStats, tabCounts });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

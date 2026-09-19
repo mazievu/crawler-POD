@@ -7,6 +7,7 @@ const doctorModule = require('./doctor');
 const { getOrCreateTracker, removeTracker, STAGES } = require('./reliability/heartbeat');
 const { defaultRetryPolicy } = require('./reliability/retry-policy');
 const { isCurrentOwner } = require('./reliability/execution-lease');
+const { persistEphemeralImages } = require('./media-cache');
 const { registerExecution, markExecutionSettled, unregisterExecution } = require('./reliability/execution-control');
 
 const router = new BackendRouter({ registry, doctor: doctorModule });
@@ -117,10 +118,25 @@ async function executeRun(runId, platform, query, options = {}) {
     tracker.setStage(STAGES.NORMALIZING);
     const normalizerName = channel.normalizer;
     const normalizedItems = normalizeItems(normalizerName, result.items || [], { platform, query });
-    // Image-only collection is intentional: every stored post/listing must
-    // have a visual asset that can be shown in the product intelligence UI.
-    const itemsWithImages = normalizedItems.filter((item) => item.image);
-    const skippedWithoutImages = normalizedItems.length - itemsWithImages.length;
+    // Posts WITHOUT a cover image are kept, not discarded. Collection used to
+    // be image-only, which meant a reddit or X crawl - both mostly text posts -
+    // threw away nearly everything it fetched and reported a successful run
+    // that stored almost nothing, with the reason only ever visible in the
+    // server log. The UI marks an imageless item instead of hiding it.
+    /*
+     * Some providers hand back a link to their own image proxy rather than the
+     * platform's CDN, and those links expire — pratikdani's TikTok Shop images
+     * answered 200 on 2026-09-15 and 403 three days later, blanking every
+     * stored product. Fetch those bytes now, while the link is still alive, and
+     * store a local path instead. Durable hosts are untouched.
+     */
+    const mediaSummary = await persistEphemeralImages(normalizedItems);
+    if (mediaSummary.considered > 0) {
+      console.log(`Run ${runId}: media cache — ${mediaSummary.cached} downloaded, ${mediaSummary.reused} reused, ${mediaSummary.failed} failed of ${mediaSummary.considered} expiring image(s)`);
+    }
+
+    const collectedItems = normalizedItems;
+    const itemsWithoutImage = normalizedItems.filter((item) => !item.image).length;
 
     // Task 3: metric conditions are evaluated HERE — after normalization, so
     // each provider's formatting ("160.23K") is already a number, and before
@@ -146,18 +162,18 @@ async function executeRun(runId, platform, query, options = {}) {
     }
     // Thresholds first (if any), then the ticked metrics decide presence and
     // order. Both are AND: an item has to survive each stage.
-    const afterConditions = applyConditions(itemsWithImages, metricConditions);
+    const afterConditions = applyConditions(collectedItems, metricConditions);
     const afterSelection = applySelection(afterConditions.kept, selectedMetrics);
     const keptItems = afterSelection.kept;
     const rejectedItems = afterConditions.rejected.concat(afterSelection.rejected);
 
     if (selectedMetrics.length > 0) {
-      console.log(`Run ${runId}: crawl filter [highest ${selectedMetrics.join(' + ')}] -> fetched ${itemsWithImages.length}, kept ${keptItems.length}, rejected ${rejectedItems.length}`);
+      console.log(`Run ${runId}: crawl filter [highest ${selectedMetrics.join(' + ')}] -> fetched ${collectedItems.length}, kept ${keptItems.length}, rejected ${rejectedItems.length}`);
     }
 
     if (metricConditions.length > 0) {
       const summary = metricConditions.map((c) => `${c.field} ${OPERATOR_SQL[c.operator]} ${c.value}`).join(' AND ');
-      console.log(`Run ${runId}: crawl filter [${summary}] -> fetched ${itemsWithImages.length}, kept ${keptItems.length}, rejected ${rejectedItems.length}`);
+      console.log(`Run ${runId}: crawl filter [${summary}] -> fetched ${collectedItems.length}, kept ${keptItems.length}, rejected ${rejectedItems.length}`);
       for (const rejection of rejectedItems) {
         console.log(`Run ${runId}:   REJECT ${rejection.item.url || rejection.item.uid} — ${rejection.reasons.join('; ')}`);
       }
@@ -179,11 +195,22 @@ async function executeRun(runId, platform, query, options = {}) {
     tracker.setStage(STAGES.COMPLETED);
     // The filter outcome is persisted alongside the run so "why did this run
     // store 2 of 5 items" is answerable later from the DB, not only from logs.
+    // Every run now records WHY its item count is what it is. This used to be
+    // written only when a metric filter was set, so a run that stored 0 items
+    // because every post was text-only looked identical to a run that found
+    // nothing at all - the reason lived solely in the server log, where the
+    // person reading the UI never sees it.
+    const collectionSummary = {
+      normalized: normalizedItems.length,
+      noImage: itemsWithoutImage,
+      rejectedByFilter: rejectedItems.length,
+      stored: keptItems.length,
+    };
     const crawlFilter = (metricConditions.length > 0 || selectedMetrics.length > 0)
       ? {
           conditions: metricConditions,
           metrics: selectedMetrics,
-          fetched: itemsWithImages.length,
+          fetched: collectedItems.length,
           kept: keptItems.length,
           rejected: rejectedItems.length,
           rejectedReasons: rejectedItems.map((r) => ({ url: r.item.url || r.item.uid, reasons: r.reasons, values: r.values })),
@@ -198,10 +225,10 @@ async function executeRun(runId, platform, query, options = {}) {
       // isCurrentOwner() fall through to "nothing has claimed a lease" for
       // every later stale-write check. Only the two non-serializable members
       // are removed (an AbortSignal stringifies to {}, a callback vanishes).
-      ...(crawlFilter ? { inputOptions: JSON.stringify({ ...serializableOptions(options), crawlFilter }) } : {}),
+      inputOptions: JSON.stringify({ ...serializableOptions(options), collectionSummary, ...(crawlFilter ? { crawlFilter } : {}) }),
     });
 
-    console.log(`Run ${runId} completed via ${result.activeBackend}: ${keptItems.length} items stored (${skippedWithoutImages} skipped for no image, ${rejectedItems.length} rejected by filter, ${dbCounts.newItems} new)`);
+    console.log(`Run ${runId} completed via ${result.activeBackend}: ${keptItems.length} items stored (${itemsWithoutImage} without image (kept), ${rejectedItems.length} rejected by filter, ${dbCounts.newItems} new)`);
     removeTracker(executionToken);
     return { success: true, runId, dbCounts, crawlFilter };
   } catch (err) {

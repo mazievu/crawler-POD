@@ -16,7 +16,7 @@ const { ResourceMonitor } = require('./resource-monitor');
 const { WorkerPoolManager } = require('./worker-pool');
 const { RunQueue } = require('./run-queue');
 const { ExecutionPlanner } = require('./execution-planner');
-const { needsSharding, planShards, aggregateShardResults, allShardsTerminal } = require('./job-sharder');
+const { needsSharding, planShards, needsKeywordFanOut, planKeywordTasks, aggregateShardResults, allShardsTerminal } = require('./job-sharder');
 const { issueExecutionToken } = require('../reliability/execution-lease');
 const { classifyFailureReason, NO_RETRY_REASON_CODES } = require('../reliability/failure-reason');
 const { waitForSettled } = require('../reliability/execution-control');
@@ -165,6 +165,63 @@ class ResourceScheduler {
     }
   }
 
+  /**
+   * TASK-2 multi-keyword fan-out: splits a run carrying N keywords into N child
+   * runs (one keyword each) and parks the parent as 'sharded'. Returns true if
+   * fan-out happened.
+   *
+   * This reuses the EXISTING parent/child machinery end to end and adds no new
+   * concurrency mechanism of its own:
+   *   - children are ordinary queued runs, so each one is planned, pool-admitted
+   *     and RAM-reserved by tick() exactly like any single-keyword run;
+   *   - per-execution-class worker limits (WorkerPoolManager.capacities) and RAM
+   *     reservation (ResourceMonitor.canAdmit/reserve) are untouched — N keywords
+   *     do NOT get N guaranteed workers, they queue for the same slots;
+   *   - reconcileShardedParents() already aggregates any 'sharded' parent's
+   *     children, so completion/rollup needs no new code path.
+   *
+   * ORDERING vs size sharding (deliberate, see also planKeywordTasks()):
+   * keyword fan-out runs FIRST, and each child's options have `keywords`
+   * REMOVED, so a child can never fan out again — nesting is bounded at one
+   * level. A child is then free to be size-sharded by shardIfNeeded() on its own
+   * tick, with exactly the shardSize a single-keyword run of the same maxItems
+   * would get today. Total leaf executions are therefore
+   * keywordCount x shardsPerKeyword — identical to submitting those same
+   * keywords as separate crawls, which is what the user asked for, rather than a
+   * new multiplier invented here. (Today every channel declares
+   * supportsSharding:false in src/backends/local-capabilities.js, so
+   * shardsPerKeyword is 1 for every platform in this repository and the product
+   * is simply keywordCount.)
+   */
+  async fanOutKeywordsIfNeeded(run, plan) {
+    if (!needsKeywordFanOut(plan)) return false;
+
+    const tasks = planKeywordTasks(run, plan);
+    // `keywords` is stripped from every child's options: it is the parent-level
+    // instruction, and leaving it in place would make each child fan out again.
+    const { keywords: _parentKeywords, ...childOptions } = plan.options;
+    for (const task of tasks) {
+      await this.database.createRun({
+        platform: run.platform,
+        query: task.keyword,
+        maxItems: task.maxItems,
+        country: run.country || null,
+        options: {
+          ...childOptions,
+          jobKind: plan.jobKind,
+          maxItems: task.maxItems,
+          keyword: task.keyword,
+          keywordIndex: task.keywordIndex,
+          keywordCount: task.keywordCount
+        },
+        parentRunId: run.id
+      });
+    }
+    await this.database.updateRun(run.id, { status: 'sharded' });
+    console.log(`[Scheduler] Run #${run.id} (${run.platform}) split into ${tasks.length} keyword tasks, maxItems=${tasks[0].maxItems} each`);
+    return true;
+  }
+
   /** Splits an oversized run into child shard runs and parks the parent as 'sharded'. Returns true if sharding happened. */
   async shardIfNeeded(run, plan) {
     if (!needsSharding(plan)) return false;
@@ -184,6 +241,16 @@ class ResourceScheduler {
     return true;
   }
 
+  /** True when a parked ('sharded') parent was split by keyword rather than by size. */
+  isKeywordFanOutParent(parent) {
+    try {
+      const raw = typeof parent.input_options === 'string' ? JSON.parse(parent.input_options || '{}') : (parent.input_options || {});
+      return Array.isArray(raw.keywords) && raw.keywords.length > 1;
+    } catch (_e) {
+      return false;
+    }
+  }
+
   /** Aggregates any parent runs whose shards have all finished. Called every tick. */
   async reconcileShardedParents() {
     const parents = this.database.getRunsByStatus ? await this.database.getRunsByStatus('sharded') : [];
@@ -192,13 +259,18 @@ class ResourceScheduler {
       if (!allShardsTerminal(children)) continue;
       const summary = aggregateShardResults(children);
       const finalStatus = summary.doneShards > 0 ? 'done' : 'failed';
+      // A 'sharded' parent is now either a size-shard parent or a keyword
+      // fan-out parent. Calling a failed keyword parent's children "shards"
+      // would be an actively wrong statement in the UI, so the word follows
+      // what actually happened; the size-shard message is unchanged.
+      const childLabel = this.isKeywordFanOutParent(parent) ? 'keyword tasks' : 'shards';
       await this.database.updateRun(parent.id, {
         status: finalStatus,
         itemsCount: summary.itemsCount,
         newCount: summary.newCount,
         activeCount: summary.activeCount,
         droppedCount: summary.droppedCount,
-        errorMessage: finalStatus === 'failed' ? `All ${summary.totalShards} shards failed` : null
+        errorMessage: finalStatus === 'failed' ? `All ${summary.totalShards} ${childLabel} failed` : null
       });
     }
   }
@@ -227,6 +299,13 @@ class ResourceScheduler {
           continue;
         }
         this.planFailureCounts.delete(run.id);
+
+        // Keyword fan-out BEFORE size sharding: plan.maxItems is per keyword
+        // (job-sharder.planKeywordTasks), so size-sharding a multi-keyword
+        // parent would partition a number that does not describe one result set.
+        if (await this.fanOutKeywordsIfNeeded(run, plan)) {
+          continue; // Parent parked as 'sharded'; one child per keyword is admitted on its own in subsequent ticks.
+        }
 
         if (await this.shardIfNeeded(run, plan)) {
           continue; // Parent parked as 'sharded'; its children will be admitted on their own in subsequent ticks.

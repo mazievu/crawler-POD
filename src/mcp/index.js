@@ -12,12 +12,16 @@ const log = {
   error: (...args) => process.stderr.write(`[MCP ERROR] ${args.join(' ')}\n`),
 };
 
-function main() {
+async function main() {
   log.info(`Starting ${SERVER_INFO.name} v${SERVER_INFO.version} (read-only mode)...`);
 
   let db;
   try {
-    db = createReadOnlyDb();
+    // createReadOnlyDb() is async: it connects to PostgreSQL (or probes the
+    // crawler-POD app's mcp-bridge, in PG_MODE=pglite — see src/mcp/db.js)
+    // before returning, so a database that is not reachable fails startup
+    // here rather than surfacing as empty results from the first tool call.
+    db = await createReadOnlyDb();
     log.info(`Connected to read-only database: ${db.dbPath}`);
   } catch (err) {
     log.error(`Fatal startup error: ${err.message}`);
@@ -67,23 +71,27 @@ function main() {
     }
   });
 
-  // Graceful shutdown
-  const shutdown = (signal) => {
+  // Graceful shutdown. close() is async now (it may end a pg.Pool), so
+  // shutdown awaits it before exiting instead of racing process.exit(0)
+  // against an in-flight disconnect.
+  const shutdown = async (signal) => {
     log.info(`Received ${signal}. Shutting down MCP server...`);
     rl.close();
     if (db) {
-      db.close();
+      try { await db.close(); } catch (_err) { /* already closed */ }
       log.info('Database connection closed.');
     }
     process.exit(0);
   };
 
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => { shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { shutdown('SIGTERM'); });
 
   rl.on('close', () => {
-    if (db) db.close();
-    process.exit(0);
+    (async () => {
+      if (db) { try { await db.close(); } catch (_err) { /* already closed */ } }
+      process.exit(0);
+    })();
   });
 
   log.info(`${SERVER_INFO.name} ready for JSON-RPC messages on stdio.`);

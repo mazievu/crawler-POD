@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '🛒',
   color: '#ff4d8a',
+  domain: 'tiktok.com',
 
   intelligenceTypes: ["product_listing"],
 
@@ -34,25 +35,37 @@ module.exports = {
      * scraper — it returns posts, so price/sold/rating/shop were never
      * obtainable from it at all.
      *
-     * unseenuser is primary because it is the one returning data, and because
-     * it gives a real product URL and a real TikTok CDN image where pratikdani
-     * gives neither (pratikdani has no URL field, and its cover_url is a
-     * provider-hosted proxy that was answering HTTP 500 during testing). Its
-     * maxResults cap is 5000, so a Top-20 job is a single call.
+     * PRIORITY SWAPPED 2026-09-15. pratikdani is now primary.
      *
-     * pratikdani stays configured as the fallback because it reports fields
-     * unseenuser does not — review_count, total_sale_30d_cnt and
-     * total_sale_gmv_amt — and should be promoted back to primary once its
-     * upstream recovers. As of 2026-09-07 11:47-12:05 UTC it returned an empty
-     * result set for every keyword tried (runs zNerAZPY1d1Lgn56s,
-     * pPIS9K6mxnIKRkjhp and one more), while the same actor and the same input
-     * had returned products at 07:29-07:30 the same day.
+     * unseenuser was primary on the strength of its schema, which declares
+     * maxResults with a maximum of 5000 - the note here used to read "a Top-20
+     * job is a single call". Measured, that is false: the actor returns exactly
+     * 5 dataset items and ignores maxResults entirely. Runs #746, #747, #748 and
+     * #785 each asked for 20-30 and stored 5. A control run on 2026-09-15 asked
+     * for maxResults=12 on "phone case" - a keyword with thousands of listings -
+     * and the run SUCCEEDED with an itemCount of 5. The input Apify received was
+     * verified from the run's own INPUT record, so the cap is the actor's, not
+     * ours. It also has no page/offset field, so it cannot be paged around: N
+     * repeat calls would return the same 5 products.
+     *
+     * pratikdani's upstream has recovered - the empty result sets seen on
+     * 2026-09-07 are gone. Re-verified 2026-09-15: limit=10 on "phone case"
+     * returned 10 items, its cover_url answered HTTP 200 (the HTTP 500 that
+     * demoted it is fixed), and it carries the fields unseenuser never had:
+     * product_rating 4.4, review_count 4.36K, total_sale_30d_cnt 10.48K,
+     * total_sale_gmv_amt 88.17K. Its limit maximum is 10, and ACTOR_PAGE_LIMITS
+     * already registers that, so apify.backend.js pages it to reach any maxItems.
+     * It still reports no product URL; product-listing.js builds one from
+     * product_id, which is why that is not a blocker.
+     *
+     * unseenuser stays enabled as the fallback: it is the one that kept working
+     * when pratikdani went dark, and 5 products beat zero.
      */
     {
       name: 'apify',
       kind: BACKEND_KIND.APIFY,
-      priority: 20,
-      enabled: true,
+      priority: 30,
+      enabled: true,
       actorId: 'unseenuser/TikTok-Shop-Scraper',
       requiresEnv: ['APIFY_TOKEN'],
       actorEntitlement: "unverified",
@@ -61,7 +74,7 @@ module.exports = {
     {
       name: 'apify-pratikdani',
       kind: BACKEND_KIND.APIFY,
-      priority: 30,
+      priority: 20,
       enabled: true,
       actorId: 'pratikdani/tiktok-shop-search-scraper',
       requiresEnv: ['APIFY_TOKEN'],

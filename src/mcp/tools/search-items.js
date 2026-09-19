@@ -111,7 +111,7 @@ async function handler(args = {}, db) {
     cursor,
   } = args;
 
-  const result = db.searchItems({
+  const result = await db.searchItems({
     keyword,
     platform,
     author,

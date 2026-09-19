@@ -289,8 +289,12 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
      * text, and every threshold travels as a bound parameter. With none
      * supplied this is byte-for-byte the previous prepared statement.
      */
-    listCurrent: async ({ platform = null, search = null, limit = 100, conditions = [], orderBy = null } = {}) => {
-      if ((!conditions || conditions.length === 0) && !orderBy) {
+    listCurrent: async ({ platform = null, search = null, limit = 100, offset = 0, conditions = [], orderBy = null } = {}) => {
+      const skip = Math.max(0, Number(offset) || 0);
+      // The fast path is only valid for the first page: that prepared statement
+      // has no OFFSET, so asking it for page 2 would silently hand back page 1
+      // again and the grid would page forever through the same rows.
+      if ((!conditions || conditions.length === 0) && !orderBy && skip === 0) {
         return await listCurrent.all({ platform, search, limit });
       }
 
@@ -306,16 +310,66 @@ function createProductCurrentOps(db, dailyHistoryOps, options = {}) {
       // Ranking first, then the pre-existing tie-breakers, so two rows with the
       // same metric value keep a stable, meaningful order instead of an
       // arbitrary one.
+      //
+      // `item_uid` closes the list because the columns above it are NOT a total
+      // order — 88,939 Etsy rows share about 30 distinct last_crawled_at values
+      // and many share a rank_score. With ties left unbroken, LIMIT/OFFSET is
+      // free to place the same row on two pages and drop another entirely, so
+      // paging through a sorted grid could repeat and skip items. item_uid is
+      // the primary key, so adding it makes the order total and paging
+      // reproducible without changing any ordering the user can perceive.
       const order = orderBy
-        ? `${orderBy}, rank_score DESC, last_crawled_at DESC`
-        : 'rank_score DESC, last_crawled_at DESC';
+        ? `${orderBy}, rank_score DESC, last_crawled_at DESC, item_uid ASC`
+        : 'rank_score DESC, last_crawled_at DESC, item_uid ASC';
 
       return await db.prepare(`
         SELECT * FROM product_current
         WHERE ${where.join(' AND ')}
         ORDER BY ${order}
-        LIMIT @limit
-      `).all({ platform, search, limit, ...filterParams });
+        LIMIT @limit OFFSET @offset
+      `).all({ platform, search, limit, offset: skip, ...filterParams });
+    },
+
+    /**
+     * How many rows the SAME filter matches, so the grid can page instead of
+     * loading everything. Counted in SQL rather than by fetching and measuring:
+     * the whole point is never to pull tens of thousands of rows into Node just
+     * to learn how many there are.
+     *
+     * Deliberately shares the WHERE construction with listCurrent above — a
+     * count that disagreed with the list would page the user into empty pages.
+     */
+    countCurrent: async ({ platform = null, search = null, conditions = [] } = {}) => {
+      const { buildSqlFilter } = require('../filters/metric-conditions');
+      const { sql: filterSql, params: filterParams } = buildSqlFilter(conditions || []);
+
+      const where = [
+        '(@platform::text IS NULL OR platform = @platform)',
+        "(@search::text IS NULL OR title LIKE '%' || @search || '%' OR query LIKE '%' || @search || '%')",
+      ];
+      if (filterSql) where.push(filterSql);
+
+      const row = await db.prepare(`
+        SELECT COUNT(*) AS total FROM product_current WHERE ${where.join(' AND ')}
+      `).get({ platform, search, ...filterParams });
+      return Number(row?.total || 0);
+    },
+
+    /**
+     * Row count per platform in ONE query, for the tab counters. The previous
+     * page built these by counting what it had already downloaded, which meant
+     * the counts were only ever as right as the page size.
+     */
+    countByPlatform: async () => {
+      // No status filter, deliberately: the grid shows dropped rows too (marked
+      // "NGOÀI TOP"), so a counter that excluded them would disagree with the
+      // tab it labels — the Amazon pill read 16 while its tab listed 46.
+      const rows = await db.prepare(
+        'SELECT platform, COUNT(*) AS total FROM product_current GROUP BY platform'
+      ).all();
+      const out = {};
+      for (const r of rows) out[r.platform] = Number(r.total || 0);
+      return out;
     }
   };
 }

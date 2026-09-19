@@ -7,6 +7,7 @@ module.exports = {
   queryType: 'keyword',
   icon: '\uD83C\uDFB5',
   color: '#000000',
+  domain: 'tiktok.com',
 
   intelligenceTypes: ['social_post', 'trend_signal'],
 

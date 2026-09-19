@@ -11,6 +11,6 @@ test('dashboard renders imported analytics even when a product export has no lis
 });
 
 test('dashboard searches the server instead of loading every imported analytics record into the browser', () => {
-  assert.match(app, /apiFetch\(`\/api\/items\?\$\{params\}`\)/);
+  assert.match(app, /apiFetch\(`\/api\/items\?\$\{params\}`/);
   assert.match(app, /params\.set\('search', query\)/);
 });

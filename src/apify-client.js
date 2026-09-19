@@ -139,15 +139,37 @@ const ACTOR_INPUT_BUILDERS = {
     region: String(country || 'US').toUpperCase(),
     maxResults: Math.max(1, Number(maxItems) || 20),
   }),
+
+  // trudax/reddit-scraper-lite
+  'trudax/reddit-scraper-lite': ({ query, maxItems }) => ({
+    searches: [query],
+    maxPosts: Math.max(1, Number(maxItems) || 20),
+    sort: 'relevance',
+    searchMedia: true,
+  }),
+
+  // fatihtahta/reddit-scraper-search-fast — extracts full scores, comments count, gallery images & media assets
+  'fatihtahta/reddit-scraper-search-fast': ({ query, maxItems }) => ({
+    queries: [query],
+    maxPosts: Math.max(1, Number(maxItems) || 5),
+    scrapeComments: false,
+    sort: 'relevance',
+  }),
+
+  // scraper_one/facebook-posts-search — extracts real Facebook post metrics (reactionsCount, commentsCount, sharesCount, attachments)
+  'scraper_one/facebook-posts-search': ({ query, maxItems }) => ({
+    query: query,
+    resultsCount: Math.max(1, Number(maxItems) || 5),
+    searchType: 'top',
+  }),
 };
 
 const INPUT_BUILDERS = {
-  // Facebook Posts/Groups — danek/facebook-search-ppr
+  // Facebook Posts — scraper_one/facebook-posts-search
   facebook_posts: ({ query, maxItems }) => ({
     query: query,
-    max_posts: maxItems,
-    maxChargedResults: maxItems,
-    search_type: 'posts',
+    resultsCount: Math.max(1, Number(maxItems) || 5),
+    searchType: 'top',
   }),
   facebook_groups: ({ query, maxItems }) => ({
     query: query,

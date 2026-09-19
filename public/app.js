@@ -20,43 +20,161 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 // ==================== Data Loading ====================
 
+/*
+ * Paging state. Each platform tab keeps its OWN page number, so switching away
+ * and back lands where you left rather than snapping to the top of a
+ * ten-thousand-row list.
+ *
+ * The grid never holds "all items": it asks the server for one page of one
+ * platform. Before this, opening the dashboard fetched a mixed bag of rows and
+ * then counted the platform tabs from whatever happened to arrive — slow, and
+ * wrong as soon as the table is bigger than one page.
+ */
+const PAGE_SIZE = 60;
+const pageByTab = {};    // platform name (or 'all') -> zero-based page index
+let totalMatching = 0;   // X-Total-Count for the query currently on screen
+
+function currentPage() { return pageByTab[activeFilter] || 0; }
+function setCurrentPage(n) { pageByTab[activeFilter] = Math.max(0, n); }
+
 async function loadData() {
   try {
-    const [platforms, items, stats] = await Promise.all([
+    // Counts come from SQL (stats.platformCounts), never from the rows this
+    // page happens to hold — a tab counter must describe the table, not the page.
+    const [platforms, stats] = await Promise.all([
       apiFetch('/api/platforms'),
-      apiFetch('/api/items?limit=100'),
       apiFetch('/api/stats').catch(() => ({ totalRuns: 0, totalSnapshots: 0, platformCounts: {} })),
     ]);
     allPlatforms = platforms;
-    allItems = items;
 
-    const counts = { ...(stats.platformCounts || {}) };
-    for (const item of allItems) {
-      if (counts[item.platform] === undefined) {
-        counts[item.platform] = (counts[item.platform] || 0) + 1;
-      }
-    }
+    // tabCounts is counted with the same predicate /api/items lists by, so a
+    // pill's number matches what its tab actually shows. platformCounts counts
+    // live items only and would read 16 over a tab holding 46.
+    const counts = { ...(stats.tabCounts || stats.platformCounts || {}) };
     renderFilterPills(platforms, counts);
-    const totalCount = stats.totalSnapshots || Object.values(counts).reduce((a, b) => a + b, 0) || allItems.length;
+
+    const totalCount = Object.values(counts).reduce((a, b) => a + b, 0) || stats.totalSnapshots || 0;
     document.getElementById('stat-total').textContent = `${stats.totalRuns || 0} runs / ${totalCount} items`;
-    renderItems(allItems);
+
+    // One page of the active tab — not the whole table.
+    await applyFilters();
   } catch (err) { console.error('Load failed:', err); }
+}
+
+// ==================== Platform Badge (shared icon/color source) ====================
+// Single source of truth for how a platform's icon, display name and brand
+// color are rendered. Every surface that shows a platform — filter pills,
+// the DB metric dropdown, item cards, the item detail modal, the Crawl Now
+// platform grid, Job History and the Schedules modal — reads through this
+// instead of keeping its own icon/label map. That duplication is exactly why
+// TikTok Shop used to show a musical-note emoji (a stale local map in the
+// Schedules modal) while the Crawl Now tab showed the registry's real icon
+// for the same platform.
+//
+// Icon is the platform's real favicon (DuckDuckGo's icon proxy), keyed off
+// the `domain` field each channel declares in src/channels/*.channel.js
+// (exposed through registry.js -> /api/platforms -> allPlatforms). If the
+// favicon 404s, is offline, or the channel has no public domain on file
+// (e.g. the internal `toidispy` CDP tool), onerror swaps in the emoji
+// already defined on the channel (`p.icon`) so the UI never shows a broken
+// image or an empty box.
+function getPlatformConfig(platformName) {
+  return allPlatforms.find((p) => p.name === platformName) || null;
+}
+
+// The ONE place a platform's brand colour is read. Every surface that tints
+// itself per platform — the filter pill, the item card's platform tag, the
+// chip variant of platformBadge() — goes through here, so a pill and the cards
+// it filters to can never disagree about what colour that platform is.
+//
+// The colour itself is declared once per channel in src/channels/*.channel.js
+// (`color:`) and travels registry.js -> /api/platforms -> allPlatforms. There
+// used to be a second, hardcoded copy of these values in style.css as a
+// `.tag-<platform>` table; it was deleted because it covered only 8 of the 14
+// channels and drifted from the registry (eBay, TikTok Shop, Twitter/X and
+// both Facebook channels had no rule at all and rendered an untinted badge).
+const PLATFORM_COLOR_FALLBACK = '#6b7280';
+
+function platformColor(platformName) {
+  const color = getPlatformConfig(platformName)?.color;
+  return /^#[0-9a-fA-F]{3,8}$/.test(String(color || '')) ? color : PLATFORM_COLOR_FALLBACK;
+}
+
+function platformIconFallback(img) {
+  const span = document.createElement('span');
+  span.className = 'platform-badge-emoji';
+  span.style.cssText = `font-size:${img.width || 14}px;line-height:1;display:inline-block;vertical-align:middle`;
+  span.textContent = img.dataset.fallbackEmoji || '🔗';
+  img.replaceWith(span);
+}
+
+function platformIconHtml(platformName, size) {
+  const config = getPlatformConfig(platformName);
+  const px = size || 14;
+  const emoji = config?.icon || '🔗';
+  if (!config?.domain) {
+    return `<span class="platform-badge-emoji" style="font-size:${px}px;line-height:1;display:inline-block;vertical-align:middle">${escapeHtml(emoji)}</span>`;
+  }
+  return `<img src="https://icons.duckduckgo.com/ip3/${escapeAttr(config.domain)}.ico" alt="" width="${px}" height="${px}" class="platform-badge-icon" data-fallback-emoji="${escapeAttr(emoji)}" style="width:${px}px;height:${px}px;object-fit:contain;vertical-align:middle;border-radius:3px" referrerpolicy="no-referrer" onerror="platformIconFallback(this)">`;
+}
+
+// Plain-text form for contexts that cannot render HTML at all, e.g. an
+// <option> label inside a <select> — still sourced from the same registry
+// data, just without the favicon <img> that <option> would silently drop.
+function platformLabelText(platformName) {
+  const config = getPlatformConfig(platformName);
+  return `${config?.icon || ''} ${config?.displayName || platformName}`.trim();
+}
+
+// `variant: 'chip'` (default) is a self-contained bordered pill tinted with
+// the platform's brand color — for spots with no color treatment of their
+// own (Job History cell, Schedules card header). `variant: 'inline'` returns
+// a bare icon (+ name unless showName:false) with no chrome, for spots that
+// already own their color treatment (the filter pill's colored dot, the
+// item card's platform-tag background, the modal title).
+function platformBadge(platformName, options) {
+  const opts = options || {};
+  const size = opts.size || 14;
+  const variant = opts.variant || 'chip';
+  const showName = opts.showName !== false;
+  const config = getPlatformConfig(platformName);
+  const color = platformColor(platformName);
+  const name = escapeHtml(config?.displayName || platformName);
+  const iconHtml = platformIconHtml(platformName, size);
+  const nameHtml = showName ? `<span>${name}</span>` : '';
+
+  if (variant === 'inline') {
+    return showName ? `${iconHtml} ${nameHtml}` : iconHtml;
+  }
+  const softBg = /^#[0-9a-fA-F]{6}$/.test(color) ? `${color}1f` : color;
+  return `<span class="platform-badge" style="display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:6px;border:1px solid ${color};background:${softBg};color:${color};font-weight:600;white-space:nowrap">${iconHtml}${nameHtml}</span>`;
 }
 
 // ==================== Filter Pills ====================
 
+// A platform pill and the cards that platform's rows render as are the same
+// thing seen twice, so they are tinted from the same value: `--pill-color` is
+// set here from platformColor() and style.css derives the pill's border, text
+// and (when active) its fill from it. Before this the pill carried the brand
+// colour only on its 7px dot — its body was white, and an ACTIVE pill turned
+// generic --primary blue — so an Etsy pill read blue while every Etsy card
+// badge read orange.
+//
+// "All" spans every platform, so it has no brand colour to borrow and keeps
+// the neutral/primary treatment.
 function renderFilterPills(platforms, counts) {
   const container = document.getElementById('filter-pills');
   const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  let html = `<button class="pill active" onclick="filterByPlatform('all', this)">
+  let html = `<button class="pill pill-all active" onclick="filterByPlatform('all', this)">
     <span class="pill-dot" style="background:#666"></span> All <span class="pill-count">${total}</span>
   </button>`;
   for (const p of platforms) {
     const c = counts[p.name] || 0;
     if (c === 0) continue;
-    html += `<button class="pill" onclick="filterByPlatform('${p.name}', this)">
-      <span class="pill-dot" style="background:${p.color}"></span>
-      ${p.icon} ${p.displayName} <span class="pill-count">${c}</span>
+    const color = platformColor(p.name);
+    html += `<button class="pill" data-platform="${escapeAttr(p.name)}" style="--pill-color:${color}" onclick="filterByPlatform('${p.name}', this)">
+      <span class="pill-dot" style="background:${color}"></span>
+      ${platformBadge(p.name, { size: 13, variant: 'inline' })} <span class="pill-count">${c}</span>
     </button>`;
   }
   container.innerHTML = html;
@@ -66,14 +184,22 @@ function filterByPlatform(platform, el) {
   activeFilter = platform;
   document.querySelectorAll('.pill').forEach((p) => p.classList.remove('active'));
   el.classList.add('active');
+  // Each tab keeps its own page (pageByTab), so returning to a tab returns to
+  // where you were rather than to row 1 of a very long list.
   // The metric panel is per-platform, so a pill click has to move it too —
   // otherwise the panel keeps offering Amazon's metrics over Instagram rows.
   // Ticks are cleared because a metric belongs to one platform's vocabulary.
-  if (platform !== 'all' && platformMetrics[platform] && platform !== metricPlatform) {
-    metricPlatform = platform;
+  // The "All" pill now has a counterpart in the select (ALL), so it moves the
+  // panel too. Before ALL existed this branch had to skip 'all' — the select
+  // had no option to move to — which left the panel sitting on e.g. Amazon
+  // while the grid showed everything.
+  const target = (platform === 'all' || platformMetrics[platform]) ? platform : null;
+  if (target && target !== metricPlatform) {
+    metricPlatform = target;
     const select = document.getElementById('metric-platform');
-    if (select) select.value = platform;
+    if (select) select.value = target;
     renderMetricBoxes();
+    syncMetricSortOptions();
   }
   applyFilters();
 }
@@ -81,7 +207,12 @@ function filterByPlatform(platform, el) {
 function setupSearch() {
   const input = document.getElementById('search-input');
   let debounce;
-  input.addEventListener('input', () => { clearTimeout(debounce); debounce = setTimeout(applyFilters, 200); });
+  // A new search is a new result set: staying on page 5 of the previous one
+  // would show an empty grid whenever the new match count is smaller.
+  input.addEventListener('input', () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => { setCurrentPage(0); applyFilters(); }, 200);
+  });
 }
 
 // ==================== DB metric filter (Task 2) ====================
@@ -95,6 +226,29 @@ function setupSearch() {
 let platformMetrics = {};
 let metricPlatform = '';
 
+/*
+ * The ALL choice in #metric-platform.
+ *
+ * It is NOT a platform — `platformMetrics['all']` does not and must not exist.
+ * It means "do not narrow the grid to one platform's vocabulary", and it is the
+ * only selection under which the metric tick boxes are deliberately absent:
+ * there is no metric that every platform reports (Etsy has no `shares`, an
+ * Instagram post has no `sold`, Shopify reports price and nothing else), so any
+ * tick offered here would be a filter that silently excludes most of the table.
+ *
+ * What is left is the ordering that does mean the same thing on every row —
+ * when it was crawled — which is exactly the two options the user asked for:
+ * Mới nhất and Cũ nhất. Both are resolved by the server over the whole table
+ * (?sort=recent|oldest -> TIME_SORT_COLUMNS in server.js), so page 2 continues
+ * page 1 instead of being its own separately-sorted island.
+ *
+ * The value is the string the platform pills already use, so ALL and the "All"
+ * pill stay one selection rather than two controls disagreeing.
+ */
+const METRIC_PLATFORM_ALL = 'all';
+
+function isMetricPlatformAll() { return !metricPlatform || metricPlatform === METRIC_PLATFORM_ALL; }
+
 async function loadMetricGroups() {
   try {
     const spec = await apiFetch('/api/item-metrics');
@@ -105,21 +259,27 @@ async function loadMetricGroups() {
   }
   renderMetricPlatformOptions();
   renderMetricBoxes();
+  syncMetricSortOptions();
 }
 
 // Only platforms that actually hold rows are offered, so the dropdown does not
-// list twelve choices when four have data.
+// list twelve choices when four have data. ALL is always first and always
+// present — it is the one choice that does not depend on any platform holding
+// rows, and it is the fallback the panel lands on when nothing else qualifies.
 function renderMetricPlatformOptions() {
   const select = document.getElementById('metric-platform');
   if (!select) return;
-  const available = allPlatforms
-    .filter((p) => platformMetrics[p.name])
-    .map((p) => ({ name: p.name, label: `${p.icon || ''} ${p.displayName || p.name}`.trim() }));
-  if (available.length === 0) return;
+  const available = [
+    { name: METRIC_PLATFORM_ALL, label: 'Tất cả nền tảng (ALL)' },
+    ...allPlatforms
+      .filter((p) => platformMetrics[p.name])
+      .map((p) => ({ name: p.name, label: platformLabelText(p.name) })),
+  ];
 
   if (!metricPlatform || !available.some((p) => p.name === metricPlatform)) {
-    // Follow the platform pill when one is active; otherwise start on the first.
-    metricPlatform = available.some((p) => p.name === activeFilter) ? activeFilter : available[0].name;
+    // Follow the platform pill when one is active; otherwise ALL, which is what
+    // the grid is actually showing before any pill is clicked.
+    metricPlatform = available.some((p) => p.name === activeFilter) ? activeFilter : METRIC_PLATFORM_ALL;
   }
   select.innerHTML = available
     .map((p) => `<option value="${escapeAttr(p.name)}"${p.name === metricPlatform ? ' selected' : ''}>${escapeHtml(p.label)}</option>`)
@@ -129,6 +289,14 @@ function renderMetricPlatformOptions() {
 function renderMetricBoxes() {
   const host = document.getElementById('metric-boxes');
   if (!host) return;
+  if (isMetricPlatformAll()) {
+    // Not "this platform has no metrics" — a different fact, and saying the
+    // wrong one here is how a control reads as broken. ALL has no tick boxes
+    // BY DESIGN, and the reason is on screen rather than only in the source.
+    host.innerHTML = '<span class="metric-boxes-empty">Chế độ <strong>ALL</strong>: không có chỉ số nào chung cho mọi nền tảng, '
+      + 'nên chỉ lọc được theo <strong>Mới nhất</strong> / <strong>Cũ nhất</strong>. Chọn một nền tảng cụ thể để lọc theo chỉ số.</span>';
+    return;
+  }
   const metrics = platformMetrics[metricPlatform] || [];
   if (metrics.length === 0) {
     host.innerHTML = '<span class="metric-boxes-empty">Nền tảng này chưa khai báo chỉ số nào.</span>';
@@ -136,18 +304,48 @@ function renderMetricBoxes() {
   }
   host.innerHTML = metrics.map((m) => `
     <label class="metric-box">
-      <input type="checkbox" value="${escapeAttr(m.name)}" onchange="applyMetricFilters()">
+      <input type="checkbox" value="${escapeAttr(m.name)}" onchange="onMetricBoxChange()">
       <span>${escapeHtml(m.label)}</span>
     </label>`).join('');
 }
 
+/**
+ * Relabels #metric-sort-dir to the ordering it will ACTUALLY perform.
+ *
+ * The two option VALUES never change — desc/asc is what applyFilters() sends —
+ * but what desc means depends on whether a metric is ticked:
+ *
+ *   platform = ALL, or no metric ticked  ->  ?sort=recent|oldest   (a time column)
+ *   one or more metrics ticked           ->  ?metrics=…&dir=desc|asc (metric columns)
+ *
+ * Leaving the labels fixed at "Mới nhất / Cũ nhất" while the control was really
+ * ranking by likes would be a control that lies about what it does, which is
+ * the same class of failure as a button that does nothing. Under ALL the option
+ * list is exactly two entries, which is the requirement.
+ */
+function syncMetricSortOptions() {
+  const select = document.getElementById('metric-sort-dir');
+  if (!select) return;
+  const byMetric = !isMetricPlatformAll() && collectMetricSelection().length > 0;
+  const labels = byMetric
+    ? { desc: 'Cao → Thấp', asc: 'Thấp → Cao' }
+    : { desc: 'Mới nhất', asc: 'Cũ nhất' };
+  const keep = select.value === 'asc' ? 'asc' : 'desc';
+  select.innerHTML = `<option value="desc">${labels.desc}</option><option value="asc">${labels.asc}</option>`;
+  select.value = keep;
+}
+
 // Switching platform also switches which pill is active, because a filter on
 // Etsy's metrics is meaningless while the grid is showing Instagram.
+// Selecting ALL here is the same act as clicking the "All" pill, so both land
+// on activeFilter = 'all' and the pill row follows — the two controls are one
+// selection, never two that disagree about what the grid is showing.
 function onMetricPlatformChange() {
   const select = document.getElementById('metric-platform');
   if (!select) return;
   metricPlatform = select.value;
   renderMetricBoxes();
+  syncMetricSortOptions();
   activeFilter = metricPlatform;
   document.querySelectorAll('.pill').forEach((pill) => {
     pill.classList.toggle('active', (pill.getAttribute('onclick') || '').includes(`'${metricPlatform}'`));
@@ -155,11 +353,24 @@ function onMetricPlatformChange() {
   applyMetricFilters();
 }
 
+// Ticking a box changes what "desc" means, so the label has to move with it
+// before the request goes out.
+function onMetricBoxChange() {
+  syncMetricSortOptions();
+  applyMetricFilters();
+}
+
 function collectMetricSelection() {
+  // Under ALL there are no boxes to read, and there must never be: returning
+  // anything here would put ?metrics= on a request that has no single platform
+  // to interpret it against.
+  if (isMetricPlatformAll()) return [];
   return [...document.querySelectorAll('#metric-boxes input[type=checkbox]:checked')].map((el) => el.value);
 }
 
-function applyMetricFilters() { applyFilters(); }
+// Same reasoning as the search box: changing the filter changes the result set,
+// so the pager restarts at page 1.
+function applyMetricFilters() { setCurrentPage(0); applyFilters(); }
 
 // Single place that writes the panel's status line, so no path can leave the
 // user without feedback after a click.
@@ -174,6 +385,9 @@ function clearMetricFilters() {
   document.querySelectorAll('#metric-boxes input[type=checkbox]').forEach((el) => { el.checked = false; });
   const dir = document.getElementById('metric-sort-dir');
   if (dir) dir.value = 'desc';
+  // Nothing is ticked now, so the direction dropdown is back to meaning
+  // newest/oldest and must say so.
+  syncMetricSortOptions();
   applyFilters();
 }
 
@@ -188,17 +402,110 @@ function toggleMetricPanel(forceOpen) {
   if (open) {
     renderMetricPlatformOptions();
     renderMetricBoxes();
+    syncMetricSortOptions();
     // Opening the panel to a blank status line is what made the old one feel
     // dead; say what it is waiting for.
     if (!document.getElementById('metric-result')?.textContent) {
-      setMetricMessage('Tích một hoặc nhiều chỉ số để lọc.', 'info');
+      setMetricMessage(
+        isMetricPlatformAll()
+          ? 'Chế độ ALL — chỉ sắp xếp theo Mới nhất / Cũ nhất.'
+          : 'Tích một hoặc nhiều chỉ số để lọc.',
+        'info',
+      );
     }
   }
 }
+/**
+ * One page of items plus how many rows the filter matches in total.
+ *
+ * Uses apiFetch with returnMeta: true to read the X-Total-Count header,
+ * counted in SQL so the pager knows the real size of the table rather than
+ * the size of what was downloaded.
+ */
+async function fetchItemsPage(params) {
+  const { data, headers } = await apiFetch(`/api/items?${params}`, { returnMeta: true });
+  const header = headers.get('X-Total-Count');
+  return { items: data, total: header === null ? data.length : Number(header) };
+}
+
+/**
+ * Pager under the grid. Hidden entirely when everything fits on one page, so
+ * a small install never sees controls it does not need.
+ */
+function renderPager() {
+  const host = document.getElementById('items-pager');
+  if (!host) return;
+  const pages = Math.ceil(totalMatching / PAGE_SIZE);
+  if (pages <= 1) { host.innerHTML = ''; return; }
+
+  const page = currentPage();
+  const from = page * PAGE_SIZE + 1;
+  const to = Math.min((page + 1) * PAGE_SIZE, totalMatching);
+  // With 1483 pages of Etsy, stepping one page at a time is not navigation.
+  // The box takes a 1-based page number — the same number the label beside it
+  // shows — and Enter jumps there.
+  host.innerHTML = `
+    <button class="pager-btn" ${page === 0 ? 'disabled' : ''} onclick="goToPage(${page - 1})">‹ Trước</button>
+    <span class="pager-info">${from}–${to} / <strong>${formatNum(totalMatching)}</strong> · trang ${page + 1}/${pages}</span>
+    <span class="pager-jump">
+      <label for="pager-jump-input">Tới trang</label>
+      <input type="number" id="pager-jump-input" class="pager-jump-input"
+             min="1" max="${pages}" value="${page + 1}" aria-label="Số trang muốn mở"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();jumpToPage();}">
+      <span class="pager-jump-max">/ ${pages}</span>
+      <button class="pager-btn" onclick="jumpToPage()">Đi</button>
+    </span>
+    <button class="pager-btn" ${page + 1 >= pages ? 'disabled' : ''} onclick="goToPage(${page + 1})">Sau ›</button>`;
+}
+
+/**
+ * Reads the jump box and goes there. The value is 1-based on screen and
+ * 0-based internally; anything out of range is clamped rather than refused,
+ * because typing 9999 into "page of 1483" plainly means "the last one".
+ */
+async function jumpToPage() {
+  const input = document.getElementById('pager-jump-input');
+  if (!input) return;
+  const pages = Math.max(1, Math.ceil(totalMatching / PAGE_SIZE));
+  const wanted = parseInt(input.value, 10);
+  if (!Number.isFinite(wanted)) { input.value = currentPage() + 1; return; }
+  const clamped = Math.min(Math.max(wanted, 1), pages);
+  input.value = clamped;
+  if (clamped - 1 === currentPage()) return;
+  await goToPage(clamped - 1);
+}
+
+async function goToPage(n) {
+  // Clamped here too: goToPage is reached from the prev/next buttons and from
+  // jumpToPage, and a page past the end would render an empty grid.
+  const pages = Math.max(1, Math.ceil(totalMatching / PAGE_SIZE));
+  setCurrentPage(Math.min(Math.max(n, 0), pages - 1));
+  await applyFilters();
+  document.querySelector('.content-area')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/**
+ * Changing the sort has to go back to page 1, the same way typing in the search
+ * box (line ~208) and applying a metric filter already do. Staying on page 743
+ * of the previous ordering shows a slice of a list the user never saw the top
+ * of, which reads as "the sort did nothing".
+ */
+function onSortChange() { setCurrentPage(0); applyFilters(); }
+
 async function applyFilters() {
   const query = document.getElementById('search-input').value.toLowerCase().trim();
-  const sort = document.getElementById('sort-select').value;
-  const params = new URLSearchParams({ limit: '200' });
+  /*
+   * The standalone "Most Recent / Most Liked / Price …" dropdown was removed at
+   * the user's request; ordering lives in the metric panel now. Reading
+   * #sort-select unconditionally threw "Cannot read properties of null" the
+   * moment that element went away, which killed applyFilters() and left the
+   * grid blank. Ordering falls back to newest-first, which is what the panel
+   * offers when nothing is ticked.
+   */
+  const sortEl = document.getElementById('sort-select');
+  const dirEl = document.getElementById('metric-sort-dir');
+  const sort = sortEl ? sortEl.value : (dirEl && dirEl.value === 'asc' ? 'oldest' : 'recent');
+  const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(currentPage() * PAGE_SIZE) });
   if (activeFilter !== 'all') params.set('platform', activeFilter);
   if (query) params.set('search', query);
 
@@ -214,10 +521,18 @@ async function applyFilters() {
     // has to be that platform. Without this, ticking Amazon's "rating" while
     // the pill still says All returns TikTok rows judged by Amazon's metrics.
     if (metricPlatform) params.set('platform', metricPlatform);
+  } else if (sort === 'recent' || sort === 'oldest') {
+    // Newest / oldest are resolved by the SERVER, over the whole table, so page
+    // 2 continues page 1. Sorting in the browser can only ever reorder the 60
+    // rows this page happens to hold — which is what made every page its own
+    // island before.
+    params.set('sort', sort);
   }
   let filtered;
   try {
-    filtered = await apiFetch(`/api/items?${params}`);
+    const page = await fetchItemsPage(params);
+    filtered = page.items;
+    totalMatching = page.total;
     allItems = filtered;
   } catch (err) {
     console.error('Search failed:', err);
@@ -228,6 +543,10 @@ async function applyFilters() {
   }
 
   const dirLabel = dir === 'asc' ? 'Thấp → Cao' : 'Cao → Thấp';
+  // What the TIME ordering is called, for the no-metric case. It has to be
+  // named on screen: under ALL this is the only thing the panel does, and a
+  // status line that never mentions it reads as "the dropdown did nothing".
+  const timeLabel = sort === 'oldest' ? 'Cũ nhất' : 'Mới nhất';
   const labelFor = (name) =>
     (platformMetrics[metricPlatform] || []).find((m) => m.name === name)?.label || name;
 
@@ -236,7 +555,11 @@ async function applyFilters() {
   setMetricMessage(
     selected.length
       ? `${selected.map((n) => escapeHtml(labelFor(n))).join(' + ')} · ${dirLabel} → <strong>${filtered.length}</strong> sản phẩm`
-      : `Chưa tích chỉ số nào — hiển thị toàn bộ <strong>${filtered.length}</strong> sản phẩm`,
+      // "toàn bộ N" was written before the grid was paged, so it claimed the 60
+      // rows on screen were the whole result — on Etsy it read "toàn bộ 60" over
+      // 88,939 rows. Say what is shown AND what it is shown out of.
+      : `${isMetricPlatformAll() ? 'ALL' : 'Chưa tích chỉ số nào'} · <strong>${timeLabel}</strong> — `
+        + `<strong>${filtered.length}</strong> / ${formatNum(totalMatching)} sản phẩm (trang ${currentPage() + 1})`,
     selected.length ? 'ok' : 'info'
   );
 
@@ -246,27 +569,305 @@ async function applyFilters() {
   if (summaryEl) {
     summaryEl.textContent = selected.length
       ? `· ${selected.map(labelFor).join(' + ')} · ${dirLabel}`
-      : '';
-    summaryEl.classList.toggle('active', selected.length > 0);
+      // Cũ nhất is not the default, so a collapsed panel must still show it —
+      // otherwise the grid is in a non-default order with nothing on screen
+      // saying why.
+      : (sort === 'oldest' ? `· ${timeLabel}` : '');
+    summaryEl.classList.toggle('active', selected.length > 0 || sort === 'oldest');
   }
 
   // The server already returned the rows in the ranked order; re-sorting here
   // would silently override it.
-  if (selected.length) { renderItems(filtered); return; }
+  if (selected.length) { renderItems(filtered); renderPager(); return; }
 
-  switch (sort) {
-    case 'likes-desc': filtered.sort((a, b) => b.likes - a.likes); break;
-    case 'comments-desc': filtered.sort((a, b) => b.comments - a.comments); break;
-    case 'shares-desc': filtered.sort((a, b) => b.shares - a.shares); break;
-    case 'price-asc': filtered.sort((a, b) => a.price - b.price); break;
-    case 'price-desc': filtered.sort((a, b) => b.price - a.price); break;
-    case 'growth': filtered.sort((a, b) => ((b.growth?.likes || 0) + (b.growth?.comments || 0)) - ((a.growth?.likes || 0) + (a.growth?.comments || 0))); break;
-    default: filtered.sort((a, b) => parseServerTimestamp(b.created_at) - parseServerTimestamp(a.created_at)); break;
+  /*
+   * MOST RECENT — the default, and now ordered in SQL.
+   *
+   * The request above carried ?sort=recent, so /api/items returned
+   *   ORDER BY last_crawled_at DESC ...
+   * across all 89,610 rows. The rows already arrive in the right order; there
+   * is nothing left to sort here.
+   *
+   * WHAT IT USED TO DO (the bug): this function fetched page N in the server's
+   * DEFAULT order (rank_score DESC, last_crawled_at DESC) and then re-sorted
+   * only those 60 rows by date in the browser. Every page was therefore its own
+   * island — measured on the Etsy tab, page 1 ran 2026-09-15 02:06:58 down to
+   * 2026-09-07 08:08:07 and page 2 then started over at 2026-09-15 00:13:13.
+   * Page 1 was not the 60 most recent rows of 88,939 either: it was the 60
+   * highest-RANKED rows, merely displayed in date order. That is why the list
+   * looked arbitrary.
+   */
+  /*
+   * `oldest` belongs here with `recent`, not below.
+   *
+   * Both are resolved by the server (TIME_SORT_COLUMNS in server.js maps each
+   * to last_crawled_at with its own default direction), so both arrive already
+   * ordered and neither has — or needs — a browser-side comparator. Falling
+   * through to PAGE_LOCAL_SORTS instead made "Cũ nhất" hit the unknown-sort
+   * branch and paint a red 'Kiểu sắp xếp không nhận dạng được: "oldest"' over a
+   * grid the server HAD sorted correctly.
+   */
+  if (sort === 'recent' || sort === 'oldest') { renderItems(filtered); renderPager(); return; }
+
+  /*
+   * The remaining options are still page-local — they reorder the 60 rows on
+   * screen, not the table (pre-existing; out of scope for this fix). The status
+   * line says so rather than letting "Price: High → Low" over 88,939 Etsy rows
+   * look like it ranked all of them.
+   */
+  const PAGE_LOCAL_SORTS = {
+    'likes-desc': (a, b) => b.likes - a.likes,
+    'comments-desc': (a, b) => b.comments - a.comments,
+    'shares-desc': (a, b) => b.shares - a.shares,
+    'price-asc': (a, b) => a.price - b.price,
+    'price-desc': (a, b) => b.price - a.price,
+    'growth': (a, b) => ((b.growth?.likes || 0) + (b.growth?.comments || 0)) - ((a.growth?.likes || 0) + (a.growth?.comments || 0)),
+  };
+
+  const comparator = PAGE_LOCAL_SORTS[sort];
+  if (!comparator) {
+    // No silent fallback: an option with no branch used to be quietly re-sorted
+    // by date, which is indistinguishable from "the dropdown is broken".
+    setMetricMessage(
+      `Kiểu sắp xếp không nhận dạng được: "${escapeHtml(sort)}" — giữ nguyên thứ tự máy chủ trả về.`,
+      'error'
+    );
+    renderItems(filtered);
+    renderPager();
+    return;
   }
+
+  filtered.sort(comparator);
+  setMetricMessage(
+    `Sắp xếp <strong>chỉ trong trang ${currentPage() + 1}</strong> (${filtered.length} sản phẩm). `
+    + `Để xếp hạng trên toàn bộ <strong>${formatNum(totalMatching)}</strong> sản phẩm, dùng "Lọc &amp; xếp hạng theo chỉ số".`,
+    'info'
+  );
   renderItems(filtered);
+  renderPager();
 }
 
 // ==================== Render Items ====================
+
+function renderItemCapturePreview(item) {
+  const platform = item.platform || 'social';
+  const author = item.author || (platform === 'reddit' ? (item.subreddit ? `r/${item.subreddit}` : 'r/reddit') : 'Post');
+  const title = item.title || item.body || item.text || 'Text Post';
+  const initial = (author.replace(/^[@ru]\//i, '')[0] || 'P').toUpperCase();
+  const brandColors = {
+    reddit: { bg: 'linear-gradient(135deg, #1a1a1b, #2b140e)', accent: '#ff4500', name: 'Reddit' },
+    twitter: { bg: 'linear-gradient(135deg, #000000, #15202b)', accent: '#1d9bf0', name: 'X' },
+    facebook_posts: { bg: 'linear-gradient(135deg, #0c1b33, #13284d)', accent: '#1877f2', name: 'Facebook' },
+    facebook_ads: { bg: 'linear-gradient(135deg, #0c1b33, #13284d)', accent: '#1877f2', name: 'Meta Ad' },
+    tiktok_videos: { bg: 'linear-gradient(135deg, #010101, #161823)', accent: '#fe2c55', name: 'TikTok' },
+    pinterest: { bg: 'linear-gradient(135deg, #1f1315, #301317)', accent: '#e60023', name: 'Pinterest' },
+  };
+  const b = brandColors[platform] || { bg: 'linear-gradient(135deg, #1e293b, #334155)', accent: '#6366f1', name: platform };
+  const likesText = item.likes > 0 ? `❤️ ${formatNum(item.likes)}` : '';
+  const commentsText = item.comments > 0 ? `💬 ${formatNum(item.comments)}` : '';
+  const stats = [likesText, commentsText].filter(Boolean).join(' · ');
+
+  return `<div class="w-100 h-100 p-3 d-flex flex-column justify-content-between text-white" style="background:${b.bg};box-sizing:border-box;user-select:none;min-height:180px">
+    <div class="d-flex align-items-center justify-content-between gap-1">
+      <div class="d-flex align-items-center gap-2 overflow-hidden">
+        <div style="width:22px;height:22px;border-radius:50%;background:${b.accent};display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:11px;flex-shrink:0">${escapeHtml(initial)}</div>
+        <span class="fs-12 fw-bold text-truncate" style="max-width:110px">${escapeHtml(author)}</span>
+      </div>
+      <span class="badge" style="background:rgba(255,255,255,0.15);font-size:10px;font-weight:600">${escapeHtml(b.name)}</span>
+    </div>
+    <div class="my-auto py-1" style="font-size:13px;line-height:1.35;font-weight:600;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;color:#f3f4f6">
+      ${escapeHtml(title)}
+    </div>
+    <div class="d-flex align-items-center justify-content-between fs-11 text-white-50 border-top border-white-10 pt-1 mt-1">
+      <span>${escapeHtml(stats || '📄 Post Preview')}</span>
+      <span style="font-size:9px;opacity:0.7">📸 Capture</span>
+    </div>
+  </div>`;
+}
+
+function formatCommas(num) {
+  if (num === null || num === undefined || num === '') return '0';
+  const n = Number(num);
+  if (isNaN(n)) return String(num);
+  return n.toLocaleString('en-US');
+}
+
+function formatTimeAgo(dateInput) {
+  if (!dateInput) return '—';
+  const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  if (isNaN(d.getTime())) return String(dateInput);
+  const now = new Date();
+  const diffSec = Math.max(0, Math.floor((now.getTime() - d.getTime()) / 1000));
+  if (diffSec < 60) return 'Just now';
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin} min${diffMin > 1 ? 's' : ''} ago`;
+  const diffHours = Math.floor(diffMin / 60);
+  if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 30) return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
+  const diffMonths = Math.floor(diffDays / 30);
+  if (diffMonths < 12) return `${diffMonths} month${diffMonths > 1 ? 's' : ''} ago`;
+  const diffYears = Math.floor(diffDays / 365);
+  return `${diffYears} year${diffYears > 1 ? 's' : ''} ago`;
+}
+
+function renderStarRating(rating, reviews) {
+  const r = Number(rating) || 0;
+  const rev = Number(reviews) || 0;
+  if (r <= 0 && rev <= 0) return '';
+  const normalized = r > 5 ? (r / 20) : r;
+  const starCount = Math.min(5, Math.max(1, Math.round(normalized > 0 ? normalized : 5)));
+  const starsHtml = '★'.repeat(starCount);
+  return `
+    <div class="item-rating-row">
+      <span class="stars" title="${normalized > 0 ? normalized.toFixed(1) : '5.0'} / 5">${starsHtml}</span>
+      <span class="review-count">(${formatCommas(rev)})</span>
+    </div>`;
+}
+
+function renderItemMetricsBox(item) {
+  const isEcommerce = ['amazon', 'ebay', 'etsy', 'shopify', 'google_shopping', 'tiktok_shop'].includes(item.platform);
+  const isFacebookAds = item.platform === 'facebook_ads';
+  const isReddit = item.platform === 'reddit';
+  const isTwitter = item.platform === 'twitter';
+
+  const rows = [];
+
+  if (isEcommerce) {
+    // Row 1: Views or Sold
+    const viewsVal = Number(item.views || 0);
+    const soldVal = Number(item.sold_count || item.soldCount || 0);
+    if (viewsVal > 0) {
+      rows.push({ label: 'Views', val: formatCommas(viewsVal), cls: 'val-red' });
+    } else if (soldVal > 0) {
+      rows.push({ label: 'Sold', val: formatCommas(soldVal), cls: 'val-red' });
+    } else {
+      rows.push({ label: 'Views', val: '—', cls: 'val-red' });
+    }
+
+    // Row 2: Daily views or Daily sales
+    const dailyViews = Number(item.delta_24h_views || item.delta_views || item.growth?.views || 0);
+    const dailySold = Number(item.delta_24h_sold || item.growth?.soldCount || 0);
+    if (dailyViews !== 0) {
+      rows.push({ label: 'Daily views', val: formatCommas(dailyViews), cls: 'val-red' });
+    } else if (dailySold !== 0) {
+      rows.push({ label: 'Daily sales', val: formatCommas(dailySold), cls: 'val-red' });
+    } else {
+      rows.push({ label: 'Daily views', val: '0', cls: 'val-red' });
+    }
+
+    // Row 3: Favorers (Etsy) / Watchers (eBay) / Likes / Saves
+    const favLabel = item.platform === 'etsy' ? 'Favorers' : (item.platform === 'ebay' ? 'Watchers' : 'Likes');
+    const favVal = Number(item.likes || item.saves || item.reviews || 0);
+    rows.push({ label: favLabel, val: formatCommas(favVal), cls: 'val-blue' });
+
+    // Row 4: Created
+    const createdDate = item.first_seen_at || item.startDate || item.created_at;
+    rows.push({ label: 'Created', val: formatTimeAgo(createdDate), cls: 'val-teal' });
+
+    // Row 5: Updated
+    const updatedDate = item.last_crawled_at || item.last_seen_at || item.created_at;
+    rows.push({ label: 'Updated', val: formatTimeAgo(updatedDate), cls: 'val-teal' });
+
+  } else if (isFacebookAds) {
+    // Row 1: Số QC (Collations)
+    rows.push({ label: 'Số QC', val: formatCommas(item.adCount ?? 1), cls: 'val-red' });
+
+    // Row 2: Fanpage Likes
+    rows.push({ label: 'Fanpage Likes', val: formatCommas(item.fanpageLikes || item.likes || 0), cls: 'val-blue' });
+
+    // Row 3: Views
+    const viewsStr = Number(item.views) > 0 ? formatCommas(item.views) : 'Meta N/A';
+    rows.push({ label: 'Views', val: viewsStr, cls: 'val-orange' });
+
+    // Row 4: Bắt đầu
+    rows.push({ label: 'Bắt đầu', val: formatTimeAgo(item.startDate || item.first_seen_at), cls: 'val-teal' });
+
+    // Row 5: Updated
+    rows.push({ label: 'Updated', val: formatTimeAgo(item.last_crawled_at || item.last_seen_at || item.created_at), cls: 'val-teal' });
+
+  } else if (isReddit) {
+    // Row 1: Upvotes / Score
+    rows.push({ label: 'Upvotes', val: formatCommas(item.likes || 0), cls: 'val-red' });
+
+    // Row 2: Comments
+    rows.push({ label: 'Comments', val: formatCommas(item.comments || 0), cls: 'val-blue' });
+
+    // Row 3: Subreddit
+    rows.push({ label: 'Subreddit', val: item.subreddit ? 'r/' + escapeHtml(item.subreddit) : '—', cls: 'val-teal' });
+
+    // Row 4: Created
+    rows.push({ label: 'Created', val: formatTimeAgo(item.first_seen_at || item.created_at), cls: 'val-teal' });
+
+    // Row 5: Updated
+    rows.push({ label: 'Updated', val: formatTimeAgo(item.last_crawled_at || item.last_seen_at || item.created_at), cls: 'val-teal' });
+
+  } else if (isTwitter) {
+    // Row 1: Views
+    rows.push({ label: 'Views', val: formatCommas(item.views || 0), cls: 'val-red' });
+
+    // Row 2: Likes
+    rows.push({ label: 'Likes', val: formatCommas(item.likes || 0), cls: 'val-blue' });
+
+    // Row 3: Replies
+    rows.push({ label: 'Replies', val: formatCommas(item.comments || 0), cls: 'val-orange' });
+
+    // Row 4: Retweets
+    rows.push({ label: 'Retweets', val: formatCommas(item.shares || 0), cls: 'val-blue' });
+
+    // Row 5: Updated
+    rows.push({ label: 'Updated', val: formatTimeAgo(item.last_crawled_at || item.last_seen_at || item.created_at), cls: 'val-teal' });
+
+  } else {
+    // Social fallback (TikTok videos, Instagram, Pinterest, etc.)
+    rows.push({ label: 'Views', val: formatCommas(item.views || 0), cls: 'val-red' });
+    rows.push({ label: 'Likes', val: formatCommas(item.likes || 0), cls: 'val-blue' });
+    rows.push({ label: 'Comments', val: formatCommas(item.comments || 0), cls: 'val-orange' });
+    rows.push({ label: 'Shares / Saves', val: formatCommas(item.shares || item.saves || 0), cls: 'val-blue' });
+    rows.push({ label: 'Updated', val: formatTimeAgo(item.last_crawled_at || item.last_seen_at || item.created_at), cls: 'val-teal' });
+  }
+
+  const rowsHtml = rows.map(r => `
+    <div class="metric-row">
+      <span class="metric-label">${r.label}</span>
+      <span class="metric-val ${r.cls}">${r.val}</span>
+    </div>
+  `).join('');
+
+  return `<div class="item-metrics-box">${rowsHtml}</div>`;
+}
+
+/*
+ * The card's metric form. Every number the card reports is a row here — label
+ * on the left, value on the right, one per line.
+ *
+ * TikTok Shop's return position / 30-day sales / GMV and Facebook Ads' ad count
+ * / views / countries used to sit OUTSIDE this box, on horizontal lines under
+ * the price ("#7 return position ▲3 · 30d: 913 · GMV $11.4K"). They are rows
+ * now, which is the whole point of the change — but they are the same numbers,
+ * movement arrow included.
+ *
+ * buildItemMetricRows() decides WHICH rows exist (public/item-metric-rows.js,
+ * pinned by test/item-metric-rows.test.js); this function only decides how one
+ * looks.
+ */
+function renderItemMetricForm(item) {
+  const rows = buildItemMetricRows(item, { formatCommas, formatNum, formatTimeAgo, escapeHtml });
+
+  const rowsHtml = rows.map((r) => {
+    const change = r.change
+      ? `<span class="metric-change ${r.change.direction === 'up' ? 'growth-up' : 'growth-down'}">${
+          r.change.direction === 'up' ? '▲' : '▼'} ${formatNum(r.change.amount)}</span>`
+      : '';
+    return `
+      <div class="metric-row">
+        <span class="metric-label">${r.label}</span>
+        <span class="metric-val ${r.cls}">${r.value}${change}</span>
+      </div>`;
+  }).join('');
+
+  return `<div class="item-metrics-box">${rowsHtml}</div>`;
+}
 
 function renderItems(items) {
   const grid = document.getElementById('items-grid');
@@ -278,7 +879,11 @@ function renderItems(items) {
 
   grid.innerHTML = items.map((item) => {
     const config = allPlatforms.find((p) => p.name === item.platform);
-    const tagClass = `tag-${item.platform}`;
+    // Same accessor the pill uses, so the badge on a card and the pill that
+    // filters to it are the same colour by construction rather than by two
+    // tables happening to agree. The old `tag-${platform}` class pointed at a
+    // hardcoded style.css table that has been deleted.
+    const tagColor = platformColor(item.platform);
     const icon = config?.icon || '🔗';
     const platformLabel = config?.displayName || item.platform;
     // A post can be one image, a video, or a carousel of mixed media; the cover
@@ -296,106 +901,93 @@ function renderItems(items) {
           : `<span class="item-media-badge" title="Carousel">▣ ${mediaCount || ''}</span>`)
         : '';
     const cardImage = item.image
-      ? `<img src="${escapeAttr(item.image)}" alt="${escapeAttr(item.title || platformLabel)}" style="width:100%;height:100%;object-fit:cover" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('div'), { className: 'item-img-placeholder', textContent: 'No image' }))">${mediaBadge}`
-      : `<div class="item-img-placeholder">No image</div>${mediaBadge}`;
+      ? `<img src="${escapeAttr(item.image)}" alt="${escapeAttr(item.title || platformLabel)}" style="width:100%;height:100%;object-fit:cover" referrerpolicy="no-referrer" onerror="this.onerror=null; this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' viewBox=\\'0 0 600 360\\' width=\\'600\\' height=\\'360\\'><rect width=\\'100%\\' height=\\'100%\\' fill=\\'%231f2937\\'/><text x=\\'50%\\' y=\\'45%\\' fill=\\'%239ca3af\\' font-size=\\'16\\' font-family=\\'sans-serif\\' text-anchor=\\'middle\\'>Image Unavailable</text><text x=\\'50%\\' y=\\'60%\\' fill=\\'%236b7280\\' font-size=\\'12\\' font-family=\\'sans-serif\\' text-anchor=\\'middle\\'>CDN Link Expired</text></svg>'">${mediaBadge}`
+      : `${renderItemCapturePreview(item)}${mediaBadge}`;
 
     // Status badge
     const statusBadge = getStatusBadge(item.status, item);
 
     // Growth indicators
-    const growthHtml = renderGrowth(item.growth);
     const isTiktokShop = item.platform === 'tiktok_shop';
     const isTwitter = item.platform === 'twitter';
     const isEcommerce = ['amazon', 'ebay', 'etsy', 'shopify', 'google_shopping', 'tiktok_shop'].includes(item.platform);
-
-    const priceHtml = item.price > 0
-      ? `<div class="item-price">$${item.price.toFixed(2)} ${growthHtml.priceChange}</div>`
-      : '';
-
     const isFacebookAds = item.platform === 'facebook_ads';
     const isReddit = item.platform === 'reddit';
+
+    // Image bottom bar (More colors or media info matching Etsy spy)
+    let imgBottomBar = '';
+    if (item.mediaType === 'video') {
+      imgBottomBar = '<div class="img-bottom-bar">▶ Video</div>';
+    } else if (item.mediaType === 'carousel') {
+      imgBottomBar = `<div class="img-bottom-bar">▣ ${mediaCount || 2} phiên bản</div>`;
+    } else if (isEcommerce) {
+      imgBottomBar = '<div class="img-bottom-bar">More colors</div>';
+    }
+
+    // Author / Shop row ("Ad by [Shop]" or author)
+    const authorText = item.author ? escapeHtml(item.author) : (isEcommerce ? 'store' : '');
+    const authorHtml = authorText
+      ? `<div class="item-author-row">Ad by <span class="fw-semibold text-dark">${authorText}</span></div>`
+      : '';
+
+    // Star rating row: ★★★★★ (2,005)
+    const starRatingHtml = (isEcommerce || item.rating > 0 || item.reviews > 0)
+      ? renderStarRating(item.rating, item.reviews || item.reviewCount)
+      : '';
+
+    // Price & Badges row
+    let priceBadgesHtml = '';
+    if (item.price > 0 || isEcommerce) {
+      const priceVal = item.price > 0 ? `$${Number(item.price).toFixed(2)}` : '';
+      let discountHtml = '';
+      if (item.original_price && Number(item.original_price) > Number(item.price)) {
+        const discount = Math.round(((Number(item.original_price) - Number(item.price)) / Number(item.original_price)) * 100);
+        discountHtml = ` <span class="original">$${Number(item.original_price).toFixed(2)}</span> <span class="discount">(${discount}% off)</span>`;
+      }
+      let badges = '';
+      if (item.freeShipping || item.free_shipping || item.shipping === 0) {
+        badges += `<span class="badge-shipping">FREE shipping</span>`;
+      }
+      if (item.isBestseller || item.bestseller || (item.badge && String(item.badge).toLowerCase().includes('bestseller'))) {
+        badges += `<span class="badge-bestseller">🏷️ Bestseller</span>`;
+      } else if (item.badge && !String(item.badge).toLowerCase().includes('shipping')) {
+        badges += `<span class="badge-bestseller">${escapeHtml(item.badge)}</span>`;
+      }
+
+      priceBadgesHtml = `
+        <div class="item-price-badges">
+          <div class="d-flex align-items-center flex-wrap gap-1">
+            ${priceVal ? `<div class="item-price">${priceVal}${discountHtml}</div>` : ''}
+            ${badges}
+          </div>
+        </div>`;
+    }
 
     const platformsList = Array.isArray(item.publisherPlatforms) && item.publisherPlatforms.length > 0 ? item.publisherPlatforms : ['FACEBOOK'];
     const platformBadgesHtml = isFacebookAds
       ? `<div class="mt-1 d-flex flex-wrap gap-1">${platformsList.map(p => `<span class="badge bg-secondary-subtle text-dark" style="font-size:10px">${p.replace(/_/g, ' ')}</span>`).join('')}</div>`
       : '';
 
-    const startStr = isFacebookAds && item.startDate ? parseServerTimestamp(item.startDate).toLocaleDateString() : '';
-    const dateHtml = startStr ? `<div class="fs-11 text-muted mt-1">📅 Bắt đầu: ${startStr}</div>` : '';
-
-    // Task 4: ad count and active countries come straight from the provider.
-    // Both render as SOURCE_NOT_AVAILABLE when it reported nothing — Meta only
-    // publishes those for political / social-issue ads, and showing "0 ads" or
-    // the search country instead would be inventing data.
-    const adMetaHtml = isFacebookAds
-      ? `<div class="fs-11 text-muted mt-1 d-flex flex-column gap-1">
-           ${adFieldHtml('🧾', 'Số QC', adCountHtml(item))}
-           ${adFieldHtml('👁', 'Views', Number(item.views) > 0 ? `<strong>${formatNum(item.views)}</strong>` : metaNotDisclosed())}
-           ${adFieldHtml('🌍', 'Quốc gia', Array.isArray(item.activeCountries) && item.activeCountries.length
-             ? `<strong>${item.activeCountries.map((c) => escapeHtml(c)).join(', ')}</strong>`
-             : metaNotDisclosed())}
-         </div>`
-      : '';
-
-    // Task 5.6: position movement and sales growth, the two things a daily
-    // Top-20 job exists to surface. A POSITIVE returnPositionChange means the
-    // product moved UP (its position number got smaller).
-    const posChange = item.returnPositionChange;
-    const posHtml = isTiktokShop && item.returnPosition
-      ? `<div class="fs-11 text-muted mt-1">#${item.returnPosition} <span class="text-muted">return position</span>${
-          posChange === null || posChange === undefined || posChange === 0
-            ? ''
-            : posChange > 0
-              ? ` <span class="growth-up">▲ ${posChange}</span>`
-              : ` <span class="growth-down">▼ ${Math.abs(posChange)}</span>`
-        }${item.sold30d ? ` · <span title="Sold in the last 30 days">30d: ${formatNum(item.sold30d)}</span>` : ''}${
-          item.gmv ? ` · <span title="Gross merchandise value">GMV $${formatNum(item.gmv)}</span>` : ''
-        }</div>`
-      : '';
-
-    const engagementHtml = isTiktokShop
-      ? `<div class="item-engagement">
-          <div class="engagement-stat" title="Số Lượng Đã Bán"><i data-feather="shopping-bag"></i><span class="eng-val">${formatNum(item.sold_count || item.soldCount || 0)}</span> <span class="fs-10 text-muted">đã bán</span>${growthHtml.soldCount}</div>
-          <div class="engagement-stat" title="Điểm Đánh Giá"><i data-feather="star"></i><span class="eng-val">${item.rating > 0 ? `★ ${Number(item.rating).toFixed(1)}` : '—'}</span>${growthHtml.rating}</div>
-          <div class="engagement-stat commented" title="Số Lượng Review"><i data-feather="message-square"></i><span class="eng-val">${formatNum(item.reviews || item.reviewCount || 0)}</span> <span class="fs-10 text-muted">reviews</span>${growthHtml.reviews}</div>
-        </div>`
-      : isTwitter
-      ? `<div class="item-engagement">
-          <div class="engagement-stat liked" title="Số Likes"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes || 0)}</span> <span class="fs-10 text-muted">likes</span>${growthHtml.likes}</div>
-          <div class="engagement-stat commented" title="Số Replies"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments || 0)}</span> <span class="fs-10 text-muted">replies</span>${growthHtml.comments}</div>
-          <div class="engagement-stat" title="Số Views"><i data-feather="eye"></i><span class="eng-val">${formatNum(item.views || 0)}</span> <span class="fs-10 text-muted">views</span>${growthHtml.views}</div>
-        </div>`
-      : isEcommerce
-      ? `<div class="item-engagement">
-          <div class="engagement-stat liked" title="Yêu thích / Likes"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes || item.reviews || 0)}</span>${growthHtml.likes}</div>
-          <div class="engagement-stat" title="Tổng số Review"><i data-feather="message-square"></i><span class="eng-val">${formatNum(item.reviews || 0)}</span>${growthHtml.reviews}</div>
-          <div class="engagement-stat" title="Điểm Đánh Giá / Feedback Score"><i data-feather="star"></i><span class="eng-val">${item.rating > 0 ? (item.rating > 5 ? `★ ${Number(item.rating).toFixed(1)}%` : `★ ${Number(item.rating).toFixed(1)}`) : '—'}</span>${growthHtml.rating}</div>
-          ${(item.sold_count > 0 || item.soldCount > 0) ? `<div class="engagement-stat" title="Lượt Bán"><i data-feather="shopping-bag"></i><span class="eng-val">${formatNum(item.sold_count || item.soldCount)}</span>${growthHtml.soldCount}</div>` : ''}
-        </div>`
-      : isFacebookAds
-      ? `<div class="item-engagement">
-          <div class="engagement-stat liked" title="Lượt Thích Fanpage"><i data-feather="thumbs-up"></i><span class="eng-val">${formatNum(item.fanpageLikes || item.likes || 0)}</span> <span class="fs-10 text-muted">Fanpage Likes</span></div>
-          ${item.cta ? `<div class="engagement-stat"><span class="badge bg-primary text-white" style="font-size:10px">${escapeHtml(item.cta)}</span></div>` : ''}
-        </div>`
-      : isReddit
-      ? `<div class="item-engagement">
-          <div class="engagement-stat" title="Subreddit"><i data-feather="hash"></i><span class="eng-val">${item.subreddit ? 'r/' + escapeHtml(item.subreddit) : '—'}</span></div>
-          <div class="engagement-stat commented" title="Tổng số Comment"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments || 0)}</span>${growthHtml.comments}</div>
-          <div class="engagement-stat liked" title="Upvote Score"><i data-feather="arrow-up"></i><span class="eng-val">${formatNum(item.likes || 0)}</span>${growthHtml.likes}</div>
-        </div>`
-      : `<div class="item-engagement">
-          <div class="engagement-stat liked" title="Likes / Reactions"><i data-feather="heart"></i><span class="eng-val">${formatNum(item.likes || 0)}</span>${growthHtml.likes}</div>
-          <div class="engagement-stat commented" title="Comments"><i data-feather="message-circle"></i><span class="eng-val">${formatNum(item.comments || 0)}</span>${growthHtml.comments}</div>
-          <div class="engagement-stat shared" title="Shares / Repins"><i data-feather="share-2"></i><span class="eng-val">${formatNum(item.shares || 0)}</span>${growthHtml.shares}</div>
-          ${Number(item.saves) > 0 ? `<div class="engagement-stat saved" title="Lưu / Saves — TikTok collectCount, đếm riêng với Shares"><i data-feather="bookmark"></i><span class="eng-val">${formatNum(item.saves)}</span></div>` : ''}
-          <div class="engagement-stat" title="Views"><i data-feather="eye"></i><span class="eng-val">${formatNum(item.views || 0)}</span>${growthHtml.views}</div>
-        </div>`;
+    /*
+     * Three horizontal lines used to live here and are gone, because every value
+     * they carried is now a row in the metric form below:
+     *
+     *   dateHtml   "📅 Bắt đầu: 01/09/2026"            -> "Bắt đầu" row
+     *   adMetaHtml "🧾 Số QC / 👁 Views / 🌍 Quốc gia"   -> three rows
+     *   posHtml    "#7 return position ▲3 · 30d: 913
+     *               · GMV $11.4K"                      -> three rows, arrow kept
+     *
+     * Nothing was dropped in the move — test/item-metric-rows.test.js asserts
+     * each of those metrics is still produced for its platform.
+     */
+    const metricFormHtml = renderItemMetricForm(item);
 
     return `
       <div class="item-card" onclick="showItemDetail('${escapeAttr(item.item_uid)}')">
         <div class="item-img">
           ${cardImage}
-          <span class="platform-tag ${tagClass}">${platformLabel}</span>
+          ${imgBottomBar}
+          <span class="platform-tag" data-platform="${escapeAttr(item.platform)}" style="background:${tagColor};color:#fff">${platformBadge(item.platform, { size: 11, variant: 'inline' })}</span>
           ${statusBadge}
           <button class="btn-card-delete" onclick="deleteSingleItem(event, '${escapeAttr(item.item_uid)}')" title="Xóa sản phẩm này">
             <i data-feather="trash-2" style="width:14px;height:14px"></i>
@@ -403,15 +995,12 @@ function renderItems(items) {
         </div>
         <div class="item-body">
           <div class="item-title" title="${escapeAttr(item.title)}">${escapeHtml(item.title) || '<em>No title</em>'}</div>
-          ${item.author ? `<div class="item-source fw-bold">${escapeHtml(item.author)}</div>` : ''}
-          ${priceHtml}
-          ${renderProductMetrics(item)}
+          ${authorHtml}
+          ${starRatingHtml}
+          ${priceBadgesHtml}
           ${platformBadgesHtml}
-          ${dateHtml}
-          ${posHtml}
-          ${adMetaHtml}
+          ${metricFormHtml}
         </div>
-        ${engagementHtml}
       </div>`;
   }).join('');
   feather.replace();
@@ -563,7 +1152,7 @@ async function showItemDetail(itemUid) {
     const isEcommerce = ['amazon', 'ebay', 'etsy', 'shopify', 'google_shopping', 'tiktok_shop'].includes(latest.platform);
 
     document.getElementById('item-modal-title').innerHTML = `
-      ${config?.icon || '🔗'} ${escapeHtml(latest.title || 'Untitled')}
+      ${platformBadge(latest.platform, { size: 16, variant: 'inline', showName: false })} ${escapeHtml(latest.title || 'Untitled')}
       ${getStatusBadge(latest.status, latest)}
     `;
 
@@ -911,9 +1500,15 @@ function renderCrawlFilterBoxes(platformName) {
         <span>${escapeHtml(m.label)}</span>
       </label>`).join('');
   }
+  // The ticks are re-rendered unchecked, so the threshold that was typed for
+  // them must go too — leaving "1000" behind while the boxes it applied to are
+  // gone is a filter armed against nothing.
+  const min = document.getElementById('crawl-filter-min');
+  if (min) min.value = '';
   if (hint) {
     hint.innerHTML = `Chỉ số của <strong>${escapeHtml(label)}</strong>. Tích ô nào thì crawl theo tiêu chí đó, lấy cao nhất trước. `
-      + 'Tích nhiều ô = sản phẩm phải đạt tất cả. Bỏ trống = crawl như bình thường.';
+      + 'Tích nhiều ô = sản phẩm phải đạt tất cả. Bỏ trống = crawl như bình thường. '
+      + 'Điền <strong>Giá trị tối thiểu</strong> để chỉ lấy item đạt từ mức đó trở lên ở <strong>mọi</strong> ô đã tích.';
   }
   updateCrawlFilterSummary();
   setCrawlFilterMessage('', 'info');
@@ -923,19 +1518,57 @@ function collectCrawlSelection() {
   return [...document.querySelectorAll('#crawl-filter-boxes input[type=checkbox]:checked')].map((el) => el.value);
 }
 
+/**
+ * The minimum-value box, read as a decision rather than as a number.
+ *
+ * Returns { empty, value, error }:
+ *   empty        — nothing typed. Today's behaviour exactly: a ticked metric
+ *                  only has to be REPORTED, and the highest come first.
+ *   value        — a finite number >= 0. Every ticked metric must be >= it.
+ *   error        — the box holds something that cannot be a threshold. It is
+ *                  NEVER silently ignored: a crawl that quietly dropped the
+ *                  number the user typed would report success having applied a
+ *                  filter the user did not ask for.
+ */
+function readCrawlMinValue() {
+  const el = document.getElementById('crawl-filter-min');
+  const raw = String(el?.value ?? '').trim();
+  if (raw === '') return { empty: true, value: null, error: null };
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return { empty: false, value: null, error: `Giá trị tối thiểu không phải là số: "${raw}".` };
+  if (value < 0) return { empty: false, value: null, error: `Giá trị tối thiểu không được âm: ${raw}.` };
+  return { empty: false, value, error: null };
+}
+
 function onCrawlFilterChange() {
   updateCrawlFilterSummary();
+  const selected = collectCrawlSelection();
+  const min = readCrawlMinValue();
+  // Say what is wrong the moment it becomes wrong, instead of waiting for the
+  // Crawl Now click to refuse.
+  if (min.error) { setCrawlFilterMessage(escapeHtml(min.error), 'error'); return; }
+  if (!min.empty && selected.length === 0) {
+    setCrawlFilterMessage(
+      `Đã nhập tối thiểu <strong>${escapeHtml(String(min.value))}</strong> nhưng chưa tích chỉ số nào — `
+      + 'hãy tích ít nhất một chỉ số để biết áp ngưỡng này vào đâu.',
+      'warn',
+    );
+    return;
+  }
   setCrawlFilterMessage('', 'info');
 }
 
 // The count rides on the collapsed button, so closing the panel never hides
-// the fact that a filter is armed for the next crawl.
+// the fact that a filter is armed for the next crawl. The threshold rides with
+// it for the same reason.
 function updateCrawlFilterSummary() {
   const el = document.getElementById('crawl-filter-summary');
   if (!el) return;
   const selected = collectCrawlSelection();
+  const min = readCrawlMinValue();
   const labelFor = (n) => crawlFilterMetrics.find((m) => m.name === n)?.label || n;
-  el.textContent = selected.length ? `· ${selected.map(labelFor).join(' + ')}` : '';
+  const suffix = (!min.empty && min.error === null) ? ` ≥ ${formatNum(min.value)}` : '';
+  el.textContent = selected.length ? `· ${selected.map(labelFor).join(' + ')}${suffix}` : '';
   el.classList.toggle('active', selected.length > 0);
 }
 
@@ -965,7 +1598,19 @@ function renderCrawlFilterOutcome(run) {
   if (!outcome) return;
 
   const labelFor = (n) => crawlFilterMetrics.find((m) => m.name === n)?.label || n;
-  const summary = (outcome.metrics || []).map((n) => escapeHtml(labelFor(n))).join(' + ');
+  // The threshold is read back from what the SERVER stored, not from the box
+  // still sitting in the browser: crawlFilter.conditions is the record of what
+  // was actually evaluated, and `metricMin` alongside it is the number the user
+  // typed. Showing the box's value instead would claim a filter ran even if the
+  // server had refused or reshaped it.
+  const OPS = { gte: '≥', gt: '>', lte: '≤', lt: '<', eq: '=', ne: '≠' };
+  const conditions = Array.isArray(outcome.conditions) ? outcome.conditions : [];
+  const byField = new Map(conditions.map((c) => [c.field, c]));
+  const named = (outcome.metrics || []).length ? outcome.metrics : conditions.map((c) => c.field);
+  const summary = named.map((n) => {
+    const cond = byField.get(n);
+    return escapeHtml(labelFor(n)) + (cond ? ` ${OPS[cond.operator] || cond.operator} ${escapeHtml(String(cond.value))}` : '');
+  }).join(' + ');
   const rejects = (outcome.rejectedReasons || []).slice(0, 5)
     .map((r) => `<li>${escapeHtml(r.reasons.join('; '))}</li>`)
     .join('');
@@ -983,6 +1628,10 @@ async function showCollectModal() {
   collectPlatform = null;
   document.getElementById('collect-query').value = '';
   document.getElementById('collect-query-label').textContent = 'Search Query';
+  const keywordPlan = document.getElementById('collect-keyword-plan');
+  if (keywordPlan) { keywordPlan.className = 'keyword-plan'; keywordPlan.innerHTML = ''; }
+  const maxLabel = document.getElementById('collect-max-label');
+  if (maxLabel) maxLabel.textContent = 'Max Items';
   document.getElementById('collect-platform-fields').innerHTML = '';
   document.getElementById('collect-hint').textContent = '';
   document.getElementById('collect-start').disabled = true;
@@ -1029,8 +1678,8 @@ function renderPlatformGrid() {
         healthBadge = '<span class="badge bg-dark text-white ms-1" style="font-size:9px">UNSUPPORTED</span>';
       }
     }
-    return `<div class="platform-option ${isFailed ? 'disabled text-muted' : ''}" data-platform="${p.name}" onclick="selectCollectPlatform('${p.name}', this)">
-      <span class="po-icon">${p.icon}</span> ${p.displayName}
+    return `<div class="platform-option ${isFailed ? 'disabled text-muted' : ''}" data-platform="${p.name}" style="box-shadow:inset 0 0 0 1px ${p.color}55" onclick="selectCollectPlatform('${p.name}', this)">
+      <span class="po-icon">${platformBadge(p.name, { size: 14, variant: 'inline', showName: false })}</span> ${p.displayName}
       ${p.paid ? '<span class="badge bg-warning text-dark ms-1" style="font-size:9px">PAID</span>' : ''}
       ${healthBadge}
     </div>`;
@@ -1044,7 +1693,11 @@ function selectCollectPlatform(name, el) {
   const config = allPlatforms.find((p) => p.name === name);
   const queryField = config?.queryField || { label: 'Search Query', placeholder: config?.queryType === 'url' ? 'Enter store URL...' : 'Enter keyword...' };
   document.getElementById('collect-query-label').textContent = queryField.label || 'Search Query';
-  document.getElementById('collect-query').type = queryField.type || 'text';
+  // #collect-query is a <textarea> since the multi-keyword change (one keyword
+  // per line), so it has no `type` to set — the platform's declared field type
+  // now only shapes the placeholder. A URL-type field (shopify storeUrl) still
+  // works unchanged with one line, and accepts several store URLs the same way
+  // a keyword field accepts several keywords.
   document.getElementById('collect-query').placeholder = queryField.placeholder || 'Enter keyword...';
   renderPlatformFields(config, queryField.id);
   // Task 3: the crawl filter offers the metric set this platform's normalizer
@@ -1113,35 +1766,152 @@ function getPlatformFieldValues() {
   return values;
 }
 
+// TASK-2 multi-keyword. Mirrors src/collection-inputs.js parseKeywordList()
+// exactly: split on line breaks (NEVER commas — a real keyword often contains
+// one), trim, drop blank lines, drop case-insensitive duplicates keeping the
+// first spelling. The server re-parses and is the authority; this copy only
+// drives the preview and the button state.
+const MAX_CRAWL_KEYWORDS_UI = 50;
+
+function parseCollectKeywords() {
+  const raw = document.getElementById('collect-query').value;
+  const keywords = [];
+  const duplicates = [];
+  const seen = new Set();
+  for (const line of String(raw).split(/\r?\n/)) {
+    const keyword = line.trim();
+    if (keyword === '') continue;
+    const key = keyword.toLowerCase();
+    if (seen.has(key)) { duplicates.push(keyword); continue; }
+    seen.add(key);
+    keywords.push(keyword);
+  }
+  return { keywords, duplicates };
+}
+
+// States exactly what pressing "Crawl Now" will do, BEFORE it is pressed: how
+// many tasks, the per-keyword item budget, and anything that was dropped or
+// refused. Rules §"no silent buttons": a rejected input must name its reason.
+function renderKeywordPlan() {
+  const el = document.getElementById('collect-keyword-plan');
+  const maxLabel = document.getElementById('collect-max-label');
+
+  /*
+   * Parse FIRST, and never let a missing display element change the answer.
+   *
+   * This used to early-return `{ keywords: [] }` when #collect-keyword-plan was
+   * absent. updateCollectBtn() takes its `query` from keywords[0], so the moment
+   * that one presentational div went missing from index.html the Crawl Now
+   * button reported "no keyword" for every input and stayed permanently
+   * disabled — a click did nothing and said nothing. Whether a preview box
+   * exists is a question about the page, not about what the user typed.
+   */
+  const { keywords, duplicates } = parseCollectKeywords();
+  const maxItems = parseInt(document.getElementById('collect-max').value, 10) || 20;
+  const notes = [];
+  let blocked = false;
+
+  if (duplicates.length > 0) {
+    notes.push(`<span class="keyword-plan-warn">Bỏ ${duplicates.length} từ khoá trùng: ${duplicates.map(escapeHtml).join(', ')}</span>`);
+  }
+
+  // "Too many keywords" is a real refusal and must hold whether or not there is
+  // a box to explain it in, so it is decided before any rendering.
+  if (keywords.length > MAX_CRAWL_KEYWORDS_UI) blocked = true;
+
+  if (el) {
+    if (blocked) {
+      el.className = 'keyword-plan keyword-plan-error';
+      el.innerHTML = `Quá nhiều từ khoá: ${keywords.length}. Tối đa ${MAX_CRAWL_KEYWORDS_UI} từ khoá mỗi lượt crawl (mỗi dòng một từ khoá).`;
+    } else if (keywords.length > 1) {
+      el.className = 'keyword-plan keyword-plan-info';
+      el.innerHTML = `<strong>${keywords.length} từ khoá → ${keywords.length} task</strong>, mỗi task tối đa <strong>${maxItems}</strong> item `
+        + `(tổng tối đa ${keywords.length * maxItems}). Mỗi worker crawl một từ khoá; số worker chạy cùng lúc vẫn do worker pool + RAM quyết định.`
+        + (notes.length ? `<div>${notes.join('')}</div>` : '')
+        + `<ol class="keyword-plan-list">${keywords.map((k) => `<li>${escapeHtml(k)}</li>`).join('')}</ol>`;
+    } else if (notes.length > 0) {
+      el.className = 'keyword-plan keyword-plan-info';
+      el.innerHTML = notes.join('');
+    } else {
+      el.className = 'keyword-plan';
+      el.innerHTML = '';
+    }
+  }
+
+  if (maxLabel) maxLabel.textContent = keywords.length > 1 ? 'Max Items (mỗi từ khoá)' : 'Max Items';
+  return { keywords, duplicates, blocked };
+}
+
 function updateCollectBtn() {
-  const query = document.getElementById('collect-query').value.trim();
+  const { keywords, blocked } = renderKeywordPlan();
+  const query = keywords[0] || '';
   let hasHealthyBackend = true;
   if (doctorReport && collectPlatform && doctorReport.channels && doctorReport.channels[collectPlatform]) {
      if (doctorReport.channels[collectPlatform].status === 'failed') {
         hasHealthyBackend = false;
      }
   }
-  document.getElementById('collect-start').disabled = !collectPlatform || !query || !hasHealthyBackend;
+  document.getElementById('collect-start').disabled = !collectPlatform || !query || !hasHealthyBackend || blocked;
 }
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('collect-query').addEventListener('input', updateCollectBtn);
+  // Max Items is part of the plan sentence ("N task x M item"), so editing it
+  // must refresh the preview too.
+  document.getElementById('collect-max').addEventListener('input', updateCollectBtn);
   document.getElementById('collect-platform-fields').addEventListener('input', updateCollectBtn);
   document.getElementById('collect-platform-fields').addEventListener('change', updateCollectBtn);
 });
 
 async function startCollect() {
   if (!collectPlatform) return;
-  const query = document.getElementById('collect-query').value.trim();
+  const { keywords, blocked } = renderKeywordPlan();
+  const status0 = document.getElementById('collect-status');
+  if (blocked) {
+    status0.innerHTML = `<small class="text-danger">❌ Quá nhiều từ khoá (tối đa ${MAX_CRAWL_KEYWORDS_UI}). Không có gì được gửi đi.</small>`;
+    return;
+  }
+  if (keywords.length === 0) {
+    status0.innerHTML = '<small class="text-danger">❌ Chưa nhập từ khoá nào. Nhập ít nhất một từ khoá (mỗi dòng một từ khoá).</small>';
+    return;
+  }
+  // `query` stays the single-value field the API has always required; with 2+
+  // keywords the server replaces the parent's display query with the full list
+  // and it is `options.keywords` that drives the fan-out.
+  const query = keywords[0];
   const maxItems = parseInt(document.getElementById('collect-max').value) || 20;
   const country = document.getElementById('collect-country').value;
 
-  // Task 3: a tick box cannot be half-filled, so there is nothing to refuse
-  // here — the panel just states what is about to be applied.
+  // A tick box cannot be half-filled, but the minimum-value box CAN hold
+  // something unusable — and an unusable filter must stop the crawl rather than
+  // be dropped on the way to the server. Nothing is sent in either refusal
+  // case; the panel is opened so the message is not refused behind a collapsed
+  // section.
   const crawlMetrics = collectCrawlSelection();
+  const crawlMin = readCrawlMinValue();
   const crawlMetricLabel = (n) => crawlFilterMetrics.find((m) => m.name === n)?.label || n;
+
+  if (crawlMin.error) {
+    toggleCrawlFilter(true);
+    setCrawlFilterMessage(`❌ ${escapeHtml(crawlMin.error)} Không có gì được gửi đi.`, 'error');
+    status0.innerHTML = '<small class="text-danger">❌ Bộ lọc crawl không hợp lệ — xem chi tiết ở mục "Bộ lọc".</small>';
+    return;
+  }
+  if (!crawlMin.empty && crawlMetrics.length === 0) {
+    toggleCrawlFilter(true);
+    setCrawlFilterMessage(
+      `❌ Đã nhập tối thiểu <strong>${escapeHtml(String(crawlMin.value))}</strong> nhưng chưa tích chỉ số nào. `
+      + 'Ngưỡng này áp vào chỉ số nào thì phải tích chỉ số đó. Không có gì được gửi đi.',
+      'error',
+    );
+    status0.innerHTML = '<small class="text-danger">❌ Bộ lọc crawl thiếu chỉ số cho ngưỡng tối thiểu.</small>';
+    return;
+  }
+
+  const minSuffix = crawlMin.empty ? '' : ` ≥ ${formatNum(crawlMin.value)}`;
   setCrawlFilterMessage(
     crawlMetrics.length
-      ? `Sẽ chỉ lưu item có: ${crawlMetrics.map((n) => escapeHtml(crawlMetricLabel(n))).join(' + ')} (cao nhất trước)`
+      ? `Sẽ chỉ lưu item có: ${crawlMetrics.map((n) => `${escapeHtml(crawlMetricLabel(n))}${minSuffix}`).join(' + ')}`
+        + (crawlMin.empty ? ' (cao nhất trước)' : ' (đạt tất cả, cao nhất trước)')
       : '',
     'info'
   );
@@ -1154,10 +1924,17 @@ async function startCollect() {
   status.innerHTML = `<small class="text-primary">Starting...</small>`;
 
   try {
-    const optionsPayload = { maxItems, country, ...getPlatformFieldValues() };
+    const optionsPayload = { maxItems, country, keywords, ...getPlatformFieldValues() };
     // Sent only when the user ticked something, so an untouched panel keeps
     // the exact previous behaviour (everything crawled is kept).
     if (crawlMetrics.length > 0) optionsPayload.metrics = crawlMetrics;
+    // `metricMin` is a SEPARATE option, not pre-expanded into conditions here:
+    // the server (buildCollectionOptions) turns it into one `>=` condition per
+    // ticked metric, so the pairing of threshold-to-metrics cannot be got wrong
+    // by a client, and `input_options` records both the number the user typed
+    // and the conditions it became. Sent only when a number was typed, so an
+    // untouched box leaves the payload byte-identical to before.
+    if (!crawlMin.empty) optionsPayload.metricMin = crawlMin.value;
     if (collectPlatform === 'toidispy') {
       optionsPayload.section = optionsPayload.section || 'posts';
       optionsPayload.filters = {};
@@ -1167,15 +1944,37 @@ async function startCollect() {
       method: 'POST',
       body: JSON.stringify({ platform: collectPlatform, query, options: optionsPayload }),
     });
-    status.innerHTML = `<small class="text-success">✅ Run #${result.id} started. Polling...</small>`;
+    // Report what the SERVER decided, not what the client guessed: the created
+    // run's own input_options says whether it was accepted as a fan-out.
+    let serverKeywords = [];
+    try {
+      const parsed = typeof result.input_options === 'string' ? JSON.parse(result.input_options || '{}') : (result.input_options || {});
+      if (Array.isArray(parsed.keywords)) serverKeywords = parsed.keywords;
+    } catch (_e) {}
+    status.innerHTML = serverKeywords.length > 1
+      ? `<small class="text-success">✅ Run #${result.id} started — tách thành ${serverKeywords.length} task theo từ khoá. Polling...</small>`
+      : `<small class="text-success">✅ Run #${result.id} started. Polling...</small>`;
 
     const poll = setInterval(async () => {
       try {
         const run = await apiFetch(`/api/runs/${result.id}`);
+        // A fan-out/shard parent sits in 'sharded' while its children run. That
+        // is progress, not a stall — show the per-keyword breakdown instead of
+        // an unexplained "Starting..." that never moves.
+        if (run.status === 'sharded' && Array.isArray(run.children)) {
+          const doneKids = run.children.filter((c) => c.status === 'done').length;
+          const failedKids = run.children.filter((c) => c.status === 'failed' || c.status === 'stuck').length;
+          status.innerHTML = `<small class="text-primary">⏳ ${doneKids}/${run.children.length} task xong`
+            + (failedKids ? `, ${failedKids} lỗi` : '')
+            + ` — ${run.children.map((c) => `#${c.id} ${escapeHtml(c.query)}`).join(' · ')}</small>`;
+        }
         if (run.status === 'done' || run.status === 'failed') {
           clearInterval(poll);
           if (run.status === 'done') {
-            status.innerHTML = `<small class="text-success">✅ Done! ${run.items_count} items (${run.new_count} new, ${run.active_count} active, ${run.dropped_count} dropped)</small>`;
+            const childSummary = Array.isArray(run.children) && run.children.length > 0
+              ? ` qua ${run.children.length} task: ${run.children.map((c) => `${escapeHtml(c.query)} (${c.items_count})`).join(', ')}`
+              : '';
+            status.innerHTML = `<small class="text-success">✅ Done! ${run.items_count} items (${run.new_count} new, ${run.active_count} active, ${run.dropped_count} dropped)${childSummary}</small>`;
             // The run records what the crawl filter did (runs.input_options
             // .crawlFilter). Showing it here answers "why did 5 crawled items
             // become 2 stored" without opening the database.
@@ -1311,31 +2110,83 @@ async function showHistoryModal() {
   await loadJobs();
 }
 
-async function loadJobs() {
-  const tbody = document.getElementById('jobs-tbody');
-  tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4">Loading...</td></tr>';
+// Job History platform filter must reflect the same registry as the rest of
+// the UI (`allPlatforms`, loaded from GET /api/platforms) instead of a
+// hardcoded list, so a newly added platform shows up automatically. Skips
+// rebuilding when already in sync so the user's current selection survives
+// every loadJobs() refresh (called on every filter change).
+function populateJobsFilterPlatforms() {
+  const select = document.getElementById('jobs-filter-platform');
+  if (!select || select.dataset.optionCount === String(allPlatforms.length)) return;
+  const previousValue = select.value;
+  select.innerHTML = ['<option value="">Tất cả</option>']
+    .concat(allPlatforms.map((p) => `<option value="${escapeAttr(p.name)}">${escapeHtml(p.icon || '')} ${escapeHtml(p.displayName || p.name)}</option>`))
+    .join('');
+  select.dataset.optionCount = String(allPlatforms.length);
+  if (previousValue && allPlatforms.some((p) => p.name === previousValue)) select.value = previousValue;
+}
+
+/** Keywords a run was submitted with (fan-out parents only); [] for everything else. */
+function runKeywordList(run) {
   try {
-    const jobs = await apiFetch('/api/runs');
+    const parsed = typeof run.input_options === 'string' ? JSON.parse(run.input_options || '{}') : (run.input_options || {});
+    return Array.isArray(parsed.keywords) ? parsed.keywords : [];
+  } catch (_e) {
+    return [];
+  }
+}
+
+async function loadJobs() {
+  populateJobsFilterPlatforms();
+  const tbody = document.getElementById('jobs-tbody');
+  const countEl = document.getElementById('jobs-filter-count');
+  tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4">Loading...</td></tr>';
+  if (countEl) countEl.textContent = '';
+  try {
+    // Server-side filtering: re-fetch /api/runs with the current dropdown
+    // selections on every call (including the ones triggered by an
+    // onchange="loadJobs()") instead of filtering rows already in the DOM,
+    // so results stay correct even with thousands of runs.
+    const statusValue = document.getElementById('jobs-filter-status')?.value || '';
+    const platformValue = document.getElementById('jobs-filter-platform')?.value || '';
+    const params = new URLSearchParams();
+    if (statusValue) params.set('status', statusValue);
+    if (platformValue) params.set('platform', platformValue);
+    const qs = params.toString();
+    const jobs = await apiFetch(`/api/runs${qs ? `?${qs}` : ''}`);
+    if (countEl) countEl.textContent = `${jobs.length} kết quả`;
     if (!jobs.length) {
       tbody.innerHTML = '<tr><td colspan="8" class="text-center py-4 text-muted">No jobs found.</td></tr>';
       return;
     }
     tbody.innerHTML = jobs.map((j) => {
-      const config = allPlatforms.find((p) => p.name === j.platform);
-      const icon = config?.icon || '🔗';
-      const pName = config?.displayName || j.platform;
       const statusBadge =
         j.status === 'done' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-success py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để xem chi tiết kết quả"><i data-feather="check-circle" style="width: 12px;"></i> Done &nearr;</a>` :
         j.status === 'running' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-primary py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để theo dõi tiến trình"><i data-feather="loader" style="width: 12px;"></i> Running &nearr;</a>` :
         j.status === 'failed' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-danger py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để xem chi tiết nguyên nhân lỗi"><i data-feather="alert-octagon" style="width: 12px;"></i> Failed &nearr;</a>` :
         j.status === 'stuck' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-danger py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Bấm để xem chi tiết lỗi kẹt"><i data-feather="alert-triangle" style="width: 12px;"></i> Stuck &nearr;</a>` :
+        // A parent run split into child tasks (multi-keyword fan-out, or size
+        // shards) is parked as 'sharded' while its children run. Before this it
+        // fell through to the generic "Pending" badge, which read as "nothing is
+        // happening" when in fact N tasks were executing.
+        j.status === 'sharded' ? `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-info py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm" title="Run cha: đã tách thành nhiều task con, đang chờ các task con chạy xong"><i data-feather="git-branch" style="width: 12px;"></i> Đang chạy task con &nearr;</a>` :
         `<a href="/run-detail.html?id=${j.id}" target="_blank" class="btn btn-sm btn-secondary py-0 px-2 fs-12 text-white d-inline-flex align-items-center gap-1 shadow-sm">Pending &nearr;</a>`;
+
+      // Multi-keyword parent/child relationship, read from data already in the
+      // row (`input_options.keywords`, `parent_run_id`) — no extra request.
+      const jobKeywords = runKeywordList(j);
+      const parentBadge = jobKeywords.length > 1
+        ? `<span class="badge bg-info text-dark ms-1" title="${escapeAttr(jobKeywords.join(' | '))}">${jobKeywords.length} từ khoá</span>`
+        : '';
+      const childMarker = j.parent_run_id
+        ? `<span class="job-child-marker" title="Task con của run #${j.parent_run_id}">↳ #${j.parent_run_id}</span> `
+        : '';
 
       return `<tr>
         <td>#${j.id}</td>
-        <td>${icon} ${pName}</td>
+        <td>${platformBadge(j.platform, { size: 13 })}</td>
         <td style="max-width:300px;">
-          <div class="text-truncate" title="${escapeAttr(j.query)}">${escapeHtml(j.query)}</div>
+          <div class="text-truncate" title="${escapeAttr(j.query)}">${childMarker}${escapeHtml(j.query)}${parentBadge}</div>
         </td>
         <td>${j.active_backend ? `<span class="badge bg-secondary">${j.active_backend}</span>` : '-'}</td>
         <td>${statusBadge}</td>
@@ -1367,7 +2218,8 @@ async function deleteJob(id) {
 // ==================== Helpers ====================
 
 async function apiFetch(endpoint, options = {}) {
-  const res = await fetch(endpoint, { headers: { 'Content-Type': 'application/json', ...options.headers }, ...options });
+  const { returnMeta, ...fetchOpts } = options;
+  const res = await fetch(endpoint, { headers: { 'Content-Type': 'application/json', ...fetchOpts.headers }, ...fetchOpts });
   const rawText = await res.text();
   let data;
   try {
@@ -1377,6 +2229,7 @@ async function apiFetch(endpoint, options = {}) {
     throw new Error('Dữ liệu từ máy chủ không phải định dạng JSON hợp lệ.');
   }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (returnMeta) return { data, headers: res.headers, res };
   return data;
 }
 
@@ -2002,21 +2855,6 @@ async function loadMarketplaceSchedules() {
       return;
     }
 
-    const platformLabels = {
-      amazon: '📦 Amazon',
-      ebay: '🏷️ eBay Sold',
-      etsy: '🧶 Etsy',
-      shopify: '🛍️ Shopify',
-      tiktok_shop: '🎵 TikTok Shop',
-      google_shopping: '🛒 Google Shopping',
-      facebook_ads: '📢 Facebook Ads',
-      facebook_posts: '👥 Facebook Posts',
-      instagram: '📷 Instagram',
-      pinterest: '📌 Pinterest',
-      reddit: '🔴 Reddit',
-      twitter: '🐦 X / Twitter'
-    };
-
     list.innerHTML = schedules.map((schedule) => {
       const timing = schedule.schedule_type === 'daily'
         ? `Hàng ngày lúc ${schedule.daily_time} (VN)`
@@ -2038,14 +2876,13 @@ async function loadMarketplaceSchedules() {
         : 'Chưa có lượt chạy nào.';
 
       const id = Number(schedule.id);
-      const platformDisplay = platformLabels[schedule.platform] || schedule.platform.toUpperCase();
 
       return `<div class="card border mb-2 shadow-sm">
         <div class="card-body p-3">
           <div class="d-flex justify-content-between align-items-start gap-2">
             <div>
               <div class="d-flex align-items-center gap-2 mb-1">
-                <span class="badge bg-primary px-2 py-1">${escapeHtml(platformDisplay)}</span>
+                ${platformBadge(schedule.platform, { size: 13 })}
                 <strong class="text-dark fs-6">${escapeHtml(schedule.keyword)}</strong>
                 ${statusBadge}
               </div>
