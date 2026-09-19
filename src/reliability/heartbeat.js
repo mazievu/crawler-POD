@@ -46,6 +46,10 @@ class HeartbeatTracker {
     this.lastProgressAt = Date.now();
     this.lastHeartbeatAt = Date.now();
     this.lastDbFlushAt = 0; // forces the very first persist() call to actually write
+    // Every persist() currently in flight. persist() returns before its write
+    // has landed, so a caller about to write the SAME health_snapshot column
+    // needs a way to wait them out — see whenPersisted().
+    this.pendingWrites = new Set();
     this.stage = STAGES.INIT;
     this.itemsCollected = 0;
     this.metadata = {};
@@ -124,7 +128,37 @@ class HeartbeatTracker {
     };
   }
 
-  async persist() {
+  /**
+   * Note the deliberate lack of `async` here: writeSnapshot() runs
+   * SYNCHRONOUSLY up to its first await, which is what makes a beat()'s
+   * db.updateRun() call observable in the same tick — the flush-throttle
+   * contract in test/reliability.test.js asserts exactly that. Wrapping this
+   * in a promise chain would push the write into a microtask and break it.
+   */
+  persist() {
+    const write = this.writeSnapshot();
+    this.pendingWrites.add(write);
+    const forget = () => this.pendingWrites.delete(write);
+    write.then(forget, forget);
+    return write;
+  }
+
+  /**
+   * Resolves once every persist() started so far has actually landed.
+   *
+   * persist() is asynchronous (it awaits an ownership read before writing) and
+   * its callers do not await it, so its write can land at an arbitrary later
+   * moment. Anyone about to write the same health_snapshot column with
+   * something the tracker's snapshot does NOT contain — runManaged() and its
+   * `result` key — must wait here first, or the tracker's write can land
+   * second and erase it.
+   */
+  async whenPersisted() {
+    if (this.pendingWrites.size === 0) return;
+    await Promise.allSettled(Array.from(this.pendingWrites));
+  }
+
+  async writeSnapshot() {
     try {
       if (!this.db || typeof this.db.updateRun !== 'function') return;
       // Final Stabilization Round #10: a stale attempt A (superseded by a
