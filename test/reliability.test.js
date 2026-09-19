@@ -727,3 +727,97 @@ test('Everbee client discovery and capture observe threaded AbortSignal (Patch #
   );
   assert.equal(captureSignalObserved, true, 'captureViaEverbeeHost must pass signal to fetch');
 });
+
+/**
+ * Regression cover for the CI flake behind
+ * `capture API returns a successful saved capture instead of starting a browser again`.
+ *
+ * runManaged() persists the executor's return value as health_snapshot.result,
+ * and server.js's submitMarketplaceCaptureViaScheduler() reads exactly that key
+ * back to answer POST /api/html-captures. HeartbeatTracker.persist() writes the
+ * SAME column with a snapshot that carries no `result` key at all, and
+ * setStage() fired it WITHOUT awaiting — so whichever write happened to land
+ * last won. When the tracker's landed second, `result` was gone while the run
+ * still read `status='done'`, and the endpoint had a finished run it could not
+ * answer from. A race, which is why it failed roughly half the time.
+ *
+ * The fake DB below makes that race deterministic instead of probabilistic:
+ * the owner lookup inside persist() (isCurrentOwner -> getRunById) is delayed,
+ * so an unordered tracker write is GUARANTEED to land after the final one.
+ */
+function createResultPersistFakeDb({ ownerLookupDelayMs = 25 } = {}) {
+  const row = { id: 1, status: 'running', health_snapshot: null, input_options: '{}' };
+  const writes = [];
+  return {
+    row,
+    writes,
+    async getRunById() {
+      if (ownerLookupDelayMs) await new Promise((resolve) => setTimeout(resolve, ownerLookupDelayMs));
+      return row;
+    },
+    async updateRun(id, patch) {
+      writes.push(patch);
+      if (patch.status !== undefined) row.status = patch.status;
+      if (patch.healthSnapshot !== undefined) row.health_snapshot = patch.healthSnapshot;
+      if (patch.errorMessage !== undefined) row.error_message = patch.errorMessage;
+    },
+  };
+}
+
+/** Gives any write left unawaited a generous chance to land before asserting. */
+async function settleBackgroundWrites() {
+  await new Promise((resolve) => setTimeout(resolve, 150));
+}
+
+test('ManagedExecution: the executor result survives the heartbeat tracker\'s own snapshot write', async () => {
+  const db = createResultPersistFakeDb();
+
+  const returned = await runManaged(1, { database: db, executionToken: 'result-persist-a' }, async () => ({ captured: true, id: 7 }));
+  assert.deepEqual(returned, { captured: true, id: 7 });
+
+  await settleBackgroundWrites();
+
+  const stored = JSON.parse(db.row.health_snapshot || '{}');
+  assert.deepEqual(
+    stored.result,
+    { captured: true, id: 7 },
+    'health_snapshot lost `result` — a tracker snapshot write overwrote the final one'
+  );
+  assert.equal(db.row.status, 'done');
+});
+
+test('ManagedExecution: a falsy-but-defined executor result is still readable back', async () => {
+  const db = createResultPersistFakeDb();
+
+  await runManaged(2, { database: db, executionToken: 'result-persist-b' }, async () => 0);
+  await settleBackgroundWrites();
+
+  const stored = JSON.parse(db.row.health_snapshot || '{}');
+  assert.equal(stored.result, 0);
+});
+
+test('ManagedExecution: the last health_snapshot write of a successful run is the one carrying the result', async () => {
+  const db = createResultPersistFakeDb();
+
+  await runManaged(3, { database: db, executionToken: 'result-persist-c' }, async () => ({ ok: true }));
+  await settleBackgroundWrites();
+
+  const snapshotWrites = db.writes.filter((patch) => patch.healthSnapshot !== undefined);
+  assert.ok(snapshotWrites.length > 0, 'expected at least one health_snapshot write');
+  const last = JSON.parse(snapshotWrites[snapshotWrites.length - 1].healthSnapshot);
+  assert.deepEqual(last.result, { ok: true });
+  assert.equal(last.stage, STAGES.COMPLETED, 'the winning write must still carry the full tracker snapshot');
+});
+
+test('ManagedExecution: a failing executor still reports its error rather than a half-written snapshot', async () => {
+  const db = createResultPersistFakeDb();
+
+  await assert.rejects(
+    runManaged(4, { database: db, executionToken: 'result-persist-d' }, async () => { throw new Error('capture blew up'); }),
+    /capture blew up/
+  );
+  await settleBackgroundWrites();
+
+  assert.equal(db.row.error_message, 'capture blew up');
+  assert.ok(['failed', 'queued'].includes(db.row.status), `unexpected terminal status ${db.row.status}`);
+});
