@@ -1778,8 +1778,8 @@ function parseCollectKeywords() {
   const keywords = [];
   const duplicates = [];
   const seen = new Set();
-  for (const line of String(raw).split(/\r?\n/)) {
-    const keyword = line.trim();
+  for (const item of String(raw).split(/[\r\n,]+/)) {
+    const keyword = item.trim();
     if (keyword === '') continue;
     const key = keyword.toLowerCase();
     if (seen.has(key)) { duplicates.push(keyword); continue; }
@@ -1822,7 +1822,7 @@ function renderKeywordPlan() {
   if (el) {
     if (blocked) {
       el.className = 'keyword-plan keyword-plan-error';
-      el.innerHTML = `Quá nhiều từ khoá: ${keywords.length}. Tối đa ${MAX_CRAWL_KEYWORDS_UI} từ khoá mỗi lượt crawl (mỗi dòng một từ khoá).`;
+      el.innerHTML = `Quá nhiều từ khoá: ${keywords.length}. Tối đa ${MAX_CRAWL_KEYWORDS_UI} từ khoá mỗi lượt crawl (ngăn cách bởi dấu phẩy hoặc xuống dòng).`;
     } else if (keywords.length > 1) {
       el.className = 'keyword-plan keyword-plan-info';
       el.innerHTML = `<strong>${keywords.length} từ khoá → ${keywords.length} task</strong>, mỗi task tối đa <strong>${maxItems}</strong> item `
@@ -1871,7 +1871,7 @@ async function startCollect() {
     return;
   }
   if (keywords.length === 0) {
-    status0.innerHTML = '<small class="text-danger">❌ Chưa nhập từ khoá nào. Nhập ít nhất một từ khoá (mỗi dòng một từ khoá).</small>';
+    status0.innerHTML = '<small class="text-danger">❌ Chưa nhập từ khoá nào. Nhập ít nhất một từ khoá (ngăn cách bởi dấu phẩy hoặc xuống dòng).</small>';
     return;
   }
   // `query` stays the single-value field the API has always required; with 2+
@@ -2752,10 +2752,47 @@ function updateScheduleVariantControls() {
   }
 }
 
+function parseScheduleKeywords() {
+  const input = document.getElementById('marketplace-schedule-keyword');
+  if (!input) return { keywords: [], duplicates: [] };
+  const raw = input.value;
+  const keywords = [];
+  const duplicates = [];
+  const seen = new Set();
+  for (const item of String(raw).split(/[\r\n,]+/)) {
+    const keyword = item.trim();
+    if (keyword === '') continue;
+    const key = keyword.toLowerCase();
+    if (seen.has(key)) { duplicates.push(keyword); continue; }
+    seen.add(key);
+    keywords.push(keyword);
+  }
+  return { keywords, duplicates };
+}
+
+function renderScheduleKeywordPlan() {
+  const el = document.getElementById('marketplace-schedule-keyword-plan');
+  if (!el) return;
+  const { keywords, duplicates } = parseScheduleKeywords();
+  const maxItems = parseInt(document.getElementById('marketplace-schedule-max-items').value, 10) || 30;
+  if (keywords.length > 1) {
+    el.className = 'keyword-plan keyword-plan-info';
+    el.innerHTML = `<strong>${keywords.length} từ khoá → tự động tách thành ${keywords.length} run độc lập khi chạy</strong>, mỗi run tối đa <strong>${maxItems}</strong> items (tổng tối đa ${keywords.length * maxItems} items).`
+      + (duplicates.length ? `<div><span class="keyword-plan-warn">Bỏ ${duplicates.length} từ khoá trùng: ${duplicates.map(escapeHtml).join(', ')}</span></div>` : '');
+  } else if (duplicates.length > 0) {
+    el.className = 'keyword-plan keyword-plan-info';
+    el.innerHTML = `<span class="keyword-plan-warn">Bỏ ${duplicates.length} từ khoá trùng: ${duplicates.map(escapeHtml).join(', ')}</span>`;
+  } else {
+    el.className = 'keyword-plan';
+    el.innerHTML = '';
+  }
+}
+
 async function showMarketplaceSchedulesModal() {
   document.getElementById('marketplace-schedule-keyword').value = '';
   document.getElementById('marketplace-schedule-status').textContent = '';
   document.getElementById('marketplace-schedule-max-items').value = '30';
+  renderScheduleKeywordPlan();
   updateMarketplaceScheduleTimeFields();
   onSchedulePlatformChange();
   new bootstrap.Modal(document.getElementById('marketplace-schedules-modal')).show();
@@ -2786,7 +2823,7 @@ function updateMarketplaceScheduleTimeFields() {
 async function saveMarketplaceSchedule() {
   const status = document.getElementById('marketplace-schedule-status');
   const platform = document.getElementById('marketplace-schedule-platform').value;
-  const keyword = document.getElementById('marketplace-schedule-keyword').value.trim();
+  const { keywords } = parseScheduleKeywords();
   const maxItems = Number(document.getElementById('marketplace-schedule-max-items').value) || 30;
   const accountId = document.getElementById('marketplace-schedule-account')?.value || null;
   const everyHours = Number(document.getElementById('marketplace-schedule-every-hours').value) || 3;
@@ -2796,10 +2833,11 @@ async function saveMarketplaceSchedule() {
   const variantMode = platform === 'etsy' ? (document.getElementById('marketplace-schedule-variant-mode')?.value || 'base') : 'base';
   const maxVariants = Number(document.getElementById('marketplace-schedule-max-variants')?.value) || 150;
 
-  if (!keyword) {
-    status.innerHTML = '<span class="text-danger">Vui lòng nhập từ khóa tìm kiếm.</span>';
+  if (keywords.length === 0) {
+    status.innerHTML = '<span class="text-danger">Vui lòng nhập ít nhất một từ khóa tìm kiếm (ngăn cách bởi dấu phẩy hoặc xuống dòng).</span>';
     return;
   }
+  const keyword = keywords.join(', ');
 
   try {
     await apiFetch('/api/marketplace-capture-schedules', {
@@ -2820,6 +2858,7 @@ async function saveMarketplaceSchedule() {
     });
     status.innerHTML = '<span class="text-success fw-bold">✓ Đã lưu lịch crawl thành công!</span>';
     document.getElementById('marketplace-schedule-keyword').value = '';
+    renderScheduleKeywordPlan();
     await loadMarketplaceSchedules();
   } catch (err) {
     status.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`;
@@ -2887,7 +2926,10 @@ async function loadMarketplaceSchedules() {
                 ${statusBadge}
               </div>
               <div class="text-muted small">
-                <span>Số lượng: <strong>${schedule.max_listings || 30} items</strong></span> · 
+                <span>Số lượng: <strong>${schedule.max_listings || 30} items / run</strong>${(() => {
+                  const kws = schedule.keyword ? schedule.keyword.split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean) : [];
+                  return kws.length > 1 ? ` (${kws.length} runs/lượt)` : '';
+                })()}</span> · 
                 <span>${escapeHtml(timing)}</span> · 
                 <span class="text-primary">${escapeHtml(next)}</span>
               </div>

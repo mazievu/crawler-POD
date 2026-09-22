@@ -467,12 +467,15 @@ async function dispatchScheduleExecution(schedule, claimToken) {
     const platform = schedule.platform;
     const query = schedule.keyword;
     const maxItems = schedule.max_listings || 30;
+    const country = schedule.country || '';
     // Task 5.2: the schedule's market has to reach the crawl. TikTok Shop's
     // actor takes country_code as a required input, so a US Top-20 job that
     // dropped it here would silently crawl the actor's default market.
-    const country = schedule.country || null;
-    const normalizedOptions = buildCollectionOptions(platform, { maxItems, country });
-    const run = await db.createRun({ platform, query, maxItems, country, options: normalizedOptions });
+    const normalizedOptions = buildCollectionOptions(platform, { maxItems, country, query });
+    const parentQuery = Array.isArray(normalizedOptions.keywords)
+      ? normalizedOptions.keywords.join(KEYWORD_DISPLAY_SEPARATOR)
+      : query;
+    const run = await db.createRun({ platform, query: parentQuery, maxItems, country, options: normalizedOptions });
 
     await scheduler.submitRun(run);
     const finishedRun = await scheduler.waitForCompletion(run.id, { timeoutMs: 180000 });
@@ -1540,3 +1543,24 @@ serverInstance.on('error', (err) => {
   console.error('[FATAL] Server failed to start:', err);
   process.exit(1);
 });
+
+let isShuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[Shutdown] Received ${signal}, closing gracefully...`);
+  try { serverInstance.close(); } catch (_) {}
+  try {
+    if (typeof db.close === 'function') {
+      await db.close();
+      console.log('[Shutdown] Database connection cleanly closed.');
+    }
+  } catch (err) {
+    console.error('[Shutdown] Error closing database:', err.message);
+  }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
