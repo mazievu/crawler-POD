@@ -61,38 +61,43 @@ function isLocalCdpUrl(value) {
 }
 
 /**
- * Multi-keyword input parsing — ONE KEYWORD PER LINE.
+ * Multi-keyword input parsing — SPLITS ON NEWLINES AND COMMAS.
  *
- * Newline, not comma: a single real keyword very often contains a comma
- * ("press on nails, short square"), so comma-splitting would silently corrupt
- * queries that work today. A line break never appears inside a keyword typed
- * into a one-line box, which makes this a strictly additive interpretation of
- * the existing `query` contract.
+ * Supports both comma-separated and newline-separated inputs.
+ * Trims whitespace, skips blank items, and deduplicates case-insensitively
+ * (preserving original case of first occurrence).
  *
  * Returns { keywords, duplicates } and THROWS on input that cannot be honoured
- * (all-blank, or more lines than MAX_CRAWL_KEYWORDS) — §"no silent buttons":
+ * (all-blank, or more than MAX_CRAWL_KEYWORDS) — §"no silent buttons":
  * a rejected input must be named, never quietly dropped.
  */
 function parseKeywordList(raw) {
-  const lines = Array.isArray(raw)
-    ? raw.map((entry) => String(entry ?? ''))
-    : String(raw ?? '').split(/\r?\n/);
+  let rawItems = [];
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      if (entry != null) {
+        rawItems.push(...String(entry).split(/[\r\n,]+/));
+      }
+    }
+  } else if (raw != null) {
+    rawItems = String(raw).split(/[\r\n,]+/);
+  }
 
   const keywords = [];
   const duplicates = [];
   const seen = new Set();
-  for (const line of lines) {
-    const keyword = line.trim();
-    if (keyword === '') continue; // Blank lines are formatting, not input.
+  for (const item of rawItems) {
+    const keyword = item.trim();
+    if (keyword === '') continue; // Blank items are formatting, not input.
     const dedupeKey = keyword.toLowerCase();
     if (seen.has(dedupeKey)) { duplicates.push(keyword); continue; }
     seen.add(dedupeKey);
     keywords.push(keyword);
   }
 
-  if (keywords.length === 0) throw new Error('Enter at least one keyword (one per line).');
+  if (keywords.length === 0) throw new Error('Enter at least one keyword.');
   if (keywords.length > MAX_CRAWL_KEYWORDS) {
-    throw new Error(`Too many keywords: ${keywords.length}. The maximum per crawl is ${MAX_CRAWL_KEYWORDS} (one keyword per line).`);
+    throw new Error(`Too many keywords: ${keywords.length}. The maximum per crawl is ${MAX_CRAWL_KEYWORDS}.`);
   }
   return { keywords, duplicates };
 }
@@ -214,6 +219,13 @@ function buildCollectionOptions(platform, values = {}) {
   if (values.keywords !== undefined) {
     const { keywords } = parseKeywordList(values.keywords);
     if (keywords.length > 1) options.keywords = keywords;
+  } else if (values.query !== undefined && values.query !== null) {
+    try {
+      const { keywords } = parseKeywordList(values.query);
+      if (keywords.length > 1) options.keywords = keywords;
+    } catch (_e) {
+      // If query is blank or invalid, leave query validation to caller
+    }
   }
 
   return options;

@@ -178,7 +178,7 @@
                  on newlines, and #collect-keyword-plan below states what will
                  happen before the button is pressed. Reverting this pair to a
                  plain input is what silently disabled Crawl Now on 2026-09-16. -->
-            <textarea class="form-control" id="collect-query" rows="3" placeholder="keyword or URL...&#10;mỗi dòng một từ khoá"></textarea>
+            <textarea class="form-control" id="collect-query" rows="3" placeholder="keyword or URL...&#10;ngăn cách bởi dấu phẩy (,) hoặc xuống dòng"></textarea>
             <div id="collect-keyword-plan" class="keyword-plan"></div>
             <small class="text-muted" id="collect-hint"></small>
           </div>
@@ -511,12 +511,13 @@
                 </select>
               </div>
               <div class="col-md-5">
-                <label class="filter-label" id="marketplace-schedule-keyword-label">Từ khóa / Query</label>
-                <input id="marketplace-schedule-keyword" class="form-control" maxlength="200" placeholder="e.g. vintage hoodie, custom mug...">
+                <label class="filter-label" id="marketplace-schedule-keyword-label">Từ khóa / Query (phẩy hoặc xuống dòng)</label>
+                <textarea id="marketplace-schedule-keyword" class="form-control" rows="2" placeholder="e.g. vintage hoodie, custom mug...&#10;ngăn cách bởi dấu phẩy (,) hoặc xuống dòng" oninput="renderScheduleKeywordPlan()"></textarea>
+                <div id="marketplace-schedule-keyword-plan" class="keyword-plan mt-1"></div>
               </div>
               <div class="col-md-3">
-                <label class="filter-label">Số lượng item (Max Items)</label>
-                <input id="marketplace-schedule-max-items" class="form-control" type="number" min="1" max="100" value="30">
+                <label class="filter-label">Số lượng item / run (Max Items)</label>
+                <input id="marketplace-schedule-max-items" class="form-control" type="number" min="1" max="100" value="30" oninput="renderScheduleKeywordPlan()">
               </div>
             </div>
 
@@ -708,6 +709,6 @@
   <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
   <!-- Must load BEFORE app.js: renderItemMetricForm() calls buildItemMetricRows(). -->
   <script src="/item-metric-rows.js?v=1.1.0"></script>
-  <script src="/app.js?v=5.4.0"></script>
+  <script src="/app.js?v=5.5.0"></script>
 </body>
 </html>

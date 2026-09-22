@@ -16,8 +16,14 @@ function vietnamDateTimeToUtc(value) {
 function normalizeScheduleInput(input = {}) {
   const platform = String(input.platform == null ? 'etsy' : input.platform).trim().toLowerCase();
   if (!platform) throw new Error('Platform is required');
-  const keyword = String(input.keyword || '').trim();
-  if (!keyword || keyword.length > 200) throw new Error('Keyword must be between 1 and 200 characters');
+  const { parseKeywordList } = require('../collection-inputs');
+  const rawKeyword = String(input.keyword || '').trim();
+  if (!rawKeyword) throw new Error('Keyword is required');
+  const { keywords } = parseKeywordList(rawKeyword);
+  for (const kw of keywords) {
+    if (kw.length > 200) throw new Error('Each keyword must be 200 characters or fewer');
+  }
+  const keyword = keywords.join(', ');
   const everyHours = Math.min(Math.max(Number(input.everyHours) || 24, 1), 168);
   const accountId = input.accountId == null || input.accountId === '' ? null : Number(input.accountId);
   if (accountId != null && (!Number.isInteger(accountId) || accountId < 1)) throw new Error('Account is invalid');
@@ -78,42 +84,53 @@ function createMarketplaceCaptureScheduler({ discover, capture, markComplete = a
   // function, its renewClaim calls below will correctly no-op (the DB's
   // claim_token no longer matches A's), never stealing B's claim.
   async function run(schedule, claimToken = null) {
-    let result;
+    const { parseKeywordList } = require('../collection-inputs');
+    let keywords = [schedule.keyword];
     try {
-      result = await discover(schedule.keyword, {
-        limit: Math.min(Number(schedule.max_listings) || 30, 30),
-        accountId: schedule.account_id == null ? null : Number(schedule.account_id),
-      });
-    } catch (error) {
-      const summary = { discovered: 0, captured: 0, blocked: 0, failed: 1, error: `Discovery failed: ${error.message}` };
-      // §3: claim_token-protected — a stale attempt cannot mark this
-      // complete or clear a newer claim even on this early-exit path.
-      await markComplete(schedule.id, summary, claimToken);
-      return summary;
+      keywords = parseKeywordList(schedule.keyword).keywords;
+    } catch (_e) {}
+
+    const perKeywordLimit = Math.min(Number(schedule.max_listings) || 30, 30);
+    const allItems = [];
+    const summary = { discovered: 0, captured: 0, blocked: 0, failed: 0 };
+
+    for (const kw of keywords) {
+      let result;
+      try {
+        result = await discover(kw, {
+          limit: perKeywordLimit,
+          accountId: schedule.account_id == null ? null : Number(schedule.account_id),
+        });
+      } catch (error) {
+        summary.failed++;
+        summary.error = `Discovery failed: ${error.message}`;
+        await markComplete(schedule.id, summary, claimToken);
+        return summary;
+      }
+
+      try {
+        await assertClaimOwnership(schedule.id, claimToken, renewClaim);
+      } catch (claimErr) {
+        console.warn(`[MarketplaceCaptureScheduler] Schedule #${schedule.id}: ${claimErr.message} after discovery — stopping before any capture.`);
+        summary.error = claimErr.message;
+        summary.claimLost = true;
+        return summary;
+      }
+
+      const kwItems = (result.items || []).filter((item) => item?.url).slice(0, perKeywordLimit);
+      allItems.push(...kwItems);
     }
 
-    // §2: discovery alone can take a while (now routed through the Resource
-    // Scheduler, §13 of the prior round); confirm the claim is still ours
-    // before starting the capture loop — if it isn't, STOP immediately, do
-    // not spend a single browser capture under a lease that's already gone.
-    try {
-      await assertClaimOwnership(schedule.id, claimToken, renewClaim);
-    } catch (claimErr) {
-      console.warn(`[MarketplaceCaptureScheduler] Schedule #${schedule.id}: ${claimErr.message} after discovery — stopping before any capture.`);
-      return { discovered: (result.items || []).length, captured: 0, blocked: 0, failed: 0, error: claimErr.message, claimLost: true };
-    }
-
-    const items = (result.items || []).filter((item) => item?.url).slice(0, Math.min(Number(schedule.max_listings) || 30, 30));
-    const summary = { discovered: items.length, captured: 0, blocked: 0, failed: 0 };
+    summary.discovered = allItems.length;
 
     // Parallel capture: each capture() submits through the scheduler (BROWSER
     // pool), so actual browser concurrency is still governed by pool capacity.
     // InternalTaskPool controls how many we SUBMIT concurrently.
     const { InternalTaskPool } = require('../scheduler/internal-task-pool');
-    const concurrency = Math.min(4, items.length); // bounded: capture submits are lightweight
+    const concurrency = Math.min(4, Math.max(1, allItems.length)); // bounded: capture submits are lightweight
     const taskPool = new InternalTaskPool({ concurrency });
 
-    await taskPool.run(items, async (item) => {
+    await taskPool.run(allItems, async (item) => {
       // §2: assert BEFORE starting each item
       await assertClaimOwnership(schedule.id, claimToken, renewClaim);
       const captured = await capture({ platform: 'etsy', url: item.url, accountId: schedule.account_id, variantMode: schedule.variant_mode, maxVariants: schedule.max_variants });
@@ -123,7 +140,7 @@ function createMarketplaceCaptureScheduler({ discover, capture, markComplete = a
 
     // Count failures from settled results
     // (taskPool.run uses allSettled — failed tasks don't throw)
-    summary.failed = items.length - summary.captured - summary.blocked;
+    summary.failed = allItems.length - summary.captured - summary.blocked;
 
     // Final assertion before completion, so a slow markComplete()/summary
     // write below still runs under a claim we've just confirmed is ours.

@@ -25,20 +25,30 @@ const { parseKeywordList, buildCollectionOptions, MAX_CRAWL_KEYWORDS } = require
 
 // ==================== Input parsing (src/collection-inputs.js) ====================
 
-test('parseKeywordList splits on LINES, never on commas (a real keyword contains commas)', () => {
+test('parseKeywordList splits on BOTH lines and commas into distinct keywords', () => {
   const { keywords } = parseKeywordList('press on nails, short square\nnail glue\n  gel tips  ');
-  assert.deepEqual(keywords, ['press on nails, short square', 'nail glue', 'gel tips']);
+  assert.deepEqual(keywords, ['press on nails', 'short square', 'nail glue', 'gel tips']);
+});
+
+test('parseKeywordList handles comma-separated list on a single line', () => {
+  const { keywords } = parseKeywordList('áo thun, cốc sứ, túi vải');
+  assert.deepEqual(keywords, ['áo thun', 'cốc sứ', 'túi vải']);
+});
+
+test('parseKeywordList handles mixed commas, consecutive newlines and extra spaces', () => {
+  const { keywords } = parseKeywordList('  a, b , , c\n\n d , e \n');
+  assert.deepEqual(keywords, ['a', 'b', 'c', 'd', 'e']);
 });
 
 test('parseKeywordList drops blank lines and case-insensitive duplicates, reporting what it dropped', () => {
-  const { keywords, duplicates } = parseKeywordList('nail glue\n\n   \nNail Glue\ngel tips\n');
+  const { keywords, duplicates } = parseKeywordList('nail glue\n\n ,  \nNail Glue, gel tips\n');
   assert.deepEqual(keywords, ['nail glue', 'gel tips']);
   assert.deepEqual(duplicates, ['Nail Glue'], 'a dropped duplicate must be reported, never silently swallowed');
 });
 
 test('parseKeywordList refuses empty input and over-limit input with a named reason (no silent rejection)', () => {
-  assert.throws(() => parseKeywordList('   \n\n  '), /at least one keyword/i);
-  const tooMany = Array.from({ length: MAX_CRAWL_KEYWORDS + 1 }, (_v, i) => `kw${i}`).join('\n');
+  assert.throws(() => parseKeywordList('   \n\n ,  '), /at least one keyword/i);
+  const tooMany = Array.from({ length: MAX_CRAWL_KEYWORDS + 1 }, (_v, i) => `kw${i}`).join(',');
   assert.throws(() => parseKeywordList(tooMany), new RegExp(`Too many keywords: ${MAX_CRAWL_KEYWORDS + 1}`));
 });
 
@@ -48,15 +58,24 @@ test('buildCollectionOptions whitelists `keywords` so the fan-out instruction su
   assert.equal(options.maxItems, 20);
 });
 
-test('buildCollectionOptions emits NO `keywords` key for a single keyword — single-keyword behaviour is unchanged', () => {
+test('buildCollectionOptions automatically extracts keywords from query when query contains commas or newlines', () => {
+  const options = buildCollectionOptions('etsy', { maxItems: 20, query: 'vintage hoodie, custom mug\nposter' });
+  assert.deepEqual(options.keywords, ['vintage hoodie', 'custom mug', 'poster']);
+  assert.equal(options.maxItems, 20);
+});
+
+test('buildCollectionOptions emits NO `keywords` key for a single keyword query or input', () => {
   const before = buildCollectionOptions('etsy', { maxItems: 20 });
   const single = buildCollectionOptions('etsy', { maxItems: 20, keywords: ['only one'] });
+  const singleQuery = buildCollectionOptions('etsy', { maxItems: 20, query: 'only one' });
   assert.equal('keywords' in single, false, 'one keyword must produce the exact pre-change option shape');
+  assert.equal('keywords' in singleQuery, false, 'single query must produce no keywords key');
   assert.deepEqual(single, before);
+  assert.deepEqual(singleQuery, before);
 });
 
 test('buildCollectionOptions rejects an all-blank keyword list instead of silently crawling nothing', () => {
-  assert.throws(() => buildCollectionOptions('etsy', { maxItems: 20, keywords: ['', '   '] }), /at least one keyword/i);
+  assert.throws(() => buildCollectionOptions('etsy', { maxItems: 20, keywords: ['', '   ', ','] }), /at least one keyword/i);
 });
 
 // ==================== Task planning (src/scheduler/job-sharder.js) ====================
