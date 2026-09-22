@@ -130,6 +130,14 @@ async function runManaged(runId, options, workFn) {
     await assertOwner('PRE_PERSIST');
 
     tracker.setStage(STAGES.COMPLETED);
+    // setStage() fires a tracker write against the SAME health_snapshot column
+    // as the line below, it does not await it, and its snapshot carries no
+    // `result` key. Unawaited, that write could land AFTER this one and erase
+    // `result`, leaving a run at status='done' whose own caller can no longer
+    // read a result from it — exactly how POST /api/html-captures intermittently
+    // answered an empty body for a capture that had in fact succeeded.
+    // Draining the tracker first makes the result write unambiguously last.
+    await tracker.whenPersisted();
     await db.updateRun(runId, { status: 'done', healthSnapshot: JSON.stringify({ result, ...tracker.getSnapshot() }) });
     return result;
   } catch (err) {
