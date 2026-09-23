@@ -50,7 +50,7 @@ test('Combo 1: Login sets session, member route succeeds with member role, admin
 // ============================================================================
 test('Combo 2: Super Admin bootstrapped from env, logs in, gets cookie, accesses admin endpoints', async () => {
   await withTestServer({ adminEmail: 'root@combo.local', adminPassword: 'RootPassword123!' }, async (baseUrl) => {
-    await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
+    // Bootstrap already happened at server start — no public HTTP route.
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -225,7 +225,7 @@ test('Combo 10: Unauthorized origin blocked by CORS; authorized origin without C
 // ============================================================================
 test('Combo 11: Attacker attempting brute force on admin email gets locked out after 5 attempts', async () => {
   await withTestServer({ adminEmail: 'admin@combo.local', adminPassword: 'SecretAdminPassword123!' }, async (baseUrl) => {
-    await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
+    // Bootstrap already happened at server start — no public HTTP route.
     for (let i = 0; i < 5; i++) {
       await fetch(`${baseUrl}/api/auth/login`, {
         method: 'POST',
@@ -302,12 +302,8 @@ test('Combo 14: Emergency Freeze blocks new runs, while active runs can complete
 
     controls.setEmergencyFrozen(true);
 
-    // Active run completes
-    const compRes = await fetch(`${baseUrl}/api/runs/${run.id}/complete`, {
-      method: 'POST',
-      headers: { 'x-api-key': rawKey },
-    });
-    assert.strictEqual(compRes.status, 200);
+    // Active run completes (no public HTTP route for this)
+    controls.completeRun(run.id);
     assert.strictEqual(controls.getActiveRunsCount(), 0);
   });
 });
@@ -392,12 +388,12 @@ test('Combo 19: Graceful shutdown: /livez returns 503, incoming runs rejected, i
     const newRes = await fetch(`${baseUrl}/livez`);
     assert.strictEqual(newRes.status, 503);
 
-    // Active run completes
-    const compRes = await fetch(`${baseUrl}/api/runs/${run.id}/complete`, {
-      method: 'POST',
-      headers: { 'x-api-key': rawKey },
-    });
-    assert.strictEqual(compRes.status, 200);
+    // Active run completes internally even during shutdown (no public HTTP
+    // route for this — and the shutdown barrier rejects new HTTP requests
+    // anyway, so completion can only ever be internal to the process).
+    const completed = controls.completeRun(run.id);
+    assert.ok(completed, 'In-flight run must be able to complete during shutdown');
+    assert.strictEqual(completed.status, 'completed');
   });
 });
 

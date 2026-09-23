@@ -98,12 +98,16 @@ test('B1.5: Concurrent logins for the same user yield distinct valid session tok
 
 // ============================================================================
 // Feature 2: Super Admin Bootstrap Boundaries
+//
+// Bootstrap has no public/authenticated HTTP route (see harness.js
+// bootstrapAdminFromConfig(), which runs once when the server starts —
+// mirroring the real server.js bootstrapDatabase()). These boundary cases
+// are exercised directly against that startup path instead.
 // ============================================================================
 test('B2.1: Bootstrap with special characters and symbols in password', async () => {
   const complexPassword = 'P@$$w0rd!#%^&*()_+~|}{[]:;?><,./';
-  await withTestServer({ adminEmail: 'special@admin.local', adminPassword: complexPassword }, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
-    assert.strictEqual(res.status, 201);
+  await withTestServer({ adminEmail: 'special@admin.local', adminPassword: complexPassword }, async (baseUrl, controls) => {
+    assert.ok(controls.db.getUserByEmail('special@admin.local'), 'Admin with complex password must be created at boot');
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -115,7 +119,6 @@ test('B2.1: Bootstrap with special characters and symbols in password', async ()
 
 test('B2.2: Email with leading and trailing whitespace is trimmed properly', async () => {
   await withTestServer({ adminEmail: '   trimmed@admin.local   ', adminPassword: 'AdminPassword123!' }, async (baseUrl, controls) => {
-    await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
     const admin = controls.db.getUserByEmail('trimmed@admin.local');
     assert.ok(admin);
     assert.strictEqual(admin.email, 'trimmed@admin.local');
@@ -124,29 +127,28 @@ test('B2.2: Email with leading and trailing whitespace is trimmed properly', asy
 
 test('B2.3: Case insensitivity of admin email matches existing account', async () => {
   await withTestServer({ adminEmail: 'UPPER@ADMIN.LOCAL', adminPassword: 'AdminPassword123!' }, async (baseUrl, controls) => {
-    await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
     const admin = controls.db.getUserByEmail('upper@admin.local');
     assert.ok(admin);
   });
 });
 
-test('B2.4: Empty string password env var is rejected', async () => {
-  await withTestServer({ adminEmail: 'valid@admin.local', adminPassword: '' }, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
-    assert.strictEqual(res.status, 400);
+test('B2.4: Empty string password env var means no admin is bootstrapped', async () => {
+  await withTestServer({ adminEmail: 'valid@admin.local', adminPassword: '' }, async (baseUrl, controls) => {
+    assert.strictEqual(controls.db.getUserByEmail('valid@admin.local'), null);
+    assert.strictEqual(controls.db.countAdmins(), 0);
   });
 });
 
-test('B2.5: Rapid sequential bootstrap requests do not create race condition or duplicate user', async () => {
-  await withTestServer({ adminEmail: 'race@admin.local', adminPassword: 'AdminPassword123!' }, async (baseUrl, controls) => {
-    const calls = Array(5).fill(0).map(() =>
-      fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } })
-    );
-    const results = await Promise.all(calls);
-    const statuses = results.map(r => r.status);
-    assert.ok(statuses.includes(201));
-    assert.strictEqual(Array.from(controls.db.users.values()).filter(u => u.email === 'race@admin.local').length, 1);
-  });
+test('B2.5: Concurrent server starts with the same admin identity never create a duplicate user', async () => {
+  // bootstrapAdminFromConfig() runs once, synchronously, at createTestApp()
+  // time — there is no request-driven race window anymore. Exercise the
+  // underlying idempotency guarantee directly instead of via HTTP.
+  const { createTestApp } = require('./harness');
+  const db = new (require('./harness').InMemoryDatabase)();
+  for (let i = 0; i < 5; i++) {
+    createTestApp({ database: db, adminEmail: 'race@admin.local', adminPassword: 'AdminPassword123!' });
+  }
+  assert.strictEqual(Array.from(db.users.values()).filter((u) => u.email === 'race@admin.local').length, 1);
 });
 
 // ============================================================================
@@ -732,8 +734,11 @@ test('B11.4: Concurrent run completion requests do not underflow active run coun
     const user = controls.db.addUser({ email: 'underflow@test.local', password: 'pwd', role: 'member' });
     const { rawKey } = controls.db.createApiKey({ userId: user.id, role: 'member' });
     controls.db.runs.set(999, { id: 999, status: 'running' });
-    await fetch(`${baseUrl}/api/runs/999/complete`, { method: 'POST', headers: { 'x-api-key': rawKey } });
-    await fetch(`${baseUrl}/api/runs/999/complete`, { method: 'POST', headers: { 'x-api-key': rawKey } });
+    // No public HTTP route for completion — call the internal equivalent
+    // directly, twice, to prove the counter clamps at 0 (Math.max(0, ...))
+    // rather than underflowing.
+    controls.completeRun(999);
+    controls.completeRun(999);
     assert.strictEqual(controls.getActiveRunsCount(), 0);
   });
 });
@@ -842,12 +847,12 @@ test('B13.1: Freeze enabled mid-flight: active runs continue execution while que
     });
     assert.strictEqual(r2.status, 503);
 
-    // Active run completes successfully even while frozen
-    const completeRes = await fetch(`${baseUrl}/api/runs/${run.id}/complete`, {
-      method: 'POST',
-      headers: { 'x-api-key': rawKey },
-    });
-    assert.strictEqual(completeRes.status, 200);
+    // Active run completes successfully even while frozen (no public HTTP
+    // route for completion — freeze only gates new-run admission, never
+    // in-flight completion, which is purely internal).
+    const completed = controls.completeRun(run.id);
+    assert.ok(completed, 'Completion must succeed while frozen');
+    assert.strictEqual(completed.status, 'completed');
   });
 });
 

@@ -156,7 +156,7 @@ test('Challenger 2 Empirical RBAC Adversarial Test Suite', async (t) => {
     const admKeyRes = await rawRequest({
       method: 'POST',
       path: '/api/auth/api-keys',
-      headers: { Cookie: `crawler_session=${adminSessionToken}` },
+      headers: { Cookie: `crawler_session=${adminSessionToken}`, 'x-requested-with': 'XMLHttpRequest' },
       body: { name: 'Challenger Admin Key', role: 'admin', prefix: 'cp_adm_' },
     });
     assert.equal(admKeyRes.status, 201, 'Admin key issuance must succeed');
@@ -166,7 +166,7 @@ test('Challenger 2 Empirical RBAC Adversarial Test Suite', async (t) => {
     const memKeyRes = await rawRequest({
       method: 'POST',
       path: '/api/auth/api-keys',
-      headers: { Cookie: `crawler_session=${adminSessionToken}` },
+      headers: { Cookie: `crawler_session=${adminSessionToken}`, 'x-requested-with': 'XMLHttpRequest' },
       body: { name: 'Challenger Member Key', role: 'member', prefix: 'cp_live_' },
     });
     assert.equal(memKeyRes.status, 201, 'Member key issuance must succeed');
@@ -298,16 +298,17 @@ test('Challenger 2 Empirical RBAC Adversarial Test Suite', async (t) => {
     });
 
     await t.test('Section 1: Privilege Escalation — Self-Promotion and Bootstrap Attack Vectors', async () => {
-      // 1. Member calls POST /api/auth/bootstrap trying to overwrite admin password
+      // 1. Member calls POST /api/auth/bootstrap trying to overwrite admin password.
+      // The route itself no longer exists — bootstrap only happens from env
+      // at server boot or via `npm run bootstrap:admin` — so this must be
+      // rejected outright, never reach any bootstrap logic.
       const bootRes = await rawRequest({
         method: 'POST',
         path: '/api/auth/bootstrap',
         headers: { 'x-api-key': memberApiKey },
         body: { adminEmail: 'admin@system.local', adminPassword: 'AttackerNewPassword999!' },
       });
-      // Should report already initialized without overwriting
-      assert.ok([200, 400].includes(bootRes.status));
-      assert.equal(bootRes.json?.message, 'Super admin already initialized');
+      assert.ok([401, 403, 404].includes(bootRes.status), `POST /api/auth/bootstrap must be rejected, got ${bootRes.status}`);
 
       // Verify original admin password is still intact
       const verifyLogin = await rawRequest({

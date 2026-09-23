@@ -71,13 +71,18 @@ test('Live Server: Probes, Bootstrap, Auth Barrier, and RBAC Matrix', async () =
     const unauthAdminRes = await fetch(`${BASE_URL}/admindashboard`);
     assert.equal(unauthAdminRes.status, 401);
 
-    // 5. Verify /api/auth/bootstrap
+    // 5. Verify /api/auth/bootstrap no longer exists as an HTTP route —
+    // Super Admin bootstrap now only happens from env at server boot
+    // (bootstrapDatabase() in server.js) or via `npm run bootstrap:admin`
+    // (scripts/bootstrap-admin.js), never a public/authenticated endpoint.
     const bootRes = await fetch(`${BASE_URL}/api/auth/bootstrap`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
     });
-    // On server startup it was already bootstrapped from env, so it returns 200 or 201
-    assert.ok([200, 201].includes(bootRes.status));
+    // Unauthenticated: the global auth barrier rejects it with 401 before
+    // Express ever gets to report the route missing — from the outside this
+    // is indistinguishable from "does not exist", which is the point.
+    assert.equal(bootRes.status, 401, 'POST /api/auth/bootstrap must not be reachable unauthenticated');
 
     // 6. Login as Super Admin
     const loginRes = await fetch(`${BASE_URL}/api/auth/login`, {
@@ -110,12 +115,25 @@ test('Live Server: Probes, Bootstrap, Auth Barrier, and RBAC Matrix', async () =
     assert.equal(meJson.user.email, 'admin@system.local');
     assert.equal(meJson.user.role, 'admin');
 
+    // 7b. Even authenticated (as admin, with CSRF header), the route is
+    // truly gone — 404, not just gated by auth.
+    const bootAuthedRes = await fetch(`${BASE_URL}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: `crawler_session=${adminSessionToken}`,
+        'x-requested-with': 'XMLHttpRequest',
+      },
+    });
+    assert.equal(bootAuthedRes.status, 404, 'POST /api/auth/bootstrap must not exist, even authenticated');
+
     // 8. Admin issues API key for Member
     const keyRes = await fetch(`${BASE_URL}/api/auth/api-keys`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Cookie: `crawler_session=${adminSessionToken}`,
+        'x-requested-with': 'XMLHttpRequest',
       },
       body: JSON.stringify({
         name: 'Member Test Key',
@@ -160,7 +178,7 @@ test('Live Server: Probes, Bootstrap, Auth Barrier, and RBAC Matrix', async () =
     // 13. Admin revokes API key
     const revokeRes = await fetch(`${BASE_URL}/api/auth/api-keys/${keyJson.id}`, {
       method: 'DELETE',
-      headers: { Cookie: `crawler_session=${adminSessionToken}` },
+      headers: { Cookie: `crawler_session=${adminSessionToken}`, 'x-requested-with': 'XMLHttpRequest' },
     });
     assert.equal(revokeRes.status, 200);
 

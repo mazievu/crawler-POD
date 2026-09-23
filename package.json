@@ -10,6 +10,7 @@
     "start:deps": "node scripts/start-deps.js",
     "start:searxng": "node scripts/start-searxng.js",
     "start:cdp": "node scripts/start-cdp.js",
+    "bootstrap:admin": "node scripts/bootstrap-admin.js",
     "doctor": "node scripts/doctor.js",
     "doctor:channels": "node scripts/doctor.js --channels",
     "setup:capabilities": "node scripts/setup-capabilities.js",

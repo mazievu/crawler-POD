@@ -2080,7 +2080,7 @@ async function startCollect() {
       } catch (e) { console.error(e); }
     }, 3000);
   } catch (err) {
-    status.innerHTML = `<small class="text-danger">❌ ${err.message}</small>`;
+    status.innerHTML = `<small class="text-danger">❌ ${escapeHtml(err.message)}</small>`;
     btn.querySelector('.btn-text').classList.remove('d-none');
     btn.querySelector('.btn-loading').classList.add('d-none');
     btn.disabled = false;
@@ -2273,7 +2273,7 @@ async function loadJobs() {
     }).join('');
     if (window.feather) feather.replace();
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="8" class="text-center py-4 text-danger">Error: ${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="text-center py-4 text-danger">Error: ${escapeHtml(err.message)}</td></tr>`;
   }
 }
 

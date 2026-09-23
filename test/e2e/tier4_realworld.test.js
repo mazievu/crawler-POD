@@ -33,12 +33,11 @@ test('Scenario 1: Cold start -> Health check -> Super admin bootstrap -> Admin l
     const readyz = await fetch(`${baseUrl}/readyz`);
     assert.strictEqual(readyz.status, 200);
 
-    // 2. Super admin bootstrap
-    const bootstrapRes = await fetch(`${baseUrl}/api/auth/bootstrap`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-    });
-    assert.strictEqual(bootstrapRes.status, 201);
+    // 2. Super admin bootstrap already happened at server start (no public
+    // HTTP route for it — see bootstrapAdminFromConfig() in harness.js).
+    const admin = controls.db.getUserByEmail(adminEmail);
+    assert.ok(admin, 'Admin must already exist once the server has started');
+    assert.strictEqual(admin.role, 'admin');
 
     // 3. Super admin logs in
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
@@ -131,8 +130,8 @@ test('Scenario 2: Member logs in -> Checks health -> Submits crawl run -> Polls 
     const polledRun = await pollRes.json();
     assert.strictEqual(polledRun.run.id, run.id);
 
-    // Complete run
-    await fetch(`${baseUrl}/api/runs/${run.id}/complete`, { method: 'POST', headers });
+    // Complete run (no public HTTP route for this)
+    controls.completeRun(run.id);
 
     // 5. Exports data
     const exportRes = await fetch(`${baseUrl}/api/exports`, { headers });
@@ -294,12 +293,8 @@ test('Scenario 5: Spike detected -> Admin enables Emergency Freeze -> Dispatches
     });
     assert.strictEqual(blockedRes.status, 503);
 
-    // 4. In-flight active run completes cleanly
-    const compRes = await fetch(`${baseUrl}/api/runs/${run.id}/complete`, {
-      method: 'POST',
-      headers: { 'x-api-key': rawKey },
-    });
-    assert.strictEqual(compRes.status, 200);
+    // 4. In-flight active run completes cleanly (no public HTTP route for this)
+    controls.completeRun(run.id);
     assert.strictEqual(controls.getActiveRunsCount(), 0);
 
     // 5. Admin revokes suspected key

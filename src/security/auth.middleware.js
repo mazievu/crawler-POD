@@ -245,7 +245,6 @@ function createAuthMiddleware(optionsOrService) {
     const isExcluded = [
       '/api/auth/login',
       '/api/auth/logout',
-      '/api/auth/bootstrap',
       '/livez',
       '/readyz',
     ].includes(req.path);
