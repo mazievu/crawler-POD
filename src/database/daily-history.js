@@ -13,20 +13,41 @@
  */
 
 /**
+ * Unpacks observations_json string into an array safely.
+ */
+function unpackObservations(observationsJson) {
+  if (!observationsJson) return [];
+  if (Array.isArray(observationsJson)) return observationsJson;
+  try {
+    const parsed = JSON.parse(observationsJson);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_e) {
+    return [];
+  }
+}
+
+/**
+ * Serializes observations array into JSON string.
+ */
+function packObservations(observationsArray) {
+  if (!Array.isArray(observationsArray)) return '[]';
+  return JSON.stringify(observationsArray);
+}
+
+/**
  * Deterministic identity for one observation:
+ *  - explicit observationId: returns observationId directly (e.g. 'monitoring:<job_id>:<capture_id>')
  *  - migrating from legacy: `legacy:<snapshot_id>` — re-running the backfill
  *    for the same legacy row must produce the exact same identity, so it
  *    replaces (not duplicates) its own prior migration.
  *  - a real live crawl: `run:<runId>:<itemUid>` — the invariant is one
  *    observation per item per Run, so this is stable and never collides
  *    with a different Run's observation for the same item, even within the
- *    same second (timestamp alone is NOT a safe identity — two crawls can
- *    legitimately land in the same second).
- *  - neither available: no stable identity can be formed; the caller gets
- *    `null` back and the observation is appended without dedup (best-effort
- *    fallback for callers that don't supply either, e.g. ad-hoc scripts).
+ *    same second.
+ *  - neither available: no stable identity can be formed; returns null.
  */
-function buildObservationId({ runId, legacySnapshotId, itemUid }) {
+function buildObservationId({ observationId, runId, legacySnapshotId, itemUid } = {}) {
+  if (observationId != null && observationId !== '') return String(observationId);
   if (legacySnapshotId != null) return `legacy:${legacySnapshotId}`;
   if (runId != null) return `run:${runId}:${itemUid}`;
   return null;
@@ -96,7 +117,7 @@ function createDailyHistoryOps(db) {
   `);
 
   async function appendObservation(item, timestamp = new Date(), identity = {}) {
-    const { runId = null, legacySnapshotId = null } = identity || {};
+    const { observationId = null, runId = null, legacySnapshotId = null } = identity || {};
     const isoStr = normalizeLegacyUtcTimestamp(timestamp);
     const dateStr = isoStr.slice(0, 10); // 'YYYY-MM-DD'
     const timeStr = isoStr.slice(11, 19); // 'HH:MM:SS'
@@ -114,11 +135,11 @@ function createDailyHistoryOps(db) {
     // before DB rebuild/cutover — not deferred to a later migration.
     const reviews = Number(item.reviews || 0);
 
-    const observationId = buildObservationId({ runId, legacySnapshotId, itemUid: item.item_uid });
+    const observationIdVal = buildObservationId({ observationId, runId, legacySnapshotId, itemUid: item.item_uid });
 
     const observation = {
-      observationId,
-      runId,
+      observationId: observationIdVal,
+      runId: runId != null ? runId : null,
       time: timeStr,
       price,
       likes,
@@ -146,7 +167,7 @@ function createDailyHistoryOps(db) {
         item_uid: item.item_uid,
         platform: item.platform,
         date: dateStr,
-        observations_json: JSON.stringify(observationsArray),
+        observations_json: packObservations(observationsArray),
         observation_count: observationsArray.length,
         price,
         likes,
@@ -156,22 +177,17 @@ function createDailyHistoryOps(db) {
       return { date: dateStr, count: 1, duplicate: false };
     }
 
-    let observationsArray = [];
-    try {
-      observationsArray = JSON.parse(existing.observations_json || '[]');
-      if (!Array.isArray(observationsArray)) observationsArray = [];
-    } catch (_e) {
-      observationsArray = [];
-    }
+    let observationsArray = unpackObservations(existing.observations_json);
 
     // §4.1: idempotent by observationId identity when available:
+    //  - explicit observationId (e.g. monitoring:<jobId>:<captureId>)
     //  - legacy:<id> (migration backfill): replaces prior entry for the same snapshot row
     //  - run:<runId>:<itemUid> (live crawl): replaces prior entry for the same Run attempt
     // If no observationId is available, falls back to time-based matching.
     let duplicate = false;
     let existingIndex = -1;
-    if (observationId != null) {
-      existingIndex = observationsArray.findIndex(o => o && o.observationId === observationId);
+    if (observationIdVal != null) {
+      existingIndex = observationsArray.findIndex(o => o && o.observationId === observationIdVal);
     } else {
       existingIndex = observationsArray.findIndex(o => o && o.time === timeStr);
     }
@@ -186,7 +202,7 @@ function createDailyHistoryOps(db) {
     await updateRow.run({
       item_uid: item.item_uid,
       date: dateStr,
-      observations_json: JSON.stringify(observationsArray),
+      observations_json: packObservations(observationsArray),
       observation_count: observationsArray.length,
       price,
       likes,
@@ -199,12 +215,7 @@ function createDailyHistoryOps(db) {
   async function getHistory(itemUid, limitDays = 30) {
     const rows = await findHistoryByUid.all(itemUid, limitDays);
     return rows.map(r => {
-      let observations = [];
-      try {
-        observations = JSON.parse(r.observations_json || '[]');
-      } catch (_e) {
-        observations = [];
-      }
+      const observations = unpackObservations(r.observations_json);
       return {
         ...r,
         observations
@@ -217,8 +228,16 @@ function createDailyHistoryOps(db) {
     getHistory,
     findRow: async (itemUid, date) => await findRow.get(itemUid, date),
     buildObservationId,
-    normalizeLegacyUtcTimestamp
+    normalizeLegacyUtcTimestamp,
+    packObservations,
+    unpackObservations
   };
 }
 
-module.exports = { createDailyHistoryOps, buildObservationId, normalizeLegacyUtcTimestamp };
+module.exports = {
+  createDailyHistoryOps,
+  buildObservationId,
+  normalizeLegacyUtcTimestamp,
+  packObservations,
+  unpackObservations,
+};
