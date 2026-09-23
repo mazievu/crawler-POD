@@ -43,7 +43,11 @@
  * used anywhere in these queries.
  */
 
+const path = require('node:path');
 const { PgDatabase, createPool, translateDialect, translateParams } = require('../database/pg-client');
+
+// Load .env explicitly if invoked in standalone MCP process
+require('dotenv').config({ path: path.join(__dirname, '..', '..', '.env') });
 
 function pgMode() {
   return (process.env.PG_MODE || '').toLowerCase();
@@ -74,11 +78,15 @@ async function bridgeQuery(baseUrl, sql, params, timeoutMs = 8000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let response;
+  const headers = { 'content-type': 'application/json' };
+  if (process.env.INTERNAL_SERVICE_KEY) {
+    headers['x-internal-service-key'] = process.env.INTERNAL_SERVICE_KEY;
+  }
   try {
     response = await fetch(`${baseUrl}${BRIDGE_QUERY_PATH}`, {
       method: 'POST',
       signal: controller.signal,
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify({ sql, params }),
     });
   } catch (err) {
@@ -90,7 +98,7 @@ async function bridgeQuery(baseUrl, sql, params, timeoutMs = 8000) {
   let parsed;
   try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = raw; }
   if (!response.ok) {
-    throw new Error((parsed && parsed.error) || `mcp-bridge query failed (HTTP ${response.status})`);
+    throw new Error((parsed && (parsed.message || parsed.error)) || `mcp-bridge query failed (HTTP ${response.status})`);
   }
   return (parsed && parsed.rows) || [];
 }

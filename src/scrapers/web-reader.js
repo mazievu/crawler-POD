@@ -5,6 +5,8 @@
  * readable Markdown/text, not platform-specific structured product metrics.
  */
 
+const { validateOutboundUrl, safeFetch } = require('../security/outbound-guard');
+
 const DEFAULT_READER_BASE = process.env.JINA_READER_URL || 'https://r.jina.ai/';
 
 function normalizeUrl(url) {
@@ -29,13 +31,21 @@ function titleFromMarkdown(markdown, fallbackUrl) {
 
 async function readPublicWebPage(url, options = {}) {
   const normalizedUrl = normalizeUrl(url);
+  // SSRF Pre-flight validation on target destination URL
+  await validateOutboundUrl(normalizedUrl, options);
+
   const readerUrl = buildJinaReaderUrl(normalizedUrl, options.readerBase || DEFAULT_READER_BASE);
-  const response = await fetch(readerUrl, {
+  // SSRF Pre-flight validation on full reader URL (guards custom readerBase)
+  await validateOutboundUrl(readerUrl, options);
+
+  const response = await safeFetch(readerUrl, {
     headers: {
       'Accept': 'text/plain',
       'User-Agent': 'Mozilla/5.0 ApifyCollector/1.0',
     },
     signal: AbortSignal.timeout(options.timeoutMs || 30000),
+    maxSizeBytes: 10 * 1024 * 1024,
+    ...options,
   });
 
   if (!response.ok) {

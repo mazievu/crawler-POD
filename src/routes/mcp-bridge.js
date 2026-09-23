@@ -35,12 +35,55 @@
  */
 
 const express = require('express');
+const crypto = require('node:crypto');
 
 /** Normalizes an IPv4-mapped-IPv6 address ("::ffff:127.0.0.1") before compare. */
 function isLoopbackAddress(address) {
   if (!address || typeof address !== 'string') return false;
   const normalized = address.replace(/^::ffff:/, '');
   return normalized === '127.0.0.1' || normalized === '::1' || normalized === 'localhost';
+}
+
+/**
+ * Extracts internal service key from request headers:
+ * Priority 1: x-internal-service-key
+ * Priority 2: Authorization: Bearer <key>
+ * Preserves exact character values without trimming to prevent control-char bypasses.
+ */
+function extractInternalServiceKey(req) {
+  if (!req || !req.headers) return null;
+  const rawKey = req.headers['x-internal-service-key'];
+  const keyHeader = Array.isArray(rawKey) ? rawKey[0] : rawKey;
+  if (typeof keyHeader === 'string' && keyHeader.length > 0) {
+    return keyHeader;
+  }
+  const rawAuth = req.headers['authorization'];
+  const authHeader = Array.isArray(rawAuth) ? rawAuth[0] : rawAuth;
+  if (typeof authHeader === 'string') {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Constant-time comparison between provided key and expected key.
+ * Hashes both keys with SHA-256 before crypto.timingSafeEqual:
+ * 1. Guarantees deterministic 32-byte buffers, eliminating RangeError on length mismatch.
+ * 2. Eliminates length timing side-channels.
+ */
+function verifyInternalServiceKey(providedKey, expectedKey) {
+  if (!expectedKey || typeof expectedKey !== 'string') {
+    return false;
+  }
+  if (!providedKey || typeof providedKey !== 'string') {
+    return false;
+  }
+  const expectedHash = crypto.createHash('sha256').update(expectedKey).digest();
+  const providedHash = crypto.createHash('sha256').update(providedKey).digest();
+  return crypto.timingSafeEqual(expectedHash, providedHash);
 }
 
 /**
@@ -76,6 +119,52 @@ function assertReadOnlySql(sql) {
 const QUERY_PATH = '/api/internal/mcp-bridge/query';
 
 /**
+ * Middleware enforcing ingress lockdown on all /api/internal/* routes.
+ * 1. Service key verification (constant-time, HTTP 403 if missing/invalid).
+ * 2. Defense-in-depth: raw socket loopback check.
+ * 3. Defense-in-depth: browser Origin / Sec-Fetch rejection.
+ */
+function guardInternalService(req, res, next) {
+  const expectedKey = process.env.INTERNAL_SERVICE_KEY;
+  if (!expectedKey || typeof expectedKey !== 'string' || !expectedKey.trim()) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'mcp-bridge: INTERNAL_SERVICE_KEY required',
+    });
+  }
+
+  const providedKey = extractInternalServiceKey(req);
+  if (!providedKey) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'mcp-bridge: INTERNAL_SERVICE_KEY required',
+    });
+  }
+
+  if (!verifyInternalServiceKey(providedKey, expectedKey)) {
+    return res.status(403).json({
+      error: 'Forbidden',
+      message: 'mcp-bridge: Invalid service credentials',
+    });
+  }
+
+  if (!isLoopbackAddress(req.socket && req.socket.remoteAddress)) {
+    return res.status(403).json({ error: 'Forbidden', message: 'mcp-bridge: loopback requests only' });
+  }
+
+  const isBrowser = Boolean(
+    req.headers.origin ||
+    req.headers['sec-fetch-site'] ||
+    (req.headers['sec-fetch-mode'] && req.headers['user-agent'] && !req.headers['user-agent'].includes('node'))
+  );
+  if (isBrowser) {
+    return res.status(403).json({ error: 'Forbidden', message: 'mcp-bridge: browser-originated requests are refused' });
+  }
+
+  next();
+}
+
+/**
  * @param {Object} deps
  * @param {Object} deps.database - the already-initialized `./src/database`
  *   module (or any object exposing `_connection.prepare(sql).all(...)`,
@@ -89,34 +178,10 @@ function createMcpBridgeRouter({ database }) {
 
   const router = express.Router();
 
-  // Both guards are attached to the ONE endpoint below, never as router-level
-  // middleware. This router is mounted with app.use(router) at the app root, so
-  // a router.use() guard runs for EVERY request the app receives - which is how
-  // an earlier version of this file answered 403 to the browser UI's own
-  // /api/* calls and emptied the page.
-  function guardBridgeRequest(req, res, next) {
-    if (!isLoopbackAddress(req.socket && req.socket.remoteAddress)) {
-      return res.status(403).json({ error: 'mcp-bridge: loopback requests only' });
-    }
-    // A loopback check ALONE does not make this endpoint safe. server.js mounts
-    // cors() with its permissive default, so a page on any website the user
-    // happens to visit can POST here from their browser and the socket address
-    // is still 127.0.0.1. Browsers are required to attach Origin / Sec-Fetch-*
-    // to such a request. Note: Node.js 22 (undici) fetch automatically sends
-    // `sec-fetch-mode: cors` by default with `user-agent: node`, but never
-    // sends `origin` or `sec-fetch-site`.
-    const isBrowser = Boolean(
-      req.headers.origin ||
-      req.headers['sec-fetch-site'] ||
-      (req.headers['sec-fetch-mode'] && req.headers['user-agent'] && !req.headers['user-agent'].includes('node'))
-    );
-    if (isBrowser) {
-      return res.status(403).json({ error: 'mcp-bridge: browser-originated requests are refused' });
-    }
-    next();
-  }
+  // Guard all /api/internal/* routes mounted on this router
+  router.use('/api/internal', guardInternalService);
 
-  router.post(QUERY_PATH, guardBridgeRequest, async (req, res) => {
+  router.post(QUERY_PATH, async (req, res) => {
     const body = req.body || {};
     const { sql, params } = body;
     if (typeof sql !== 'string' || !sql.trim()) {
@@ -146,7 +211,20 @@ function createMcpBridgeRouter({ database }) {
     }
   });
 
+  // Explicitly 404 any unknown /api/internal/* endpoints that cleared authentication
+  router.all('/api/internal/*', (req, res) => {
+    res.status(404).json({ error: 'Not Found', message: 'Unknown internal endpoint' });
+  });
+
   return router;
 }
 
-module.exports = { createMcpBridgeRouter, assertReadOnlySql, isLoopbackAddress, QUERY_PATH };
+module.exports = {
+  createMcpBridgeRouter,
+  assertReadOnlySql,
+  isLoopbackAddress,
+  extractInternalServiceKey,
+  verifyInternalServiceKey,
+  guardInternalService,
+  QUERY_PATH,
+};

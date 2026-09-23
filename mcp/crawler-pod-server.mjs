@@ -182,14 +182,18 @@ const TOOLS = [
 
 // ==================== Tool implementations ====================
 
-async function httpJson(url, { method = 'GET', body, timeoutMs = 8000 } = {}) {
+async function httpJson(url, { method = 'GET', headers: customHeaders = {}, body, timeoutMs = 8000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    const headers = {
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      ...customHeaders,
+    };
     const response = await fetch(url, {
       method,
       signal: controller.signal,
-      headers: body ? { 'content-type': 'application/json' } : undefined,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
       body: body ? JSON.stringify(body) : undefined,
     });
     const raw = await response.text();
@@ -207,12 +211,17 @@ async function httpJson(url, { method = 'GET', body, timeoutMs = 8000 } = {}) {
  *  mcp-bridge endpoint (src/routes/mcp-bridge.js) and returns its rows. Only
  *  used in PG_MODE=pglite — see the module doc above for why. */
 async function bridgeQuery(sql, params, port) {
+  const headers = {};
+  if (process.env.INTERNAL_SERVICE_KEY) {
+    headers['x-internal-service-key'] = process.env.INTERNAL_SERVICE_KEY;
+  }
   const res = await httpJson(`http://127.0.0.1:${port}${BRIDGE_QUERY_PATH}`, {
     method: 'POST',
+    headers,
     body: { sql, params },
   });
   if (res.offline) throw new Error(offlineMessage(port));
-  if (!res.ok) throw new Error((res.body && res.body.error) || `mcp-bridge query failed (HTTP ${res.status})`);
+  if (!res.ok) throw new Error((res.body && (res.body.message || res.body.error)) || `mcp-bridge query failed (HTTP ${res.status})`);
   return res.body.rows;
 }
 
