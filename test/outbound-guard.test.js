@@ -388,30 +388,104 @@ test('OG6.5: safeFetch enforces strict byte size limits (content-length & stream
   );
 });
 
-test('OG6.6: safeFetch pins connection to resolved IP to prevent DNS rebinding TOCTOU', async () => {
-  let fetchedUrl = '';
-  let hostHeader = '';
+test('OG6.6: safeFetch keeps the original hostname (SNI/Host) and pins via a guarded dispatcher, not an IP rewrite', async () => {
+  let captured = null;
   const mockFetch = async (url, options) => {
-    fetchedUrl = url;
-    if (options && options.headers) {
-      if (typeof options.headers.get === 'function') {
-        hostHeader = options.headers.get('host') || options.headers.get('Host');
-      } else {
-        hostHeader = options.headers.host || options.headers.Host;
-      }
-    }
+    captured = { url, options };
     return { status: 200, headers: new Map() };
   };
 
   const res = await safeFetch('https://rebinding.example.com/data', {
     mockFetch,
-    dnsResolver: async () => '93.184.216.34', // Validator resolves to public IP
+    dnsResolver: async () => '93.184.216.34',
   });
 
   assert.equal(res.status, 200);
-  const parsed = new URL(fetchedUrl);
-  assert.equal(parsed.hostname, '93.184.216.34', 'Fetch should use the validated IP');
-  assert.equal(hostHeader, 'rebinding.example.com', 'Original Host header should be preserved');
+  assert.equal(new URL(captured.url).hostname, 'rebinding.example.com', 'URL must keep hostname so SNI/cert validation work');
+  assert.ok(captured.options.dispatcher, 'a guarded dispatcher must be supplied');
+  assert.equal(typeof captured.options.dispatcher.dispatch, 'function');
+  assert.equal(captured.options.redirect, 'manual');
+  assert.equal(new Headers(captured.options.headers).get('host'), null, 'Host must not be forced manually');
+});
+
+test('OG6.7: safeFetch preserves caller headers passed as a Headers object or tuple array', async () => {
+  const seen = [];
+  const mockFetch = async (url, options) => {
+    seen.push(new Headers(options.headers));
+    return { status: 200, headers: new Map() };
+  };
+  const common = { mockFetch, dnsResolver: async () => '93.184.216.34' };
+
+  await safeFetch('https://example.com/a', { ...common, headers: new Headers({ 'X-Probe': 'headers-object' }) });
+  await safeFetch('https://example.com/b', { ...common, headers: [['X-Probe', 'tuple-array']] });
+  await safeFetch('https://example.com/c', { ...common, headers: { 'X-Probe': 'plain-object' } });
+
+  assert.deepEqual(seen.map(h => h.get('x-probe')), ['headers-object', 'tuple-array', 'plain-object']);
+});
+
+test('OG6.8: safeFetch does not mutate the caller options object', async () => {
+  const headers = new Headers({ 'X-Probe': '1' });
+  const options = Object.freeze({
+    headers,
+    mockFetch: async () => ({ status: 200, headers: new Map() }),
+    dnsResolver: async () => '93.184.216.34',
+  });
+  await safeFetch('https://example.com/x', options);
+  assert.equal(options.headers, headers);
+  assert.deepEqual([...headers.entries()], [['x-probe', '1']]);
+});
+
+// ============================================================================
+// 9. IPv6 transition / embedded-IPv4 / deprecated ranges
+// ============================================================================
+
+test('OG9.1: isPrivateIp blocks IPv4-compatible, NAT64, 6to4, site-local and discard-only IPv6', () => {
+  const blocked = [
+    '::7f00:1', // IPv4-compatible ::127.0.0.1 (hex form)
+    '::127.0.0.1', // IPv4-compatible dotted
+    '0:0:0:0:0:0:7f00:1',
+    '64:ff9b::7f00:1', // NAT64 -> 127.0.0.1
+    '64:ff9b::10.0.0.1', // NAT64 dotted -> 10.0.0.1
+    '64:ff9b::a9fe:a9fe', // NAT64 -> 169.254.169.254
+    '0064:ff9b:0000:0000:0000:0000:c0a8:0101', // NAT64 fully expanded -> 192.168.1.1
+    '64:ff9b:1::1', // Local-use NAT64 (RFC 8215)
+    '2002:7f00:1::1', // 6to4 -> 127.0.0.1
+    '2002:c0a8:101::', // 6to4 -> 192.168.1.1
+    '2002:a9fe:a9fe::1', // 6to4 -> 169.254.169.254
+    'fec0::1', // site-local (deprecated)
+    'feff::1', // top of fec0::/10
+    '100::1', // discard-only 100::/64
+    '100::ffff:ffff:ffff:ffff',
+    '[fe80::1%eth0]', // link-local with zone id
+    '2001:db8::1', // documentation
+  ];
+  for (const ip of blocked) {
+    assert.equal(isPrivateIp(ip), true, `${ip} must be treated as private`);
+  }
+});
+
+test('OG9.2: isPrivateIp keeps public IPv6 (including transition forms embedding public IPv4) reachable', () => {
+  const allowed = [
+    '2606:4700::1111',
+    '2001:4860:4860::8888',
+    '64:ff9b::808:808', // NAT64 -> 8.8.8.8
+    '2002:808:808::1', // 6to4 -> 8.8.8.8
+    '::ffff:8.8.8.8',
+  ];
+  for (const ip of allowed) {
+    assert.equal(isPrivateIp(ip), false, `${ip} must be treated as public`);
+  }
+});
+
+test('OG9.3: validateOutboundUrl rejects bracketed IPv6 literals embedding private IPv4', async () => {
+  const urls = ['http://[::7f00:1]/', 'http://[64:ff9b::7f00:1]/', 'http://[2002:a9fe:a9fe::]/', 'http://[fec0::1]/', 'http://[100::1]/'];
+  for (const url of urls) {
+    await assert.rejects(
+      async () => validateOutboundUrl(url),
+      (err) => err instanceof SSRFSecurityError && err.blockedReason === 'PRIVATE_IP_BLOCKED',
+      url
+    );
+  }
 });
 
 // ============================================================================
