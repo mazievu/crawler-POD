@@ -159,6 +159,10 @@ function createMonitoringOps(db, options = {}) {
     SELECT * FROM monitoring_items WHERE item_uid = ?;
   `);
 
+  const findItemById = db.prepare(`
+    SELECT * FROM monitoring_items WHERE id = ?;
+  `);
+
   const findItemWithEntityStmt = db.prepare(`
     SELECT mi.*,
            me.platform, me.entity_type, me.external_id, me.display_name,
@@ -540,6 +544,11 @@ function createMonitoringOps(db, options = {}) {
     return await findItemByUid.get(itemUid) || null;
   }
 
+  async function getMonitoringItemById(itemId) {
+    if (itemId == null) return null;
+    return await findItemById.get(Number(itemId)) || null;
+  }
+
   async function getItemWithEntity(itemUid) {
     if (!itemUid) return null;
     return await findItemWithEntityStmt.get(itemUid) || null;
@@ -851,6 +860,11 @@ function createMonitoringOps(db, options = {}) {
         .map(o => o.price)
         .filter(p => p !== null && p !== undefined && !isNaN(p));
 
+      const obsWithValidPrices = observations.filter(o => o.price !== null && o.price !== undefined && !isNaN(o.price));
+      const latestPriceObs = obsWithValidPrices.length > 0
+        ? obsWithValidPrices.reduce((latest, o) => new Date(o.time).getTime() > new Date(latest.time).getTime() ? o : latest, obsWithValidPrices[0])
+        : null;
+
       if (historyRow) {
         const minPrice = validPrices.length > 0
           ? validPrices.reduce((m, p) => (p < m ? p : m), validPrices[0])
@@ -860,7 +874,7 @@ function createMonitoringOps(db, options = {}) {
           : historyRow.max_price;
         const latestPrice = (isNonNegMetric(patch.price) && !isLateArrival)
           ? Number(patch.price)
-          : (validPrices.length > 0 ? validPrices[validPrices.length - 1] : historyRow.latest_price);
+          : (latestPriceObs ? latestPriceObs.price : historyRow.latest_price);
         const latestLikes = (isNonNegMetric(patch.likes) && !isLateArrival)
           ? Math.trunc(Number(patch.likes))
           : historyRow.latest_likes;
@@ -1808,7 +1822,7 @@ function createMonitoringOps(db, options = {}) {
           -- Scheduled time (aging)
           j.scheduled_for ASC
         LIMIT 1
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE OF j SKIP LOCKED
       )
       RETURNING *;
     `, [workerToken, `${leaseDurationMs}`]);
@@ -1946,6 +1960,7 @@ function createMonitoringOps(db, options = {}) {
     registerItemForMonitoring,
     handlePendingIdentity,
     getItem,
+    getMonitoringItemById,
     getItemWithEntity,
     resolvePendingIdentity,
     findDueItems,

@@ -83,8 +83,11 @@ async function bootstrapDatabase() {
   const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
   const adminPassword = process.env.ADMIN_PASSWORD;
 
-  if (adminEmail && adminPassword && adminPassword.trim().length > 0) {
-    try {
+  try {
+    const adminCount = await db.countAdmins();
+    if (adminCount > 0) {
+      console.log('[Auth] Super Admin already exists');
+    } else if (adminEmail && adminPassword && adminPassword.trim().length > 0) {
       const { getAuthService } = require('./src/security/auth.service');
       const auth = getAuthService(db);
       const result = await auth.bootstrapSuperAdmin({ email: adminEmail, password: adminPassword });
@@ -93,11 +96,11 @@ async function bootstrapDatabase() {
       } else {
         console.log(`[Auth] Super Admin account verified: ${adminEmail}`);
       }
-    } catch (err) {
-      console.error('[Auth] Super Admin bootstrap failed:', err.message);
+    } else {
+      console.log('[Auth] Super Admin bootstrap skipped (ADMIN_EMAIL or ADMIN_PASSWORD not configured)');
     }
-  } else {
-    console.log('[Auth] Super Admin bootstrap skipped (ADMIN_EMAIL or ADMIN_PASSWORD not configured)');
+  } catch (err) {
+    console.error('[Auth] Super Admin bootstrap failed:', err.message);
   }
 
   // Boot-time crash recovery
@@ -372,7 +375,6 @@ function csrfProtection(req, res, next) {
   const isExcluded = [
     '/api/auth/login',
     '/api/auth/logout',
-    '/api/auth/bootstrap',
     '/livez',
     '/readyz',
   ].includes(req.path);
@@ -1181,35 +1183,7 @@ app.post('/api/runs', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/runs/:id/complete', async (req, res) => {
-  try {
-    const runId = parseInt(req.params.id, 10);
-    const run = await db.getRunById(runId);
-    if (!run) return res.status(404).json({ error: 'Run not found' });
 
-    await db.updateRun(runId, { status: 'completed' });
-
-    // Decrement active concurrency if active in scheduler
-    for (const [token, meta] of scheduler.activeRunMetrics.entries()) {
-      if (meta.runId === runId) {
-        scheduler.activeRunMetrics.delete(token);
-        scheduler.pools.releaseAllForToken(token);
-        scheduler.monitor.release(token);
-        break;
-      }
-    }
-    if (scheduler.getActiveExecutionCount() > 0 && scheduler._simulatedActiveDelta > 0) {
-      scheduler._simulatedActiveDelta--;
-    }
-
-    res.status(200).json({
-      message: 'Run completed',
-      run: { ...run, status: 'completed' },
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.get('/api/system/info', (req, res) => {
   res.json(getSystemInfo());

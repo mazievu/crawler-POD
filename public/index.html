@@ -10,6 +10,23 @@
   <link rel="stylesheet" href="style.css?v=4.1.0">
 </head>
 <body>
+  <div id="login-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:9999; align-items:center; justify-content:center;">
+    <div style="background:white; padding:2rem; border-radius:8px; min-width:320px;">
+      <h2>Đăng nhập Crawler-POD</h2>
+      <form id="login-form">
+        <div style="margin-bottom:1rem;">
+          <label>Email</label><br>
+          <input type="email" id="login-email" required style="width:100%; padding:0.5rem;">
+        </div>
+        <div style="margin-bottom:1rem;">
+          <label>Mật khẩu</label><br>
+          <input type="password" id="login-password" required style="width:100%; padding:0.5rem;">
+        </div>
+        <div id="login-error" style="color:red; margin-bottom:0.5rem;"></div>
+        <button type="submit" style="width:100%; padding:0.5rem; background:#4CAF50; color:white; border:none; border-radius:4px; cursor:pointer;">Đăng nhập</button>
+      </form>
+    </div>
+  </div>
 
   <!-- ===== Top Bar ===== -->
   <nav class="topbar">
@@ -20,6 +37,7 @@
         <span class="topbar-badge" id="stat-total">0 items</span>
       </div>
       <div class="topbar-right">
+        <div id="user-info-container" class="d-inline-flex align-items-center me-3"></div>
         <button class="btn-topbar" onclick="showMarketplaceAccountsModal()">
           <i data-feather="key"></i> Marketplace Accounts
         </button>

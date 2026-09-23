@@ -375,12 +375,23 @@ async function safeFetch(urlStr, fetchOptions = {}) {
       // Validate outbound URL on every hop
       const validated = await validateOutboundUrl(currentUrl, { dnsResolver });
 
+      // Pinned IP connection to prevent DNS rebinding TOCTOU
+      const pinnedUrl = new URL(validated.normalizedUrl);
+      const originalHost = pinnedUrl.hostname;
+      if (validated.resolvedIp) {
+        pinnedUrl.hostname = validated.resolvedIp;
+      }
+
       // Execute HTTP request
       const fetchFn = mockFetch || global.fetch;
-      const response = await fetchFn(validated.normalizedUrl, {
+      const response = await fetchFn(pinnedUrl.toString(), {
         ...restOptions,
         redirect: 'manual', // Never auto-follow redirects
         signal: activeSignal,
+        headers: {
+          ...restOptions.headers,
+          'Host': originalHost,
+        },
       });
 
       // Handle redirect status codes

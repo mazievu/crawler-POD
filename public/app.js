@@ -12,11 +12,84 @@ let marketplaceLoginSessionId = null;
 let marketplaceProxyProfiles = [];
 
 document.addEventListener('DOMContentLoaded', async () => {
+  const loginForm = document.getElementById('login-form');
+  if (loginForm) {
+    loginForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('login-email').value;
+      const password = document.getElementById('login-password').value;
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-requested-with': 'XMLHttpRequest' },
+          body: JSON.stringify({ email, password }),
+          credentials: 'same-origin',
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          document.getElementById('login-error').textContent = err.message || 'Login failed';
+          return;
+        }
+        hideLoginOverlay();
+        location.reload();
+      } catch (err) {
+        document.getElementById('login-error').textContent = 'Network error';
+      }
+    });
+  }
+
+  const isAuth = await checkAuth();
+  if (!isAuth) return;
+
   feather.replace();
   await loadData();
   await loadMetricGroups();
   setupSearch();
 });
+
+async function checkAuth() {
+  try {
+    const res = await fetch('/api/auth/me', { credentials: 'same-origin', headers: { 'x-requested-with': 'XMLHttpRequest' } });
+    if (res.status === 401) {
+      showLoginOverlay();
+      return false;
+    }
+    const data = await res.json();
+    hideLoginOverlay();
+    updateUserInfo(data.user);
+    return true;
+  } catch {
+    showLoginOverlay();
+    return false;
+  }
+}
+
+function showLoginOverlay() {
+  const overlay = document.getElementById('login-overlay');
+  if (overlay) overlay.style.display = 'flex';
+}
+
+function hideLoginOverlay() {
+  const overlay = document.getElementById('login-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function updateUserInfo(user) {
+  const container = document.getElementById('user-info-container');
+  if (container && user) {
+    container.innerHTML = `
+      <span class="text-white me-3" style="font-size:13px">${escapeHtml(user.email)}</span>
+      <button class="btn btn-outline-light btn-sm" onclick="logout()">Logout</button>
+    `;
+  }
+}
+
+async function logout() {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin', headers: { 'x-requested-with': 'XMLHttpRequest' } });
+    location.reload();
+  } catch (err) {}
+}
 
 // ==================== Data Loading ====================
 
@@ -2219,7 +2292,13 @@ async function deleteJob(id) {
 
 async function apiFetch(endpoint, options = {}) {
   const { returnMeta, ...fetchOpts } = options;
-  const res = await fetch(endpoint, { headers: { 'Content-Type': 'application/json', ...fetchOpts.headers }, ...fetchOpts });
+  const headers = { 'Content-Type': 'application/json', 'x-requested-with': 'XMLHttpRequest', ...fetchOpts.headers };
+  fetchOpts.credentials = 'same-origin';
+  const res = await fetch(endpoint, { headers, ...fetchOpts });
+  if (res.status === 401) {
+    if (typeof showLoginOverlay === 'function') showLoginOverlay();
+    throw new Error('Unauthorized');
+  }
   const rawText = await res.text();
   let data;
   try {

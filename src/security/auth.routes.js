@@ -49,45 +49,6 @@ function createAuthRouter(options = {}) {
     }
   });
 
-  // 2. Super Admin Bootstrap Endpoint (Public)
-  router.post(['/bootstrap', '/api/auth/bootstrap'], async (req, res) => {
-    try {
-      const adminEmail = (process.env.ADMIN_EMAIL || req.body?.adminEmail || '').trim();
-      const adminPassword = process.env.ADMIN_PASSWORD || req.body?.adminPassword;
-
-      if (!adminEmail || !adminPassword || (typeof adminPassword === 'string' && !adminPassword.trim())) {
-        return res.status(400).json({
-          error: 'Bootstrap Failed',
-          message: 'ADMIN_EMAIL and ADMIN_PASSWORD required in environment',
-        });
-      }
-
-      const existing = await authService.getUserByEmail(adminEmail);
-      if (existing) {
-        return res.status(200).json({
-          message: 'Super admin already initialized',
-          email: existing.email,
-        });
-      }
-
-      const result = await authService.bootstrapSuperAdmin({ email: adminEmail, password: adminPassword });
-      if (result.alreadyExists) {
-        return res.status(200).json({
-          message: 'Super admin already initialized',
-          email: result.user.email,
-        });
-      }
-
-      // Plain password is never exposed in response
-      res.status(201).json({
-        message: 'Super admin bootstrapped successfully',
-        email: result.user.email,
-        role: result.user.role,
-      });
-    } catch (err) {
-      res.status(500).json({ error: 'Internal Server Error', message: err.message });
-    }
-  });
 
   // 3. User Logout (Authenticated)
   router.post(['/logout', '/api/auth/logout'], requireAuth, async (req, res) => {

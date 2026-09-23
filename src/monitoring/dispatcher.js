@@ -195,8 +195,10 @@ class MonitoringDispatcher {
       failMonitoringJob,
       applyShopObservation,
       applyMonitoringObservation,
-      getItem,
+      createMonitoringOps,
     } = require('../database/monitoring');
+
+    const monitoringOps = createMonitoringOps(this.db);
 
     let browserSlotAcquired = false;
     let captureSuccess = false;
@@ -206,6 +208,9 @@ class MonitoringDispatcher {
     // Heartbeat renewal interval for slow captures
     const heartbeat = setInterval(() => {
       this.limiter.renewLease(workerToken, 60000).catch(() => {});
+      if (monitoringOps.renewJobLease) {
+        monitoringOps.renewJobLease(job.id, workerToken, 60000).catch(() => {});
+      }
     }, 15000);
 
     try {
@@ -243,20 +248,25 @@ class MonitoringDispatcher {
 
     try {
       if (captureSuccess) {
-        // Apply observation if payload exists
-        if (job.kind === 'shop_probe' && job.entity_id && captureResult?.value !== undefined && captureResult?.value !== null) {
-          try {
+        // Verify lease still valid before writing
+        if (monitoringOps.verifyJobClaim) {
+          const jobStillMine = await monitoringOps.verifyJobClaim(job.id, workerToken);
+          if (!jobStillMine) {
+            console.warn(`[MonitoringDispatcher] Lost lease on job ${job.id}, aborting write`);
+            return; // Don't write, don't complete, don't fail — lease was revoked
+          }
+        }
+
+        try {
+          // Apply observation if payload exists
+          if (job.kind === 'shop_probe' && job.entity_id && captureResult?.value !== undefined && captureResult?.value !== null) {
             await applyShopObservation(this.db, job.entity_id, {
               value: captureResult.value,
               observedAt: captureResult.observedAt || new Date().toISOString(),
               quality: captureResult.quality || 'exact',
             });
-          } catch (e) {
-            console.warn('[MonitoringDispatcher] Shop observation error:', e.message);
-          }
-        } else if (job.kind === 'item_refresh' && job.item_id && captureResult?.patch) {
-          try {
-            const item = await getItem(this.db, job.item_id);
+          } else if (job.kind === 'item_refresh' && job.item_id && captureResult?.patch) {
+            const item = await monitoringOps.getMonitoringItemById(job.item_id);
             if (item && item.item_uid) {
               const obsId = captureResult.observationId || `obs-${job.id}-${Date.now()}`;
               await applyMonitoringObservation(this.db, {
@@ -265,18 +275,24 @@ class MonitoringDispatcher {
                 metadata: { observationId: obsId },
               });
             }
-          } catch (e) {
-            console.warn('[MonitoringDispatcher] Item observation error:', e.message);
           }
+
+          const observationId = captureResult?.observationId || `obs-completed-${job.id}-${Date.now()}`;
+          await completeMonitoringJob(this.db, {
+            jobId: job.id,
+            claimToken: workerToken,
+            observationId,
+          });
+
+        } catch (e) {
+          console.warn('[MonitoringDispatcher] Observation write error:', e.message);
+          await failMonitoringJob(this.db, {
+            jobId: job.id,
+            claimToken: workerToken,
+            error: e,
+            isRetryable: true,
+          });
         }
-
-        const observationId = captureResult?.observationId || `obs-completed-${job.id}-${Date.now()}`;
-        await completeMonitoringJob(this.db, {
-          jobId: job.id,
-          claimToken: workerToken,
-          observationId,
-        });
-
       } else {
         const error = captureError || new Error(captureResult?.error || 'Capture returned failure');
         const isRetryable = captureResult?.isRetryable !== false;

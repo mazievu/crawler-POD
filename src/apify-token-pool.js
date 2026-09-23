@@ -125,6 +125,10 @@ class ApifyTokenPoolManager {
     this.lastBudgetSyncAt = null;
     this.syncIntervalMs = Number(options.syncIntervalMs) || 300000;
 
+    this.defaultEstimatedCostUsd = options.defaultEstimatedCostUsd !== undefined ? Number(options.defaultEstimatedCostUsd) : 0.05;
+    this.reservations = new Map();
+    this.reservationCounter = 0;
+
     this.tokens = new Map(); // id -> token record
     this.clients = new Map(); // id -> ApifyClient instance
     this.currentIndex = 0;
@@ -199,6 +203,74 @@ class ApifyTokenPoolManager {
     }
     this.totalSpentUsd = Number((this.totalSpentUsd + cost).toFixed(4));
     return this.remainingBalanceUsd;
+  }
+
+  /**
+   * Reserves a budget amount before an operation.
+   * Throws APIFY_BUDGET_EXCEEDED if budget is insufficient.
+   */
+  reserveBudget(estimatedCostUsd) {
+    const cost = estimatedCostUsd !== undefined ? Number(estimatedCostUsd) : this.defaultEstimatedCostUsd;
+    
+    const balance = Number(this.remainingBalanceUsd);
+    const threshold = Number(this.minBalanceThresholdUsd);
+
+    if (balance - cost < threshold) {
+      throw new ApifyBudgetExceededError('Apify account budget limit reached or token balance zero', {
+        remainingBalance: balance,
+        budgetLimit: this.budgetLimitUsd,
+        threshold,
+      });
+    }
+
+    if (this.budgetLimitUsd !== Infinity && (this.totalSpentUsd + cost) > this.budgetLimitUsd) {
+      throw new ApifyBudgetExceededError(`Configured budget limit of $${this.budgetLimitUsd} reached`, {
+        remainingBalance: balance,
+        budgetLimit: this.budgetLimitUsd,
+        threshold,
+      });
+    }
+
+    // Deduct immediately
+    this.remainingBalanceUsd = Number(Math.max(0, balance - cost).toFixed(4));
+    this.totalSpentUsd = Number((this.totalSpentUsd + cost).toFixed(4));
+
+    this.reservationCounter++;
+    const id = `res-${this.reservationCounter}-${Date.now()}`;
+    const reservation = { id, amount: cost, createdAt: Date.now() };
+    this.reservations.set(id, reservation);
+
+    return reservation;
+  }
+
+  /**
+   * Releases a previously reserved budget.
+   */
+  releaseBudget(reservationId) {
+    const res = this.reservations.get(reservationId);
+    if (!res) return false;
+
+    this.remainingBalanceUsd = Number((this.remainingBalanceUsd + res.amount).toFixed(4));
+    this.totalSpentUsd = Number(Math.max(0, this.totalSpentUsd - res.amount).toFixed(4));
+    this.reservations.delete(reservationId);
+    return true;
+  }
+
+  /**
+   * Reconciles a reservation with actual cost.
+   */
+  reconcileBudget(reservationId, actualCostUsd) {
+    const res = this.reservations.get(reservationId);
+    if (!res) return false;
+
+    const actual = Number(actualCostUsd);
+    const delta = res.amount - actual;
+
+    // Refund the difference
+    this.remainingBalanceUsd = Number((this.remainingBalanceUsd + delta).toFixed(4));
+    this.totalSpentUsd = Number(Math.max(0, this.totalSpentUsd - delta).toFixed(4));
+    this.reservations.delete(reservationId);
+    return true;
   }
 
   /**
@@ -591,57 +663,71 @@ class ApifyTokenPoolManager {
    * @returns {Promise<any>}
    */
   async withTokenFailover(fn, options = {}) {
-    // Proactive check before rotation loop
-    this.assertBudgetAvailable(options);
+    const reservation = this.reserveBudget(options.estimatedCostUsd !== undefined ? options.estimatedCostUsd : this.defaultEstimatedCostUsd);
+    let isReconciled = false;
 
-    const maxRotations = Math.min(
-      Math.max(1, this.tokens.size),
-      Number(options.maxTokenRotations || this.maxTokenRotations)
-    );
-    const excludeTokenIds = [];
-    let lastError = null;
+    try {
+      const maxRotations = Math.min(
+        Math.max(1, this.tokens.size),
+        Number(options.maxTokenRotations || this.maxTokenRotations)
+      );
+      const excludeTokenIds = [];
+      let lastError = null;
 
-    for (let attempt = 1; attempt <= maxRotations; attempt++) {
-      const admission = this.acquire({
-        ...options,
-        excludeTokenIds,
-        rotationAttempt: attempt
-      });
+      for (let attempt = 1; attempt <= maxRotations; attempt++) {
+        const admission = this.acquire({
+          ...options,
+          excludeTokenIds,
+          rotationAttempt: attempt
+        });
 
-      if (!admission.allowed) {
-        const err = new Error(admission.error || 'APIFY_POOL_EXHAUSTED');
-        err.code = admission.reason || 'APIFY_POOL_EXHAUSTED';
-        err.cause = lastError;
-        throw err;
-      }
-
-      const { client, tokenRecord, tokenId } = admission;
-
-      try {
-        const result = await fn(client, tokenRecord, admission);
-        if (tokenId) this.markSuccess(tokenId);
-        return result;
-      } catch (err) {
-        lastError = err;
-        const signal = parseTokenSignal(err);
-
-        if (signal.isError && tokenId) {
-          console.warn(`[ApifyTokenPool] Token ${tokenId} (${tokenRecord.label}) failed during attempt ${attempt}/${maxRotations}: ${signal.reason}. Rotating to next token...`);
-          this.markFailure(tokenId, err);
-          excludeTokenIds.push(tokenId);
-          continue; // Auto-rotate to next token
+        if (!admission.allowed) {
+          const err = new Error(admission.error || 'APIFY_POOL_EXHAUSTED');
+          err.code = admission.reason || 'APIFY_POOL_EXHAUSTED';
+          err.cause = lastError;
+          throw err;
         }
 
-        // If not a token-specific error (e.g. invalid actor input, client abort), don't discard token
-        if (tokenId) this.markSuccess(tokenId);
-        throw err;
+        const { client, tokenRecord, tokenId } = admission;
+
+        try {
+          const result = await fn(client, tokenRecord, admission);
+          if (tokenId) this.markSuccess(tokenId);
+          
+          if (result && typeof result.cost === 'number') {
+            this.reconcileBudget(reservation.id, result.cost);
+            isReconciled = true;
+          } else if (result && result.costUsd !== undefined) {
+            this.reconcileBudget(reservation.id, result.costUsd);
+            isReconciled = true;
+          }
+          return result;
+        } catch (err) {
+          lastError = err;
+          const signal = parseTokenSignal(err);
+
+          if (signal.isError && tokenId) {
+            console.warn(`[ApifyTokenPool] Token ${tokenId} (${tokenRecord.label}) failed during attempt ${attempt}/${maxRotations}: ${signal.reason}. Rotating to next token...`);
+            this.markFailure(tokenId, err);
+            excludeTokenIds.push(tokenId);
+            continue; // Auto-rotate to next token
+          }
+
+          // If not a token-specific error (e.g. invalid actor input, client abort), don't discard token
+          if (tokenId) this.markSuccess(tokenId);
+          throw err;
+        }
+      }
+
+      const exhaustedErr = new Error(`All Apify tokens failed or exhausted after ${maxRotations} rotation(s): ${lastError ? lastError.message : 'APIFY_POOL_EXHAUSTED'}`);
+      exhaustedErr.code = 'APIFY_POOL_EXHAUSTED';
+      exhaustedErr.cause = lastError;
+      throw exhaustedErr;
+    } finally {
+      if (!isReconciled) {
+        this.releaseBudget(reservation.id);
       }
     }
-
-    const exhaustedErr = new Error(`All Apify tokens failed or exhausted after ${maxRotations} rotation(s): ${lastError ? lastError.message : 'APIFY_POOL_EXHAUSTED'}`);
-    exhaustedErr.code = 'APIFY_POOL_EXHAUSTED';
-    exhaustedErr.cause = lastError;
-    throw exhaustedErr;
   }
 
   getStatus() {

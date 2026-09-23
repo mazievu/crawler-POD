@@ -166,4 +166,72 @@ test('Apify Budget: Feature 12 Apify Budget Kill Switch', async (t) => {
     assert.strictEqual(status.budget.budgetLimitUsd, 50.0);
     assert.strictEqual(status.budget.isExhausted, false);
   });
+
+  await t.test('Test concurrent: 2 reserve cùng lúc, budget chỉ đủ cho 1 -> cái thứ 2 bị reject', () => {
+    const pool = new ApifyTokenPoolManager({
+      tokens: ['apify_api_tok1'],
+      initialApifyBalance: 0.08,
+      defaultEstimatedCostUsd: 0.05,
+    });
+
+    const res1 = pool.reserveBudget(0.05);
+    assert.ok(res1);
+    assert.strictEqual(pool.remainingBalanceUsd, 0.03);
+
+    assert.throws(
+      () => pool.reserveBudget(0.05),
+      (err) => {
+        assert.strictEqual(err.code, 'APIFY_BUDGET_EXCEEDED');
+        return true;
+      }
+    );
+  });
+
+  await t.test('Test release: reserve rồi release -> budget khôi phục', () => {
+    const pool = new ApifyTokenPoolManager({
+      tokens: ['apify_api_tok1'],
+      initialApifyBalance: 0.10,
+    });
+
+    const res = pool.reserveBudget(0.05);
+    assert.strictEqual(pool.remainingBalanceUsd, 0.05);
+
+    const released = pool.releaseBudget(res.id);
+    assert.strictEqual(released, true);
+    assert.strictEqual(pool.remainingBalanceUsd, 0.10);
+  });
+
+  await t.test('Test reconcile: reserve $0.05, thực tế $0.03 -> delta $0.02 hoàn lại', () => {
+    const pool = new ApifyTokenPoolManager({
+      tokens: ['apify_api_tok1'],
+      initialApifyBalance: 0.10,
+    });
+
+    const res = pool.reserveBudget(0.05);
+    assert.strictEqual(pool.remainingBalanceUsd, 0.05);
+
+    const reconciled = pool.reconcileBudget(res.id, 0.03);
+    assert.strictEqual(reconciled, true);
+    // remaining should be 0.05 + 0.02 = 0.07
+    assert.strictEqual(pool.remainingBalanceUsd, 0.07);
+    assert.strictEqual(pool.totalSpentUsd, 0.03);
+  });
+
+  await t.test('Test exhaustion: budget $0.10, 3 lần reserve $0.05 -> lần 3 bị reject', () => {
+    const pool = new ApifyTokenPoolManager({
+      tokens: ['apify_api_tok1'],
+      initialApifyBalance: 0.10,
+    });
+
+    pool.reserveBudget(0.05);
+    pool.reserveBudget(0.05);
+
+    assert.throws(
+      () => pool.reserveBudget(0.05),
+      (err) => {
+        assert.strictEqual(err.code, 'APIFY_BUDGET_EXCEEDED');
+        return true;
+      }
+    );
+  });
 });

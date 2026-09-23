@@ -8,6 +8,7 @@
  * - §5: Shared patch writer (field-presence merge), advisory locks, observation deduplication
  * - §6 & §10: Global limiter (max 1 concurrent capture, 20s cooldown lease, fencing tokens)
  * - Stealth Browser (CloakBrowser priority + Camoufox fallback) & Admin Dashboard API
+ */
 const fs = require('fs');
 const path = require('path');
 const { fromDriver } = require('../../src/database/pg-client');

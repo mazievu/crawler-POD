@@ -388,6 +388,32 @@ test('OG6.5: safeFetch enforces strict byte size limits (content-length & stream
   );
 });
 
+test('OG6.6: safeFetch pins connection to resolved IP to prevent DNS rebinding TOCTOU', async () => {
+  let fetchedUrl = '';
+  let hostHeader = '';
+  const mockFetch = async (url, options) => {
+    fetchedUrl = url;
+    if (options && options.headers) {
+      if (typeof options.headers.get === 'function') {
+        hostHeader = options.headers.get('host') || options.headers.get('Host');
+      } else {
+        hostHeader = options.headers.host || options.headers.Host;
+      }
+    }
+    return { status: 200, headers: new Map() };
+  };
+
+  const res = await safeFetch('https://rebinding.example.com/data', {
+    mockFetch,
+    dnsResolver: async () => '93.184.216.34', // Validator resolves to public IP
+  });
+
+  assert.equal(res.status, 200);
+  const parsed = new URL(fetchedUrl);
+  assert.equal(parsed.hostname, '93.184.216.34', 'Fetch should use the validated IP');
+  assert.equal(hostHeader, 'rebinding.example.com', 'Original Host header should be preserved');
+});
+
 // ============================================================================
 // 7. Scraper Integration Tests (Shopify, Web Reader, Media Cache)
 // ============================================================================
