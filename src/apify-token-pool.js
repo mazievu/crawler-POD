@@ -83,6 +83,22 @@ function parseTokenSignal(signal) {
   return { isError: false };
 }
 
+/**
+ * Custom Error for Apify Budget Exceeded (Feature 12)
+ */
+class ApifyBudgetExceededError extends Error {
+  constructor(message = 'Apify account budget limit reached or token balance zero', details = {}) {
+    super(message);
+    this.name = 'ApifyBudgetExceededError';
+    this.code = 'APIFY_BUDGET_EXCEEDED';
+    this.status = 402;
+    this.statusCode = 402;
+    this.remainingBalance = details.remainingBalance ?? 0.0;
+    this.budgetLimit = details.budgetLimit ?? null;
+    this.threshold = details.threshold ?? 0.0;
+  }
+}
+
 class ApifyTokenPoolManager {
   constructor(options = {}) {
     this.configPath = options.configPath || DEFAULT_CONFIG_PATH;
@@ -90,6 +106,24 @@ class ApifyTokenPoolManager {
     this.exhaustedCooldownMs = Number(options.exhaustedCooldownMs) || 86400000; // 24 hours default
     this.failureThreshold = Number(options.failureThreshold) || 2;
     this.maxTokenRotations = Number(options.maxTokenRotations) || 5;
+
+    // Feature 12: Apify Budget Kill Switch Configuration
+    this.minBalanceThresholdUsd = options.minBalanceThresholdUsd !== undefined
+      ? Number(options.minBalanceThresholdUsd)
+      : (process.env.APIFY_MIN_BALANCE_USD !== undefined ? Number(process.env.APIFY_MIN_BALANCE_USD) : 0.0);
+
+    this.budgetLimitUsd = options.budgetLimitUsd !== undefined
+      ? Number(options.budgetLimitUsd)
+      : (process.env.APIFY_BUDGET_LIMIT_USD ? Number(process.env.APIFY_BUDGET_LIMIT_USD) : Infinity);
+
+    const envInitial = process.env.APIFY_INITIAL_BALANCE_USD !== undefined ? Number(process.env.APIFY_INITIAL_BALANCE_USD) : null;
+    const optInitial = options.initialApifyBalance !== undefined ? Number(options.initialApifyBalance) : null;
+    this.remainingBalanceUsd = optInitial !== null ? optInitial : (envInitial !== null ? envInitial : 100.0);
+
+    this.defaultRunCostUsd = Number(options.defaultRunCostUsd || process.env.APIFY_DEFAULT_RUN_COST_USD || 1.0);
+    this.totalSpentUsd = 0.0;
+    this.lastBudgetSyncAt = null;
+    this.syncIntervalMs = Number(options.syncIntervalMs) || 300000;
 
     this.tokens = new Map(); // id -> token record
     this.clients = new Map(); // id -> ApifyClient instance
@@ -100,6 +134,105 @@ class ApifyTokenPoolManager {
     } else {
       this.load();
     }
+  }
+
+  /**
+   * Checks whether Apify budget is available for paid actor execution.
+   */
+  checkBudget(options = {}) {
+    const cost = options.cost !== undefined ? Number(options.cost) : this.defaultRunCostUsd;
+    const balance = Number(this.remainingBalanceUsd);
+    const threshold = Number(this.minBalanceThresholdUsd);
+
+    if (balance <= threshold) {
+      return {
+        allowed: false,
+        remainingBalance: balance,
+        budgetLimit: this.budgetLimitUsd,
+        totalSpent: this.totalSpentUsd,
+        threshold,
+        reason: 'APIFY_BUDGET_EXCEEDED',
+        message: 'Apify account budget limit reached or token balance zero',
+      };
+    }
+
+    if (this.budgetLimitUsd !== Infinity && (this.totalSpentUsd + cost) > this.budgetLimitUsd) {
+      return {
+        allowed: false,
+        remainingBalance: balance,
+        budgetLimit: this.budgetLimitUsd,
+        totalSpent: this.totalSpentUsd,
+        threshold,
+        reason: 'APIFY_BUDGET_EXCEEDED',
+        message: `Configured budget limit of $${this.budgetLimitUsd} reached`,
+      };
+    }
+
+    return {
+      allowed: true,
+      remainingBalance: balance,
+      budgetLimit: this.budgetLimitUsd,
+      totalSpent: this.totalSpentUsd,
+      threshold,
+    };
+  }
+
+  /**
+   * Asserts that budget is available; throws ApifyBudgetExceededError (402) if not.
+   */
+  assertBudgetAvailable(options = {}) {
+    const check = this.checkBudget(options);
+    if (!check.allowed) {
+      throw new ApifyBudgetExceededError(check.message, check);
+    }
+    return check;
+  }
+
+  /**
+   * Atomically deducts run cost from remaining budget and increments total spend.
+   */
+  deductBudget(amount = null) {
+    const cost = amount !== null ? Number(amount) : this.defaultRunCostUsd;
+    if (this.remainingBalanceUsd !== null && this.remainingBalanceUsd !== undefined) {
+      const nextBalance = this.remainingBalanceUsd - cost;
+      this.remainingBalanceUsd = Number(Math.max(0, nextBalance).toFixed(4));
+    }
+    this.totalSpentUsd = Number((this.totalSpentUsd + cost).toFixed(4));
+    return this.remainingBalanceUsd;
+  }
+
+  /**
+   * Dynamically updates budget limit or balance (Admin controls).
+   */
+  setBudget(options = {}) {
+    if (options.budgetLimitUsd !== undefined) {
+      this.budgetLimitUsd = Number(options.budgetLimitUsd);
+    }
+    if (options.minBalanceThresholdUsd !== undefined) {
+      this.minBalanceThresholdUsd = Number(options.minBalanceThresholdUsd);
+    }
+    if (options.remainingBalanceUsd !== undefined) {
+      this.remainingBalanceUsd = Number(options.remainingBalanceUsd);
+    }
+    if (options.resetSpent === true) {
+      this.totalSpentUsd = 0.0;
+    }
+    return this.getBudgetStatus();
+  }
+
+  getBudgetStatus() {
+    const isExhausted = this.remainingBalanceUsd <= this.minBalanceThresholdUsd ||
+      (this.budgetLimitUsd !== Infinity && this.totalSpentUsd >= this.budgetLimitUsd);
+
+    return {
+      budgetLimitUsd: this.budgetLimitUsd === Infinity ? null : this.budgetLimitUsd,
+      remainingBalanceUsd: this.remainingBalanceUsd,
+      minBalanceThresholdUsd: this.minBalanceThresholdUsd,
+      totalSpentUsd: this.totalSpentUsd,
+      isExhausted,
+      status: isExhausted ? 'EXHAUSTED' : (this.remainingBalanceUsd <= 5.0 ? 'LOW_BALANCE' : 'HEALTHY'),
+      lastSyncAt: this.lastBudgetSyncAt,
+    };
   }
 
   load() {
@@ -458,6 +591,9 @@ class ApifyTokenPoolManager {
    * @returns {Promise<any>}
    */
   async withTokenFailover(fn, options = {}) {
+    // Proactive check before rotation loop
+    this.assertBudgetAvailable(options);
+
     const maxRotations = Math.min(
       Math.max(1, this.tokens.size),
       Number(options.maxTokenRotations || this.maxTokenRotations)
@@ -547,6 +683,7 @@ class ApifyTokenPoolManager {
       exhaustedCount,
       invalidCount,
       currentIndex: this.currentIndex,
+      budget: this.getBudgetStatus(),
       tokens: tokenList
     };
   }
@@ -563,6 +700,7 @@ function getApifyTokenPool(options = {}) {
 }
 
 module.exports = {
+  ApifyBudgetExceededError,
   ApifyTokenPoolManager,
   getApifyTokenPool,
   maskToken,

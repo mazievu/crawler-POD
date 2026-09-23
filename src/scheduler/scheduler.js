@@ -56,6 +56,99 @@ class ResourceScheduler {
     // itself); channel-based runs resolve this wait instantly (unregistered
     // tokens are treated as already-settled), so this never slows the common path.
     this.resourceReleaseGraceMs = options.resourceReleaseGraceMs || Number(process.env.RESOURCE_RELEASE_GRACE_MS) || 5000;
+
+    // Feature 11: System Concurrency Cap
+    this.maxConcurrentRuns = options.maxConcurrentRuns !== undefined
+      ? Number(options.maxConcurrentRuns)
+      : (process.env.MAX_CONCURRENT_RUNS !== undefined
+          ? parseInt(process.env.MAX_CONCURRENT_RUNS, 10)
+          : 10);
+
+    // Feature 13: Emergency Dispatch Freeze
+    this.emergencyFreeze = options.emergencyFreeze !== undefined
+      ? Boolean(options.emergencyFreeze)
+      : (process.env.EMERGENCY_DISPATCH_FREEZE === 'true');
+
+    // Test simulation delta for test harness compatibility
+    this._simulatedActiveDelta = 0;
+  }
+
+  /**
+   * Returns total count of active running executions across all pools.
+   * Includes underflow guard.
+   */
+  getActiveExecutionCount() {
+    const realCount = this.activeRunMetrics.size + this.cleanupFailedTokens.size;
+    return Math.max(0, realCount + this._simulatedActiveDelta);
+  }
+
+  /**
+   * Alias matching test harness contract (controls.getActiveRunsCount()).
+   */
+  getActiveRunsCount() {
+    return this.getActiveExecutionCount();
+  }
+
+  /**
+   * Test harness simulation helper to set active runs count.
+   * Enforces non-negative bound (B11.4).
+   */
+  setActiveRunsCount(count) {
+    const target = Math.max(0, Number(count) || 0);
+    const realCount = this.activeRunMetrics.size + this.cleanupFailedTokens.size;
+    this._simulatedActiveDelta = target - realCount;
+  }
+
+  /**
+   * Sets concurrency ceiling dynamically (B11.2).
+   */
+  setMaxConcurrentRuns(limit) {
+    const parsed = Number(limit);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new Error('maxConcurrentRuns must be a non-negative number');
+    }
+    this.maxConcurrentRuns = parsed;
+  }
+
+  getMaxConcurrentRuns() {
+    return this.maxConcurrentRuns;
+  }
+
+  /**
+   * Toggles emergency dispatch freeze (F13).
+   */
+  setEmergencyFreeze(frozen) {
+    this.emergencyFreeze = Boolean(frozen);
+    console.warn(`[Scheduler] Emergency dispatch freeze set to: ${this.emergencyFreeze ? 'ENABLED' : 'DISABLED'}`);
+    return this.emergencyFreeze;
+  }
+
+  /**
+   * Returns true if emergency dispatch freeze is currently active.
+   */
+  isFrozen() {
+    return Boolean(this.emergencyFreeze);
+  }
+
+  /**
+   * Evaluates whether a new run can be admitted into execution.
+   */
+  canAdmitRun() {
+    if (this.isFrozen()) {
+      return {
+        allowed: false,
+        reason: 'DISPATCH_FROZEN',
+        message: 'Run dispatch is currently frozen by administrator',
+      };
+    }
+    if (this.getActiveExecutionCount() >= this.maxConcurrentRuns) {
+      return {
+        allowed: false,
+        reason: 'CONCURRENCY_LIMIT_REACHED',
+        message: `Concurrency limit reached (${this.maxConcurrentRuns} active runs)`,
+      };
+    }
+    return { allowed: true };
   }
 
   async isApifyActorTerminal(actorRunId) {
@@ -108,6 +201,48 @@ class ResourceScheduler {
       locks.push(`account:${options.accountId}`);
     }
     return locks;
+  }
+
+  /**
+   * Checks whether any Discovery runs are currently waiting in the execution queue.
+   */
+  async hasQueuedDiscoveryRuns() {
+    if (!this.queue) return false;
+    try {
+      const candidates = await this.queue.peek(1);
+      return Array.isArray(candidates) && candidates.length > 0;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  /**
+   * Evaluates whether a Monitoring capture can be admitted given current
+   * Discovery queue state, RAM pressure, and worker pool capacity (Feature F23).
+   *
+   * @param {number} [waitTicks=0] - Number of scheduler ticks this monitoring job has been waiting
+   * @returns {Promise<{ allowed: boolean, reason?: string }>}
+   */
+  async canAdmitMonitoringCapture(waitTicks = 0) {
+    const ramSnapshot = this.monitor ? this.monitor.getSnapshot() : { state: 'GREEN' };
+    // RAM state: RED and YELLOW reject monitoring
+    if (ramSnapshot.state === 'RED' || ramSnapshot.state === 'YELLOW') {
+      return { allowed: false, reason: `RAM_${ramSnapshot.state}` };
+    }
+
+    // Check if Discovery tasks exist in queue
+    const hasQueuedDiscovery = await this.hasQueuedDiscoveryRuns();
+    // Starvation aging threshold: waitTicks >= 50 grants fairness boost
+    if (hasQueuedDiscovery && waitTicks < 50) {
+      return { allowed: false, reason: 'DISCOVERY_PRIORITY_PREEMPTION' };
+    }
+
+    // Check browser pool slot availability
+    if (this.pools && !this.pools.hasSlot('BROWSER', false)) {
+      return { allowed: false, reason: 'BROWSER_POOL_SATURATED' };
+    }
+
+    return { allowed: true };
   }
 
   async submitRun(runPayload) {
@@ -282,6 +417,16 @@ class ResourceScheduler {
     try {
       await this.reconcileShardedParents();
 
+      // Feature 13: Halt all new admissions when emergency freeze is engaged
+      if (this.isFrozen()) {
+        return;
+      }
+
+      // Feature 11: Halt new admissions when global concurrency ceiling is reached
+      if (this.getActiveExecutionCount() >= this.maxConcurrentRuns) {
+        return;
+      }
+
       const ramSnapshot = this.monitor.getSnapshot();
       if (ramSnapshot.state === 'RED') {
         return; // Strict admission block under critical memory pressure.
@@ -291,6 +436,10 @@ class ResourceScheduler {
       if (!candidates || candidates.length === 0) return;
 
       for (const run of candidates) {
+        // Feature 11: Halt admission loop if concurrency ceiling reached
+        if (this.getActiveExecutionCount() >= this.maxConcurrentRuns) {
+          break;
+        }
         let plan;
         try {
           plan = await this.planner.plan(run);
@@ -469,7 +618,16 @@ class ResourceScheduler {
     return {
       scheduler: {
         activeTicker: this.timer !== null,
-        tickIntervalMs: this.tickIntervalMs
+        tickIntervalMs: this.tickIntervalMs,
+        isFrozen: this.isFrozen(),
+        maxConcurrentRuns: this.maxConcurrentRuns,
+        activeExecutionCount: this.getActiveExecutionCount(),
+      },
+      isFrozen: this.isFrozen(),
+      concurrency: {
+        active: this.getActiveExecutionCount(),
+        maxConcurrentRuns: this.maxConcurrentRuns,
+        isFrozen: this.isFrozen(),
       },
       ram: this.monitor.getSnapshot(),
       queue: await this.queue.countByStatus(),
