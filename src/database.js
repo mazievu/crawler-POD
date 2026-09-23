@@ -25,6 +25,11 @@ const {
 const { createProductCurrentOps } = require('./database/product-current');
 const { createDailyHistoryOps, normalizeLegacyUtcTimestamp } = require('./database/daily-history');
 const { createWeeklySummaryOps } = require('./database/weekly-summary');
+const { createMonitoringOps } = require('./database/monitoring');
+const { createAuthOps } = require('./database/auth-ops');
+const { MonitoringLimiter, acquireMonitoringLease, releaseMonitoringLease } = require('./monitoring/limiter');
+const { MonitoringDispatcher, parseMonitoringFlag } = require('./monitoring/dispatcher');
+const { acquireItemAdvisoryLock, getAdvisoryLockKeys } = require('./database/concurrency');
 // Job History "stuck" filter (getRunsFiltered() below) must reuse the exact
 // thresholds StuckDetector itself enforces, never a re-typed copy — see
 // reliability/stuck-detector.js. Safe to require at module scope: that file's
@@ -54,12 +59,20 @@ const db = openDatabase();
 const dailyHistoryOps = createDailyHistoryOps(db);
 const productCurrentOps = createProductCurrentOps(db, dailyHistoryOps);
 const weeklySummaryOps = createWeeklySummaryOps(db);
+const monitoringOps = createMonitoringOps(db);
+const authOps = createAuthOps(db);
 
 const PG_SCHEMA_PATH = path.join(__dirname, 'database', 'pg-schema.sql');
 
 const insertPlatform = db.prepare(`
   INSERT OR IGNORE INTO platforms (name, display_name, description, query_type, actor_id, country_support, icon, color)
   VALUES (@name, @displayName, @description, @queryType, @actorId, @countrySupport, @icon, @color)
+`);
+
+const insertLimiterSeed = db.prepare(`
+  INSERT INTO monitoring_limiter (key, owner_token, leased_until, next_allowed_at)
+  VALUES ('global_monitoring_capture', NULL, NULL, now())
+  ON CONFLICT (key) DO NOTHING
 `);
 
 let initPromise = null;
@@ -83,6 +96,7 @@ async function initDatabase() {
       await db.exec(fs.readFileSync(PG_SCHEMA_PATH, 'utf8'));
       const seed = db.transaction(async () => {
         for (const p of PLATFORMS) await insertPlatform.run(p);
+        await insertLimiterSeed.run();
       });
       await seed();
       // Historic-data backfills; previously require()-time side effects.
@@ -674,14 +688,34 @@ async function insertSnapshots(runId, platform, query, items) {
 
   let newCount = 0, activeCount = 0, droppedCount = 0;
   const currentUids = new Set();
-  const resultItems = []; // Â§6.1: this Run's own packed result array
   const pendingComments = []; // flushed to post_comments AFTER the item transaction commits
 
-  const insertMany = db.transaction(async (txItems) => {
-    for (const item of txItems) {
-      const parsed = parseItemData(item);
-      const itemUid = generateUid(platform, query, parsed);
+  // Milestone 2 (F7): Pre-parse all items and calculate itemUid with original index preservation
+  const preparedItems = items.map((item, originalIndex) => {
+    const parsed = parseItemData(item);
+    const itemUid = generateUid(platform, query, parsed);
+    return { item, parsed, itemUid, originalIndex };
+  });
+
+  // Sort preparedItems strictly ascending by itemUid (Havender's Total Ordering)
+  // This mathematically eliminates circular wait deadlocks across concurrent runs
+  preparedItems.sort((a, b) => (a.itemUid < b.itemUid ? -1 : a.itemUid > b.itemUid ? 1 : 0));
+
+  // Result array matching original scraper array length to preserve original order for UI/API
+  const resultItems = new Array(items.length);
+
+  const insertMany = db.transaction(async (txPreparedItems) => {
+    let lastLockedUid = null;
+
+    for (const { item, parsed, itemUid, originalIndex } of txPreparedItems) {
       currentUids.add(itemUid);
+
+      // Acquire transaction advisory lock on itemUid in strict ASC order.
+      // Deduplicate adjacent locks if multiple items share the same itemUid.
+      if (itemUid !== lastLockedUid) {
+        await acquireItemAdvisoryLock(db, itemUid);
+        lastLockedUid = itemUid;
+      }
 
       // Â§12: new/active must be derived from V2 (product_current), which is
       // authoritative regardless of LEGACY_SNAPSHOT_WRITE â€” the legacy
@@ -749,10 +783,8 @@ async function insertSnapshots(runId, platform, query, items) {
       }
       if (status === 'new') newCount++; else activeCount++;
 
-      // Â§6.1: this Run's own packed result array â€” populated unconditionally
-      // (not gated by LEGACY_SNAPSHOT_WRITE), so /api/runs/:id and
-      // /api/export/:runId never depend on legacy `snapshots` rows existing.
-      resultItems.push({
+      // Populate resultItems at originalIndex to preserve 100% of scraper ordering for UI/API
+      resultItems[originalIndex] = {
         item_uid: itemUid,
         platform,
         title: parsed.title,
@@ -794,7 +826,7 @@ async function insertSnapshots(runId, platform, query, items) {
         views: parsed.views,
         status,
         observed_at: new Date().toISOString()
-      });
+      };
 
       // Comments are QUEUED, not written here. Writing them inside this
       // transaction meant one bad comment statement aborted the whole thing —
@@ -844,9 +876,14 @@ async function insertSnapshots(runId, platform, query, items) {
       const staleCandidates = await db.prepare(
         "SELECT * FROM product_current WHERE platform = ? AND query = ? AND last_run_id = ? AND status != 'dropped'"
       ).all(platform, query, prevRunId);
+
+      // Sort stale candidates by item_uid ASC before acquiring locks to prevent deadlocks
+      staleCandidates.sort((a, b) => (a.item_uid < b.item_uid ? -1 : a.item_uid > b.item_uid ? 1 : 0));
+
       for (const cand of staleCandidates) {
         if (currentUids.has(cand.item_uid)) continue;
         droppedCount++;
+        await acquireItemAdvisoryLock(db, cand.item_uid);
         await stmt.markProductCurrentDropped.run(cand.item_uid);
         // Â§16: Only insert legacy dropped snapshots if flag is on. Sourced
         // from product_current's own fields, not a legacy-table read, so
@@ -879,7 +916,7 @@ async function insertSnapshots(runId, platform, query, items) {
     }
   });
 
-  await insertMany(items);
+  await insertMany(preparedItems);
 
   // Full comment text, written outside the item transaction so a comment
   // failure costs only the comments. Each item is independent for the same
@@ -2124,6 +2161,72 @@ const api = {
   createMarketplaceCapture, getCachedMarketplaceCapture, getMarketplaceCapture, getMarketplaceCaptures,
   createMarketplaceCaptureSchedule, getMarketplaceCaptureSchedules, getDueMarketplaceCaptureSchedules, completeMarketplaceCaptureSchedule, getMarketplaceCaptureScheduleRuns, deleteMarketplaceCaptureSchedule, toggleMarketplaceCaptureSchedule,
   claimMarketplaceCaptureSchedule, releaseMarketplaceCaptureScheduleClaim, renewMarketplaceCaptureScheduleClaim,
+  // Monitoring data access layer (Milestones 1 & 2)
+  createMonitoringOps,
+  monitoringOps,
+  applyMonitoringObservation: async (...args) => monitoringOps.applyMonitoringObservation(...args),
+  acquireItemAdvisoryLock,
+  getAdvisoryLockKeys,
+  createOrGetEntity: async (...args) => monitoringOps.createOrGetEntity(...args),
+  getEntity: async (...args) => monitoringOps.getEntity(...args),
+  getEntityByCompositeKey: async (...args) => monitoringOps.getEntityByCompositeKey(...args),
+  findDueEntities: async (...args) => monitoringOps.findDueEntities(...args),
+  updateEntityStatus: async (...args) => monitoringOps.updateEntityStatus(...args),
+  registerItemForMonitoring: async (...args) => monitoringOps.registerItemForMonitoring(...args),
+  handlePendingIdentity: async (...args) => monitoringOps.handlePendingIdentity(...args),
+  getItem: async (...args) => monitoringOps.getItem(...args),
+  getMonitoringItem: async (...args) => monitoringOps.getItem(...args),
+  getItemWithEntity: async (...args) => monitoringOps.getItemWithEntity(...args),
+  resolvePendingIdentity: async (...args) => monitoringOps.resolvePendingIdentity(...args),
+  findDueItems: async (...args) => monitoringOps.findDueItems(...args),
+  // Monitoring shop operations (Milestone 3)
+  applyShopObservation: async (...args) => monitoringOps.applyShopObservation(...args),
+  recordEntityObservation: async (...args) => monitoringOps.recordEntityObservation(...args),
+  findDueShopEntities: async (...args) => monitoringOps.findDueShopEntities(...args),
+  getChildItemsForEntity: async (...args) => monitoringOps.getChildItemsForEntity(...args),
+  // Monitoring author & lifecycle operations (Milestone 4)
+  toggleEntityStar: async (...args) => monitoringOps.toggleEntityStar(...args),
+  expireDueEntities: async (...args) => monitoringOps.expireDueEntities(...args),
+  findDueAuthorEntities: async (...args) => monitoringOps.findDueAuthorEntities(...args),
+  retrackEntity: async (...args) => monitoringOps.retrackEntity(...args),
+  // Monitoring queue & limiter operations (Milestone 5)
+  claimNextDueMonitoringJob: async (...args) => monitoringOps.claimNextDueMonitoringJob(...args),
+  completeMonitoringJob: async (...args) => monitoringOps.completeMonitoringJob(...args),
+  failMonitoringJob: async (...args) => monitoringOps.failMonitoringJob(...args),
+  recoverExpiredMonitoringJobs: async (...args) => monitoringOps.recoverExpiredMonitoringJobs(...args),
+  acquireMonitoringLease: async (...args) => acquireMonitoringLease(db, ...args),
+  releaseMonitoringLease: async (...args) => releaseMonitoringLease(db, ...args),
+  MonitoringLimiter,
+  MonitoringDispatcher,
+  parseMonitoringFlag,
+  // Auth & RBAC operations (Milestone M1)
+  createAuthOps,
+  authOps,
+  createUser: async (...args) => authOps.createUser(...args),
+  findUserByEmail: async (...args) => authOps.findUserByEmail(...args),
+  getUserByEmail: async (...args) => authOps.findUserByEmail(...args),
+  findUserById: async (...args) => authOps.findUserById(...args),
+  getUserById: async (...args) => authOps.findUserById(...args),
+  updateUserPassword: async (...args) => authOps.updateUserPassword(...args),
+  updateUserRole: async (...args) => authOps.updateUserRole(...args),
+  deleteUser: async (...args) => authOps.deleteUser(...args),
+  listUsers: async (...args) => authOps.listUsers(...args),
+  countUsers: async (...args) => authOps.countUsers(...args),
+  countAdmins: async (...args) => authOps.countAdmins(...args),
+  createSession: async (...args) => authOps.createSession(...args),
+  findSessionByToken: async (...args) => authOps.findSessionByToken(...args),
+  getSession: async (...args) => authOps.findSessionByToken(...args),
+  touchSession: async (...args) => authOps.touchSession(...args),
+  deleteSession: async (...args) => authOps.deleteSession(...args),
+  deleteSessionsByUserId: async (...args) => authOps.deleteSessionsByUserId(...args),
+  cleanExpiredSessions: async (...args) => authOps.cleanExpiredSessions(...args),
+  createApiKey: async (...args) => authOps.createApiKey(...args),
+  findApiKeyByHash: async (...args) => authOps.findApiKeyByHash(...args),
+  revokeApiKey: async (...args) => authOps.revokeApiKey(...args),
+  findApiKeyById: async (...args) => authOps.findApiKeyById(...args),
+  listApiKeys: async (...args) => authOps.listApiKeys(...args),
+  listApiKeysByUserId: async (...args) => authOps.listApiKeysByUserId(...args),
+  deleteApiKey: async (...args) => authOps.deleteApiKey(...args),
 };
 
 /**
