@@ -146,7 +146,7 @@ test('BOOT-ADV-3: Missing or whitespace credentials fail fast without writing to
   assert.strictEqual(db.users.size, 0, 'No user should be written to DB on invalid credentials');
 });
 
-test('BOOT-ADV-4: Live HTTP Server: 25 concurrent /api/auth/bootstrap requests return 200/201 without 500 error', async () => {
+test('BOOT-ADV-4: Live HTTP Server: bootstrap happens once from env at boot, and POST /api/auth/bootstrap is not a reachable route', async () => {
   const PORT = 32190;
   const BASE_URL = `http://127.0.0.1:${PORT}`;
 
@@ -177,7 +177,9 @@ test('BOOT-ADV-4: Live HTTP Server: 25 concurrent /api/auth/bootstrap requests r
     }
     assert.ok(ready, 'Live server must start within 15s');
 
-    // Fire 25 concurrent POST /api/auth/bootstrap requests
+    // The vulnerable public bootstrap endpoint (M1 audit finding: bootstrap
+    // takeover) must not exist. 25 concurrent hits must ALL be rejected —
+    // never a 200/201 that would imply the endpoint still exists.
     const CONCURRENCY = 25;
     const reqs = Array.from({ length: CONCURRENCY }, () =>
       fetch(`${BASE_URL}/api/auth/bootstrap`, {
@@ -188,10 +190,29 @@ test('BOOT-ADV-4: Live HTTP Server: 25 concurrent /api/auth/bootstrap requests r
 
     const responses = await Promise.all(reqs);
     for (const res of responses) {
-      assert.ok([200, 201].includes(res.status), `Status must be 200 or 201 (got ${res.status})`);
-      const data = await res.json();
-      assert.strictEqual(data.email, 'concurrent_admin@system.local');
+      assert.ok(
+        [401, 404].includes(res.status),
+        `POST /api/auth/bootstrap must not exist (expected 401/404, got ${res.status})`
+      );
     }
+
+    // Bootstrap now only happens from env at boot (or via `npm run
+    // bootstrap:admin`), never through a public HTTP endpoint. This process
+    // shares a PGLITE_DIR with other spawn tests in this suite, so an admin
+    // may already exist from an earlier test — either way, login must not
+    // 500 and must never be gated by a public bootstrap call.
+    const loginRes = await fetch(`${BASE_URL}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'concurrent_admin@system.local',
+        password: 'LiveConcurrentAdminPassword123!',
+      }),
+    });
+    assert.ok(
+      [200, 401].includes(loginRes.status),
+      `Login must resolve deterministically (200 if this run created the admin, 401 if an earlier admin already exists), got ${loginRes.status}`
+    );
   } finally {
     child.kill('SIGKILL');
   }

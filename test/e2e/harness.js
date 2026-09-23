@@ -256,6 +256,14 @@ class InMemoryDatabase {
     return this.users.get(email.toLowerCase().trim()) || null;
   }
 
+  countAdmins() {
+    let count = 0;
+    for (const u of this.users.values()) {
+      if (u.role === 'admin') count += 1;
+    }
+    return count;
+  }
+
   getUserById(id) {
     for (const u of this.users.values()) {
       if (u.id === id) return u;
@@ -394,8 +402,27 @@ class RateLimiter {
 // 5. Test Application Factory (Full-Fidelity Contract Express App)
 // ============================================================================
 
+/**
+ * Mirrors server.js's bootstrapDatabase(): Super Admin bootstrap happens at
+ * server "boot" from ADMIN_EMAIL/ADMIN_PASSWORD (env or config), and refuses
+ * once any admin already exists. There is intentionally NO HTTP route for
+ * this — a public/authenticated `/api/auth/bootstrap` endpoint was the M1
+ * "bootstrap takeover" vulnerability the real server had removed.
+ */
+function bootstrapAdminFromConfig(db, config) {
+  const adminEmail = (process.env.ADMIN_EMAIL || config.adminEmail || '').trim();
+  const adminPassword = process.env.ADMIN_PASSWORD || config.adminPassword;
+
+  if (db.countAdmins() > 0) return;
+  if (!adminEmail || !adminPassword || (typeof adminPassword === 'string' && !adminPassword.trim())) return;
+  if (db.getUserByEmail(adminEmail)) return;
+
+  db.addUser({ email: adminEmail, password: adminPassword, role: 'admin' });
+}
+
 function createTestApp(config = {}) {
   const db = config.database || new InMemoryDatabase();
+  bootstrapAdminFromConfig(db, config);
   const internalServiceKey = config.internalServiceKey || 'test-internal-secret-key-32chars!!';
   const allowedOrigins = config.allowedOrigins || ['http://localhost:3000', 'https://crawler-pod.local'];
   const maxConcurrentRuns = config.maxConcurrentRuns !== undefined ? config.maxConcurrentRuns : 5;
@@ -455,7 +482,7 @@ function createTestApp(config = {}) {
   app.use((req, res, next) => {
     const isStateChanging = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method);
     // Exclude public login/logout/probes from CSRF
-    const isExcluded = ['/api/auth/login', '/api/auth/logout', '/api/auth/bootstrap', '/livez', '/readyz'].includes(req.path);
+    const isExcluded = ['/api/auth/login', '/api/auth/logout', '/livez', '/readyz'].includes(req.path);
     
     if (isStateChanging && !isExcluded) {
       const csrfHeader = req.headers['x-csrf-token'] || req.headers['x-requested-with'];
@@ -491,24 +518,12 @@ function createTestApp(config = {}) {
   // Authentication & Session Endpoints (F1, F2, F3)
   // ==========================================
   
-  // Super Admin Bootstrap (F2)
-  app.post('/api/auth/bootstrap', (req, res) => {
-    const adminEmail = process.env.ADMIN_EMAIL || config.adminEmail;
-    const adminPassword = process.env.ADMIN_PASSWORD || config.adminPassword;
-
-    if (!adminEmail || !adminPassword) {
-      return res.status(400).json({ error: 'Bootstrap Failed', message: 'ADMIN_EMAIL and ADMIN_PASSWORD required in environment' });
-    }
-
-    const existing = db.getUserByEmail(adminEmail);
-    if (existing) {
-      return res.status(200).json({ message: 'Super admin already initialized', email: existing.email });
-    }
-
-    const user = db.addUser({ email: adminEmail, password: adminPassword, role: 'admin' });
-    // Ensure secrets are NOT logged or exposed
-    res.status(201).json({ message: 'Super admin bootstrapped successfully', email: user.email, role: user.role });
-  });
+  // Super Admin Bootstrap (F2) is intentionally NOT an HTTP route — see
+  // bootstrapAdminFromConfig() above, called once when this app is created.
+  // (Historical note: an earlier version exposed POST /api/auth/bootstrap,
+  // which was the M1 "bootstrap takeover" vulnerability; any request to that
+  // path now simply falls through to the global auth barrier / 404, exactly
+  // like the real server.)
 
   // User Login (F1, F9)
   app.post('/api/auth/login', (req, res) => {
@@ -697,13 +712,11 @@ function createTestApp(config = {}) {
     res.status(200).json({ run });
   });
 
-  app.post('/api/runs/:id/complete', authenticate, (req, res) => {
-    const run = db.runs.get(parseInt(req.params.id, 10));
-    if (!run) return res.status(404).json({ error: 'Run not found' });
-    run.status = 'completed';
-    if (activeConcurrentRuns > 0) activeConcurrentRuns--;
-    res.status(200).json({ message: 'Run completed', run });
-  });
+  // POST /api/runs/:id/complete is intentionally NOT an HTTP route — the
+  // real server has no such public endpoint either (run completion is
+  // internal to the scheduler/ManagedExecution, never a caller-triggered
+  // HTTP action that could let any authenticated member free up any run's
+  // concurrency slot). Tests simulate completion via controls.completeRun().
 
   app.get('/api/items', authenticate, (req, res) => {
     res.status(200).json({ items: [] });
@@ -801,6 +814,16 @@ function createTestApp(config = {}) {
     getApifyBalance: () => apifyBudgetBalance,
     getActiveRunsCount: () => activeConcurrentRuns,
     setActiveRunsCount: (val) => { activeConcurrentRuns = val; },
+    // Test-only equivalent of the removed public POST /api/runs/:id/complete
+    // route: marks a run completed and frees its concurrency slot, without
+    // exposing that as an HTTP action any authenticated caller could hit.
+    completeRun: (runId) => {
+      const run = db.runs.get(parseInt(runId, 10));
+      if (!run) return null;
+      run.status = 'completed';
+      if (activeConcurrentRuns > 0) activeConcurrentRuns--;
+      return run;
+    },
     simulateShutdown: () => { isShutdown = true; },
     simulateRestore: () => { isShutdown = false; },
     loginLimiter,

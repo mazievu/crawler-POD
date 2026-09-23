@@ -79,12 +79,31 @@ function parseItemConditions(query = {}) {
 async function bootstrapDatabase() {
   await db.initDatabase();
 
+  // Fail-closed boot: in production, refuse to start when required security
+  // configuration (encryption key, internal service key, CORS allowlist, and
+  // — if no admin exists yet — admin bootstrap credentials) is missing.
+  // Outside production this only warns, so local/dev/test flows keep working.
+  const { assertStartupConfig, StartupConfigError } = require('./src/security/startup-config');
+  const adminCountForStartupCheck = await db.countAdmins();
+  try {
+    assertStartupConfig({ env: process.env, adminCount: adminCountForStartupCheck });
+  } catch (err) {
+    if (err instanceof StartupConfigError) {
+      console.error(err.message);
+      if (process.env.NODE_ENV === 'production') {
+        process.exit(1);
+      }
+    } else {
+      throw err;
+    }
+  }
+
   // Milestone M1: Super Admin Bootstrap from environment
   const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
   const adminPassword = process.env.ADMIN_PASSWORD;
 
   try {
-    const adminCount = await db.countAdmins();
+    const adminCount = adminCountForStartupCheck;
     if (adminCount > 0) {
       console.log('[Auth] Super Admin already exists');
     } else if (adminEmail && adminPassword && adminPassword.trim().length > 0) {
@@ -101,6 +120,12 @@ async function bootstrapDatabase() {
     }
   } catch (err) {
     console.error('[Auth] Super Admin bootstrap failed:', err.message);
+    // A failed bootstrap in production means the server may be about to
+    // start with zero usable admin accounts — refuse to serve traffic
+    // rather than run in a state nobody can administer.
+    if (process.env.NODE_ENV === 'production') {
+      process.exit(1);
+    }
   }
 
   // Boot-time crash recovery
@@ -355,21 +380,22 @@ app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0 
 const { getAuthService } = require('./src/security/auth.service');
 const { createAuthMiddleware } = require('./src/security/auth.middleware');
 const { createAuthRouter } = require('./src/security/auth.routes');
+const { extractInternalServiceKey, verifyInternalServiceKey } = require('./src/routes/mcp-bridge');
 
 const authService = getAuthService(db);
 const { requireAuth, requireRole, requireAdmin } = createAuthMiddleware(authService);
 
-// Mount Auth Router (contains public /api/auth/login, /api/auth/logout, /api/auth/me; bootstrap via CLI only)
-app.use(createAuthRouter({ authService, authMiddleware: { requireAuth, requireRole, requireAdmin } }));
-
-// Mount MCP Bridge Router (internal loopback / service key)
-app.use(createMcpBridgeRouter({ database: db }));
-
-// ==================== Stage 1: Authentication Barrier ====================
-// Every remaining request under /api/*, /admin, and /admindashboard requires a valid session or API key
-app.use(['/api', '/admin', '/admindashboard'], requireAuth);
-
-// CSRF Defense Barrier for Mutating Requests Authenticated via Session Cookie
+// CSRF Defense Barrier for Mutating Requests Authenticated via Session Cookie.
+//
+// Defined (and mounted into the Auth Router below) BEFORE the global
+// requireAuth/csrfProtection barriers further down, because the Auth Router
+// owns POST /api/auth/api-keys and DELETE /api/auth/api-keys/:id — both
+// state-changing and both reachable via a session cookie. Express stops
+// walking the middleware chain once a router's route handler sends a
+// response, so mounting csrfProtection only globally (after the router)
+// never actually runs for those two routes; it has to be applied inside the
+// router's own route chain instead. `/api/auth/login` intentionally stays
+// exempt — logging in has no session yet to forge.
 function csrfProtection(req, res, next) {
   const isStateChanging = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method);
   const isExcluded = [
@@ -380,15 +406,25 @@ function csrfProtection(req, res, next) {
   ].includes(req.path);
 
   if (isStateChanging && !isExcluded) {
-    // Exempt API key and internal service key callers
-    const hasApiKey = Boolean(
-      req.authType === 'api_key' ||
-      req.headers['x-api-key'] ||
-      (req.headers.authorization && req.headers.authorization.startsWith('Bearer cp_'))
-    );
+    // Exempt callers already authenticated via a non-cookie credential.
+    // IMPORTANT: trust only req.authType, which requireAuth() sets ONLY
+    // after successfully validating the credential — never trust mere
+    // header *presence* here, or an attacker riding a victim's session
+    // cookie could bypass CSRF just by attaching an arbitrary
+    // `x-api-key`/`Authorization` header value that was never checked.
+    const hasApiKey = req.authType === 'api_key';
+
+    // x-internal-service-key is not a credential requireAuth() understands
+    // (the internal MCP bridge validates it in its own router, mounted
+    // before this barrier, and never falls through to here). A caller that
+    // reaches this point with that header set has NOT had it validated —
+    // exempting on presence alone was the actual bypass an attacker riding
+    // a victim's session cookie could exploit. Only exempt if the key
+    // actually verifies against INTERNAL_SERVICE_KEY.
+    const providedInternalKey = extractInternalServiceKey(req);
     const hasInternalKey = Boolean(
-      req.headers['x-internal-service-key'] ||
-      (req.headers.authorization && req.headers.authorization.match(/^Bearer\s+(?!cp_)/i))
+      providedInternalKey &&
+      verifyInternalServiceKey(providedInternalKey, process.env.INTERNAL_SERVICE_KEY)
     );
 
     if (hasApiKey || hasInternalKey) {
@@ -417,6 +453,23 @@ function csrfProtection(req, res, next) {
   }
   next();
 }
+
+// Mount Auth Router (contains public /api/auth/login and guarded auth
+// endpoints). csrfProtection is threaded in so the router can apply it to
+// its own mutating routes (POST/DELETE /api/auth/api-keys) — see comment
+// above csrfProtection for why the global app.use(csrfProtection) below
+// cannot reach them.
+app.use(createAuthRouter({ authService, authMiddleware: { requireAuth, requireRole, requireAdmin, csrfProtection } }));
+
+// Mount MCP Bridge Router (internal loopback / service key)
+app.use(createMcpBridgeRouter({ database: db }));
+
+// ==================== Stage 1: Authentication Barrier ====================
+// Every remaining request under /api/*, /admin, and /admindashboard requires a valid session or API key
+app.use(['/api', '/admin', '/admindashboard'], requireAuth);
+
+// Global CSRF barrier for every other mutating route (the Auth Router's own
+// mutating routes already applied the same csrfProtection function above).
 app.use(csrfProtection);
 
 // ==================== Stage 2: Admin RBAC Barrier ====================
@@ -1308,7 +1361,10 @@ app.delete('/api/apify-tokens/:id', (req, res) => {
   }
 });
 
-app.delete('/api/runs/:id', async (req, res) => {
+// Admin-only: runs have no owner column, so any lesser scope would let one
+// member abort/delete another member's run. Requiring admin here is the
+// least-privilege boundary available until per-run ownership exists.
+app.delete('/api/runs/:id', requireAdmin, async (req, res) => {
   try {
     const run = await db.getRunById(parseInt(req.params.id, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
@@ -1322,8 +1378,17 @@ app.delete('/api/runs/:id', async (req, res) => {
     if (run.status === 'running' || run.status === 'queued' || run.status === 'pending') {
       try {
         const options = typeof run.input_options === 'string' ? JSON.parse(run.input_options || '{}') : {};
-        if (options.executionToken) abortExecution(options.executionToken, 'USER_CANCELLED');
-      } catch (_e) { /* best-effort abort; deletion still proceeds below */ }
+        if (options.executionToken) {
+          // Await so a failed abort is observable instead of firing-and-forgetting
+          // a promise whose rejection would otherwise vanish silently.
+          await abortExecution(options.executionToken, 'USER_CANCELLED');
+        }
+      } catch (abortErr) {
+        console.error(`[DeleteRun] Abort failed for run ${run.id} (token present):`, abortErr.message);
+        // Best-effort: deletion still proceeds below even if the abort failed —
+        // the row must not become permanently un-deletable because the
+        // underlying execution refused to unwind cleanly.
+      }
     }
 
     await db.deleteRun(run.id);

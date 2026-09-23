@@ -524,9 +524,14 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
     }
   });
 
-  // --- LIVE TEST 2: Slot Underflow Stress via POST /api/runs/:id/complete ---
-  await t.test('Live Vector 2: Slot underflow stress: 25 spurious completion calls cannot drop active count below 0', async () => {
-    // 1. Send 25 spurious completions on non-existent run ID 999999
+  // --- LIVE TEST 2: POST /api/runs/:id/complete must not exist (removed —
+  // it let any authenticated caller free up any run's concurrency slot,
+  // including runs they didn't own, and manipulate scheduler admission
+  // state directly). Completion is now purely internal (ManagedExecution /
+  // scheduler), never a public HTTP surface. ---
+  await t.test('Live Vector 2: POST /api/runs/:id/complete is not a reachable route (removed public completion surface)', async () => {
+    // 1. Non-existent run ID: must not be treated as a valid-but-missing
+    // resource (404 with route semantics) — the route itself is gone.
     const spuriousPromises = Array.from({ length: 25 }, () =>
       adminFetch('/api/runs/999999/complete', {
         method: 'POST',
@@ -535,10 +540,12 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
     );
     const spuriousResponses = await Promise.all(spuriousPromises);
     for (const r of spuriousResponses) {
-      assert.strictEqual(r.status, 404, 'Non-existent run completion must return 404');
+      assert.strictEqual(r.status, 404, 'POST /api/runs/:id/complete must not exist');
     }
 
-    // 2. Submit a run, then complete it once, then hammer 10 times
+    // 2. Submit a real run, then confirm hammering .../complete on it is
+    // equally rejected — no path by which a caller can force-complete a run
+    // and manipulate the scheduler's active-slot accounting from the API.
     const runRes = await keyFetch('/api/runs', memberApiKeys[0], {
       method: 'POST',
       body: JSON.stringify({ platform: 'etsy_local', isPaidActor: false, query: 'underflow-target' }),
@@ -547,27 +554,23 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
     const runId = runJson.run?.id || runJson.id;
     assert.ok(runId, 'Run ID must exist');
 
-    // First completion -> 200
-    const firstComplete = await adminFetch(`/api/runs/${runId}/complete`, { method: 'POST' });
-    assert.strictEqual(firstComplete.status, 200);
-
-    // Repeated 10 completions on same run
     const repeatedPromises = Array.from({ length: 10 }, () =>
       adminFetch(`/api/runs/${runId}/complete`, { method: 'POST' })
     );
     const repeatedResponses = await Promise.all(repeatedPromises);
     for (const r of repeatedResponses) {
-      assert.strictEqual(r.status, 200);
+      assert.strictEqual(r.status, 404, 'POST /api/runs/:id/complete must not exist, even for a real run ID');
     }
 
-    // 3. Verify activeExecutionCount in scheduler is strictly >= 0 (never negative)
+    // 3. activeExecutionCount must never go negative regardless — verified
+    // structurally (scheduler status endpoint still reports a sane value)
+    // even though there is no public way to force-complete a run anymore.
     const statusRes = await adminFetch('/api/scheduler/status');
     const statusJson = await statusRes.json();
     assert.ok(
       statusJson.concurrency.active >= 0,
       `Active count must be >= 0, got: ${statusJson.concurrency.active}`
     );
-    assert.strictEqual(statusJson.concurrency.active, 0);
   });
 
   // --- LIVE TEST 3: Emergency Freeze Rapid Toggling Under Load ---

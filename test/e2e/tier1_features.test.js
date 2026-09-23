@@ -102,54 +102,65 @@ test('F1.5: Logout invalidates session and clears session cookie with past expir
 
 // ============================================================================
 // Feature 2: Super Admin Bootstrap
+//
+// There is intentionally NO public/authenticated HTTP route for this (the M1
+// "bootstrap takeover" audit finding removed it from the real server).
+// Bootstrap happens once, internally, when the server process starts —
+// mirrored here by bootstrapAdminFromConfig() running inside createTestApp().
 // ============================================================================
-test('F2.1: Bootstrap creates super admin user from ADMIN_EMAIL and ADMIN_PASSWORD', async () => {
+test('F2.1: Bootstrap creates super admin user from ADMIN_EMAIL and ADMIN_PASSWORD at server start', async () => {
   await withTestServer({ adminEmail: 'admin@system.local', adminPassword: 'SuperSecretAdminPassword123!' }, async (baseUrl, controls) => {
-    const res = await fetch(`${baseUrl}/api/auth/bootstrap`, {
+    const admin = controls.db.getUserByEmail('admin@system.local');
+    assert.ok(admin, 'Admin must exist immediately once the server has started');
+    assert.strictEqual(admin.role, 'admin');
+
+    // Login proves the account is fully usable, not just present in the DB.
+    const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'admin@system.local', password: 'SuperSecretAdminPassword123!' }),
     });
-    assert.strictEqual(res.status, 201);
-    const body = await res.json();
-    assert.strictEqual(body.email, 'admin@system.local');
-    assert.strictEqual(body.role, 'admin');
-    const admin = controls.db.getUserByEmail('admin@system.local');
-    assert.ok(admin);
-    assert.strictEqual(admin.role, 'admin');
+    assert.strictEqual(loginRes.status, 200);
   });
 });
 
-test('F2.2: Idempotent execution does not duplicate admin user or return error', async () => {
+test('F2.2: POST /api/auth/bootstrap does not exist — the vulnerable public route stays removed', async () => {
   await withTestServer({ adminEmail: 'admin@system.local', adminPassword: 'SuperSecretAdminPassword123!' }, async (baseUrl) => {
-    // First call
-    const res1 = await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
-    assert.strictEqual(res1.status, 201);
-    // Second call
-    const res2 = await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
-    assert.strictEqual(res2.status, 200);
-    const body = await res2.json();
-    assert.match(body.message, /already initialized/i);
-  });
-});
-
-test('F2.3: Rejects bootstrap when ADMIN_EMAIL or ADMIN_PASSWORD missing from env', async () => {
-  await withTestServer({ adminEmail: '', adminPassword: '' }, async (baseUrl) => {
     const res = await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
-    assert.strictEqual(res.status, 400);
+    assert.ok([401, 403, 404].includes(res.status), `POST /api/auth/bootstrap must not exist, got ${res.status}`);
   });
 });
 
-test('F2.4: Bootstrap response never leaks plain-text password in payload', async () => {
-  await withTestServer({ adminEmail: 'admin@safe.local', adminPassword: 'RawPasswordMustNotBeExposed!' }, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
-    const text = await res.text();
-    assert.ok(!text.includes('RawPasswordMustNotBeExposed!'), 'Plain password must not be present in response');
+test('F2.3: No admin exists when ADMIN_EMAIL or ADMIN_PASSWORD missing from env/config', async () => {
+  await withTestServer({ adminEmail: '', adminPassword: '' }, async (baseUrl, controls) => {
+    assert.strictEqual(controls.db.countAdmins(), 0);
+    const res = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'nobody@system.local', password: 'whatever' }),
+    });
+    assert.strictEqual(res.status, 401);
   });
 });
 
-test('F2.5: Created bootstrap user has role admin with full administrative rights', async () => {
+test('F2.4: Admin password hash never stores or exposes the plain-text password', async () => {
+  await withTestServer({ adminEmail: 'admin@safe.local', adminPassword: 'RawPasswordMustNotBeExposed!' }, async (baseUrl, controls) => {
+    const admin = controls.db.getUserByEmail('admin@safe.local');
+    assert.ok(admin);
+    assert.ok(!admin.passwordHash.includes('RawPasswordMustNotBeExposed!'), 'Stored hash must not contain the raw password');
+
+    const meRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'admin@safe.local', password: 'RawPasswordMustNotBeExposed!' }),
+    });
+    const text = await meRes.text();
+    assert.ok(!text.includes('RawPasswordMustNotBeExposed!'), 'Plain password must not be present in any response');
+  });
+});
+
+test('F2.5: Bootstrapped admin user has role admin with full administrative rights', async () => {
   await withTestServer({ adminEmail: 'admin@role.local', adminPassword: 'AdminPassword123!' }, async (baseUrl) => {
-    await fetch(`${baseUrl}/api/auth/bootstrap`, { method: 'POST', headers: { 'content-type': 'application/json' } });
     const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -791,11 +802,8 @@ test('F11.3: Completing an active run decrements concurrency count and frees slo
     });
     const { run } = await res1.json();
 
-    // Complete run 1
-    await fetch(`${baseUrl}/api/runs/${run.id}/complete`, {
-      method: 'POST',
-      headers: { 'x-api-key': rawKey },
-    });
+    // Complete run 1 (no public HTTP route for this — see controls.completeRun)
+    controls.completeRun(run.id);
     assert.strictEqual(controls.getActiveRunsCount(), 0);
 
     // Slot is free now
