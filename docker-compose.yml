@@ -21,11 +21,20 @@ services:
       CDP_URL: ""
     ports:
       - "${HOST_PORT:-9999}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/livez', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     volumes:
-      # Use the project's existing database and keep the prior named volume as a recovery copy.
+      # Persistent runtime data
       - ./data:/app/data
       - ./server.js:/app/server.js:ro
+      # Static public frontend assets remain read-only
       - ./public:/app/public:ro
+      # Dedicated read-write volume for media cache overrides read-only parent mount
+      - media_data:/app/public/media
       - ./src:/app/src:ro
     depends_on:
       - searxng
@@ -43,3 +52,4 @@ services:
 volumes:
   collector_data:
   searxng_cache:
+  media_data:

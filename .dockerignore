@@ -1,17 +1,68 @@
-.git
-.agents
-.codex
-.env
-node_modules
-data
-debug
-codemaps
-docs
-test
-skills
+# ==============================================================================
+# Docker Build Context Ignore List
+# Prevents secret leakage, runtime data bundling, and unnecessary build bloat
+# ==============================================================================
+
+# Version control & agent workspaces
+.git/
+.gitignore
+.agents/
+.agent/
+.codex/
+.claude/
+.playwright-mcp/
+.codegraph/
+
+# Environment configurations & secrets (PREVENTS CREDENTIAL LEAKAGE)
+.env*
+**/.env*
+proxies.txt
+**/proxies.txt
+
+# Database backups & sensitive data packets
+.backup/
+**/.backup/
+docs/BACKUPS/
+docs/DATA_PACKETS/
+
+# Runtime data, profiles, and logs
+data/
+**/data/
+logs/
+**/logs/
 *.log
 *.db
+*.db-wal
+*.db-shm
+
+# Ephemeral cached media assets (handled via persistent Docker volume)
+public/media/
+public/media/**
+
+# Node dependencies (freshly installed via npm ci in container)
+node_modules/
+
+# Test suites, reports & developer documentation
+test/
+codemaps/
+debug/
+skills/
+docs/
+playwright-report/
+test-results/
+coverage/
+.nyc_output/
+
+# Temporary run artifacts, scripts & screenshots
+screenshot*.png
+screenshot-*.png
 scratch-run.js
 check_fb.js
-screenshot*.png
-
+update.js
+start*.bat
+*.zip
+*.tar.gz
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
