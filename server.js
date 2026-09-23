@@ -359,7 +359,7 @@ const { createAuthRouter } = require('./src/security/auth.routes');
 const authService = getAuthService(db);
 const { requireAuth, requireRole, requireAdmin } = createAuthMiddleware(authService);
 
-// Mount Auth Router (contains public /api/auth/login, /api/auth/bootstrap, and guarded auth endpoints)
+// Mount Auth Router (contains public /api/auth/login, /api/auth/logout, /api/auth/me; bootstrap via CLI only)
 app.use(createAuthRouter({ authService, authMiddleware: { requireAuth, requireRole, requireAdmin } }));
 
 // Mount MCP Bridge Router (internal loopback / service key)

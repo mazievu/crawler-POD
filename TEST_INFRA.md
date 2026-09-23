@@ -45,11 +45,12 @@ The core testing engine resides in `test/e2e/harness.js` and provides:
 
 ### 2.1 In-Process Ephemeral Server (`withTestServer`)
 - Spins up an Express application bound to `127.0.0.1:0` (ephemeral OS-assigned port).
-- Exposes all 21 feature contracts:
-  - **Public**: `GET /livez`, `GET /readyz`, `POST /api/auth/login`, `POST /api/auth/bootstrap`
-  - **Member**: `POST /api/runs`, `GET /api/runs`, `GET /api/runs/:id`, `POST /api/runs/:id/complete`, `GET /api/items`, `GET /api/exports`
+- Exposes all feature contracts:
+  - **Public**: `GET /livez`, `GET /readyz`, `POST /api/auth/login`
+  - **Member**: `POST /api/runs`, `GET /api/runs`, `GET /api/runs/:id`, `GET /api/items`, `GET /api/exports`
   - **Admin**: `GET/POST /api/tokens`, `GET/POST /api/proxies`, `GET /api/sessions`, `GET /api/doctor`, `GET /api/system/info`, `POST /api/admin/freeze`, `POST /api/admin/bulk-delete`, `POST /api/auth/api-keys`, `DELETE /api/auth/api-keys/:id`
   - **Internal MCP Bridge**: `POST /api/internal/mcp-bridge/query` requiring constant-time `x-internal-service-key`
+  - **Bootstrap**: Admin account bootstrap via `npm run bootstrap:admin` CLI only (not via HTTP endpoint). Scheduler handles internal completion of runs.
 - Cleans up and unbinds socket immediately upon test completion.
 
 ### 2.2 OWASP Outbound SSRF Defense (`validateOutboundUrl` & `safeFetch`)
