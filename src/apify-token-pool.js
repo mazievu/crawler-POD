@@ -83,6 +83,69 @@ function parseTokenSignal(signal) {
   return { isError: false };
 }
 
+const DEFAULT_ESTIMATED_RUN_COST_USD = 0.05;
+const USD_DECIMALS = 4;
+
+function roundUsd(value) {
+  return Number(Number(value).toFixed(USD_DECIMALS));
+}
+
+function isPositiveUsd(value) {
+  if (value === undefined || value === null || value === '' || typeof value === 'boolean') return false;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0;
+}
+
+/**
+ * A zero, negative or non-numeric estimate would let runs through the cap for
+ * free, so anything but a positive finite number falls back to the default.
+ */
+function resolveEstimateConfig(raw) {
+  if (raw === undefined || raw === null || raw === '') return DEFAULT_ESTIMATED_RUN_COST_USD;
+  if (isPositiveUsd(raw)) return Number(raw);
+  console.warn(`[ApifyTokenPool] Ignoring invalid APIFY_DEFAULT_RUN_COST_USD "${raw}"; using $${DEFAULT_ESTIMATED_RUN_COST_USD}`);
+  return DEFAULT_ESTIMATED_RUN_COST_USD;
+}
+
+/**
+ * Per-attempt record of what a paid-actor callback reported back to the pool.
+ * `started` is what decides between refund (release) and settlement.
+ */
+function createRunTracker() {
+  return { started: false, runId: null, costUsd: null, costFinal: false, commitPromise: null };
+}
+
+/** Folds a callback's return value into the tracker (legacy cost/runId fields). */
+function absorbResult(tracker, result) {
+  // A callback that returned normally may well have started a paid actor
+  // without saying so; assume it did — over-counting is the safe direction.
+  tracker.started = true;
+  if (result && typeof result === 'object') {
+    const runId = result.backendRunId || result.runId;
+    if (runId && !tracker.runId) tracker.runId = String(runId);
+    const cost = typeof result.cost === 'number' ? result.cost : result.costUsd;
+    if (cost !== undefined && cost !== null && Number.isFinite(Number(cost)) && Number(cost) >= 0) {
+      tracker.costUsd = Number(cost);
+      tracker.costFinal = true;
+    }
+  }
+}
+
+/** Final settlement amount: real usage when final, never below the estimate otherwise. */
+function settlementAmount(tracker, estimate) {
+  if (tracker.costUsd === null) return estimate;
+  if (tracker.costFinal) return tracker.costUsd;
+  return Math.max(estimate, tracker.costUsd);
+}
+
+function budgetUpdateError(message) {
+  const err = new Error(message);
+  err.status = 400;
+  err.statusCode = 400;
+  err.code = 'INVALID_BUDGET_UPDATE';
+  return err;
+}
+
 /**
  * Custom Error for Apify Budget Exceeded (Feature 12)
  */
@@ -125,9 +188,20 @@ class ApifyTokenPoolManager {
     this.lastBudgetSyncAt = null;
     this.syncIntervalMs = Number(options.syncIntervalMs) || 300000;
 
-    this.defaultEstimatedCostUsd = options.defaultEstimatedCostUsd !== undefined ? Number(options.defaultEstimatedCostUsd) : 0.05;
+    // Amount reserved (and, once the actor starts, committed as spend) for a
+    // paid run whose real cost is not yet known. APIFY_DEFAULT_RUN_COST_USD.
+    this.defaultEstimatedCostUsd = resolveEstimateConfig(
+      options.defaultEstimatedCostUsd !== undefined
+        ? options.defaultEstimatedCostUsd
+        : process.env.APIFY_DEFAULT_RUN_COST_USD
+    );
+    // In-memory reservations: used ONLY when no durable ledger is attached
+    // (unit tests / tooling). Production attaches the Postgres ledger at boot.
     this.reservations = new Map();
     this.reservationCounter = 0;
+    this.budgetLedger = null;
+    this._ledgerReady = null;
+    if (options.budgetLedger) this.attachBudgetLedger(options.budgetLedger);
 
     this.tokens = new Map(); // id -> token record
     this.clients = new Map(); // id -> ApifyClient instance
@@ -248,7 +322,9 @@ class ApifyTokenPoolManager {
    */
   releaseBudget(reservationId) {
     const res = this.reservations.get(reservationId);
-    if (!res) return false;
+    // A committed reservation belongs to an actor that STARTED: that money is
+    // spent on Apify's side and must never be refunded here.
+    if (!res || res.committed) return false;
 
     this.remainingBalanceUsd = Number((this.remainingBalanceUsd + res.amount).toFixed(4));
     this.totalSpentUsd = Number(Math.max(0, this.totalSpentUsd - res.amount).toFixed(4));
@@ -304,6 +380,163 @@ class ApifyTokenPoolManager {
       isExhausted,
       status: isExhausted ? 'EXHAUSTED' : (this.remainingBalanceUsd <= 5.0 ? 'LOW_BALANCE' : 'HEALTHY'),
       lastSyncAt: this.lastBudgetSyncAt,
+    };
+  }
+
+  // ==================== Durable ledger (Postgres) ====================
+
+  /**
+   * Makes the DB ledger the source of truth for spend/balance. Without one,
+   * the pool falls back to in-process fields (unit tests / tooling only):
+   * that fallback resets on restart and is not shared across instances.
+   */
+  attachBudgetLedger(ledger) {
+    this.budgetLedger = ledger || null;
+    this._ledgerReady = null;
+    return this;
+  }
+
+  async _ensureLedger() {
+    if (!this.budgetLedger) return null;
+    if (!this._ledgerReady) {
+      this._ledgerReady = this.budgetLedger
+        .init({ initialBalanceUsd: this.remainingBalanceUsd })
+        .catch((err) => { this._ledgerReady = null; throw err; });
+    }
+    await this._ledgerReady;
+    return this.budgetLedger;
+  }
+
+  _applyLedgerState(state) {
+    if (state) {
+      this.totalSpentUsd = roundUsd(state.spentUsd);
+      this.remainingBalanceUsd = roundUsd(state.remainingBalanceUsd);
+      this.lastBudgetSyncAt = new Date().toISOString();
+    }
+    return this.getBudgetStatus();
+  }
+
+  /** Refreshes the cached spend/balance from the ledger (no-op in memory mode). */
+  async syncBudgetFromLedger() {
+    const ledger = await this._ensureLedger();
+    if (!ledger) return this.getBudgetStatus();
+    return this._applyLedgerState(await ledger.getState());
+  }
+
+  /**
+   * Admin budget update that is persisted when a ledger is attached. Same
+   * input/output shape as setBudget(); rejects non-numeric values (400).
+   */
+  async applyBudgetUpdate(options = {}) {
+    const input = options && typeof options === 'object' ? options : {};
+    for (const field of ['budgetLimitUsd', 'minBalanceThresholdUsd', 'remainingBalanceUsd']) {
+      const value = input[field];
+      if (value === undefined) continue;
+      if (typeof value === 'boolean' || value === null || value === '' || !Number.isFinite(Number(value))) {
+        throw budgetUpdateError(`${field} must be a finite number`);
+      }
+    }
+
+    const ledger = await this._ensureLedger();
+    const status = this.setBudget(input);
+    if (!ledger) return status;
+
+    const state = await ledger.update({
+      remainingBalanceUsd: input.remainingBalanceUsd,
+      resetSpent: input.resetSpent === true,
+    });
+    return this._applyLedgerState(state);
+  }
+
+  _budgetExceeded(cost) {
+    const details = {
+      remainingBalance: this.remainingBalanceUsd,
+      budgetLimit: this.budgetLimitUsd,
+      threshold: this.minBalanceThresholdUsd,
+    };
+    const overCap = this.budgetLimitUsd !== Infinity && (this.totalSpentUsd + cost) > this.budgetLimitUsd;
+    const message = overCap
+      ? `Configured budget limit of $${this.budgetLimitUsd} reached`
+      : 'Apify account budget limit reached or token balance zero';
+    return new ApifyBudgetExceededError(message, details);
+  }
+
+  /** Reserves `estimate` for one paid-actor attempt; throws APIFY_BUDGET_EXCEEDED. */
+  async _openReservation(estimate) {
+    const ledger = await this._ensureLedger();
+    if (!ledger) {
+      const res = this.reserveBudget(estimate);
+      return { id: res.id, amount: res.amount, ledger: null };
+    }
+
+    const outcome = await ledger.reserve({
+      amountUsd: estimate,
+      budgetLimitUsd: this.budgetLimitUsd === Infinity ? null : this.budgetLimitUsd,
+      minBalanceUsd: this.minBalanceThresholdUsd,
+    });
+    this._applyLedgerState(outcome.state);
+    if (!outcome.ok) throw this._budgetExceeded(estimate);
+    return { id: outcome.reservationId, amount: estimate, ledger };
+  }
+
+  /** Actor started: the reservation becomes non-refundable spend. */
+  async _commitReservation(reservation, runId) {
+    if (!reservation.ledger) {
+      const res = this.reservations.get(reservation.id);
+      if (res) res.committed = true;
+      return;
+    }
+    await reservation.ledger.commit(reservation.id, runId);
+  }
+
+  /** Adjusts spend from the estimate to the settled amount. */
+  async _settleReservation(reservation, tracker) {
+    const amount = settlementAmount(tracker, reservation.amount);
+    try {
+      if (tracker.commitPromise) await tracker.commitPromise;
+      if (!reservation.ledger) {
+        this.reconcileBudget(reservation.id, amount);
+        return;
+      }
+      this._applyLedgerState(await reservation.ledger.settle(reservation.id, amount, tracker.runId));
+    } catch (err) {
+      // The estimate stays counted as spend (over-counting is the safe side).
+      console.error(`[ApifyTokenPool] Budget settlement failed for ${reservation.id}: ${err.message}`);
+    }
+  }
+
+  /** Refunds a reservation whose actor never started. */
+  async _releaseReservation(reservation) {
+    try {
+      if (!reservation.ledger) {
+        this.releaseBudget(reservation.id);
+        return;
+      }
+      this._applyLedgerState(await reservation.ledger.release(reservation.id));
+    } catch (err) {
+      console.error(`[ApifyTokenPool] Budget release failed for ${reservation.id}: ${err.message}`);
+    }
+  }
+
+  /** The admission handed to a callback, plus hooks to report start and cost. */
+  _buildRunAdmission(admission, reservation, tracker) {
+    return {
+      ...admission,
+      reportActorStarted: (runId) => {
+        tracker.started = true;
+        if (runId) tracker.runId = String(runId);
+        if (!tracker.commitPromise) {
+          tracker.commitPromise = this._commitReservation(reservation, tracker.runId).catch((err) => {
+            console.error(`[ApifyTokenPool] Budget commit failed for ${reservation.id}: ${err.message}`);
+          });
+        }
+      },
+      reportRunCost: (usd, { final = false } = {}) => {
+        const n = Number(usd);
+        if (usd === null || usd === undefined || !Number.isFinite(n) || n < 0) return;
+        tracker.costUsd = n;
+        tracker.costFinal = Boolean(final);
+      },
     };
   }
 
@@ -662,25 +895,34 @@ class ApifyTokenPoolManager {
    * @param {object} options
    * @returns {Promise<any>}
    */
+  //
+  // Budget contract (P0):
+  // - A reservation of the estimate (APIFY_DEFAULT_RUN_COST_USD) is admitted
+  //   atomically BEFORE any actor can start; APIFY_BUDGET_EXCEEDED otherwise.
+  // - Once the callback reports the actor started (admission.reportActorStarted,
+  //   or by returning normally), the reservation is spend and is never refunded.
+  //   It is settled to the run's usageTotalUsd (admission.reportRunCost, or a
+  //   legacy result.cost/costUsd) — on success AND on failure/abort/timeout.
+  // - Only an attempt whose actor never started is released.
+  // - Each token attempt that starts an actor gets its own reservation, so a
+  //   failover after a start can never launch a second run for free.
   async withTokenFailover(fn, options = {}) {
-    const reservation = this.reserveBudget(options.estimatedCostUsd !== undefined ? options.estimatedCostUsd : this.defaultEstimatedCostUsd);
-    let isReconciled = false;
+    const estimate = isPositiveUsd(options.estimatedCostUsd)
+      ? Number(options.estimatedCostUsd)
+      : this.defaultEstimatedCostUsd;
+    const maxRotations = Math.min(
+      Math.max(1, this.tokens.size),
+      Number(options.maxTokenRotations || this.maxTokenRotations)
+    );
+    const excludeTokenIds = [];
+    let lastError = null;
+    let reservation = null;
 
     try {
-      const maxRotations = Math.min(
-        Math.max(1, this.tokens.size),
-        Number(options.maxTokenRotations || this.maxTokenRotations)
-      );
-      const excludeTokenIds = [];
-      let lastError = null;
-
       for (let attempt = 1; attempt <= maxRotations; attempt++) {
-        const admission = this.acquire({
-          ...options,
-          excludeTokenIds,
-          rotationAttempt: attempt
-        });
+        if (!reservation) reservation = await this._openReservation(estimate);
 
+        const admission = this.acquire({ ...options, excludeTokenIds, rotationAttempt: attempt });
         if (!admission.allowed) {
           const err = new Error(admission.error || 'APIFY_POOL_EXHAUSTED');
           err.code = admission.reason || 'APIFY_POOL_EXHAUSTED';
@@ -689,33 +931,24 @@ class ApifyTokenPoolManager {
         }
 
         const { client, tokenRecord, tokenId } = admission;
+        const tracker = createRunTracker();
 
         try {
-          const result = await fn(client, tokenRecord, admission);
+          const result = await fn(client, tokenRecord, this._buildRunAdmission(admission, reservation, tracker));
           if (tokenId) this.markSuccess(tokenId);
-          
-          if (result && typeof result.cost === 'number') {
-            this.reconcileBudget(reservation.id, result.cost);
-            isReconciled = true;
-          } else if (result && result.costUsd !== undefined) {
-            this.reconcileBudget(reservation.id, result.costUsd);
-            isReconciled = true;
-          }
+          absorbResult(tracker, result);
+          const settled = reservation;
+          reservation = null;
+          await this._settleReservation(settled, tracker);
           return result;
         } catch (err) {
           lastError = err;
-          const signal = parseTokenSignal(err);
-
-          if (signal.isError && tokenId) {
-            console.warn(`[ApifyTokenPool] Token ${tokenId} (${tokenRecord.label}) failed during attempt ${attempt}/${maxRotations}: ${signal.reason}. Rotating to next token...`);
-            this.markFailure(tokenId, err);
-            excludeTokenIds.push(tokenId);
-            continue; // Auto-rotate to next token
+          if (tracker.started) {
+            const settled = reservation;
+            reservation = null;
+            await this._settleReservation(settled, tracker);
           }
-
-          // If not a token-specific error (e.g. invalid actor input, client abort), don't discard token
-          if (tokenId) this.markSuccess(tokenId);
-          throw err;
+          if (!this._shouldRotate(err, tokenId, tokenRecord, attempt, maxRotations, excludeTokenIds)) throw err;
         }
       }
 
@@ -724,10 +957,23 @@ class ApifyTokenPoolManager {
       exhaustedErr.cause = lastError;
       throw exhaustedErr;
     } finally {
-      if (!isReconciled) {
-        this.releaseBudget(reservation.id);
-      }
+      // Still open only when no actor was started under it: refund.
+      if (reservation) await this._releaseReservation(reservation);
     }
+  }
+
+  /** Token-specific failures rotate to the next token; anything else is rethrown. */
+  _shouldRotate(err, tokenId, tokenRecord, attempt, maxRotations, excludeTokenIds) {
+    const signal = parseTokenSignal(err);
+    if (signal.isError && tokenId) {
+      console.warn(`[ApifyTokenPool] Token ${tokenId} (${tokenRecord.label}) failed during attempt ${attempt}/${maxRotations}: ${signal.reason}. Rotating to next token...`);
+      this.markFailure(tokenId, err);
+      excludeTokenIds.push(tokenId);
+      return true;
+    }
+    // Not a token-specific error (e.g. invalid actor input, client abort): keep the token.
+    if (tokenId) this.markSuccess(tokenId);
+    return false;
   }
 
   getStatus() {

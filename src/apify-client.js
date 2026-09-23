@@ -358,6 +358,28 @@ async function getRunStatus(runId, apiClient = null) {
 }
 
 /**
+ * Status plus what the run has cost so far. `usageTotalUsd` is Apify's own
+ * figure for the run (final once the run is in a terminal status); null when
+ * the API did not report it.
+ * @param {string} runId
+ * @returns {Promise<{ status: string, usageTotalUsd: number|null }>}
+ */
+async function getRunInfo(runId, apiClient = null) {
+  const effectiveClient = getClient(apiClient);
+  if (!effectiveClient) {
+    throw new Error('Apify client not initialized');
+  }
+
+  const run = await effectiveClient.run(runId).get();
+  const usage = Number(run?.usageTotalUsd);
+  const hasUsage = run?.usageTotalUsd !== undefined && run?.usageTotalUsd !== null && Number.isFinite(usage) && usage >= 0;
+  return {
+    status: run?.status,
+    usageTotalUsd: hasUsage ? usage : null,
+  };
+}
+
+/**
  * Fetch a dataset in bounded pages. Actors can return thousands of records,
  * while one listItems call is intentionally kept small and predictable.
  * @param {{ listItems: Function }} dataset
@@ -404,6 +426,7 @@ async function fetchDatasetItems(datasetId, limit = 100, apiClient = null) {
 module.exports = {
   startActor,
   getRunStatus,
+  getRunInfo,
   fetchDatasetItems,
   paginateDatasetItems,
   INPUT_BUILDERS,

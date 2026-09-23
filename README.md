@@ -40,6 +40,24 @@ The local free-first probes, SearXNG discovery scripts, and Toidispy CDP flow
 can run without it, but dashboard run routing has not yet been fully moved off
 Apify actors.
 
+#### Apify budget cap
+
+Paid Apify spend is tracked in PostgreSQL (`apify_budget_ledger` /
+`apify_budget_reservations`), so it survives restarts and is shared by every
+instance on the same database. Every actor start first reserves an estimate
+atomically; once the actor has started, that money counts as spent (it is never
+refunded, even if the run fails or is aborted) and is settled to Apify's
+reported `usageTotalUsd` when the run ends.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `APIFY_BUDGET_LIMIT_USD` | unlimited | Total spend cap; starts beyond it are rejected with `APIFY_BUDGET_EXCEEDED` (402). |
+| `APIFY_DEFAULT_RUN_COST_USD` | `0.05` | Estimate reserved per actor start (and kept as spend when no final usage is reported). Must be a positive number. |
+| `APIFY_INITIAL_BALANCE_USD` | `100` | Seeds the ledger balance **only when the ledger row is first created**; change it later via `POST /api/apify-tokens/budget`. |
+| `APIFY_MIN_BALANCE_USD` | `0` | Starts are rejected when the balance would drop below this floor. |
+
+The request field `isPaidActor` on `POST /api/runs` has no budget effect.
+
 ### Marketplace HTML capture
 
 Amazon, eBay, and Etsy can use an optional Playwright browser storage-state

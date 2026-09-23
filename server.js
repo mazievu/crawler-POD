@@ -79,6 +79,14 @@ function parseItemConditions(query = {}) {
 async function bootstrapDatabase() {
   await db.initDatabase();
 
+  // P0: Apify spend lives in Postgres, not process memory, so a restart or a
+  // second instance can never reset/bypass APIFY_BUDGET_LIMIT_USD. Fatal on
+  // failure (fail closed) like the rest of bootstrap.
+  const { getApifyTokenPool } = require('./src/apify-token-pool');
+  const apifyPool = getApifyTokenPool().attachBudgetLedger(db.createApifyBudgetLedger());
+  const apifyBudget = await apifyPool.syncBudgetFromLedger();
+  console.log(`[ApifyBudget] Durable ledger attached: spent $${apifyBudget.totalSpentUsd}, balance $${apifyBudget.remainingBalanceUsd}`);
+
   // Milestone M1: Super Admin Bootstrap from environment
   const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
   const adminPassword = process.env.ADMIN_PASSWORD;
@@ -1083,26 +1091,11 @@ app.post('/api/runs', async (req, res) => {
       });
     }
 
-    // 3. Feature 12 Check: Apify Budget Kill Switch
+    // 3. Feature 12 (Apify Budget Kill Switch) is enforced ONLY inside the
+    //    token pool, atomically, at the moment a real actor is started. The
+    //    client-supplied `isPaidActor` flag must never drive budget accounting:
+    //    it let callers burn the budget with fake runs or skip the check.
     const { isPaidActor, options } = req.body || {};
-    const requiresPaidActor = Boolean(isPaidActor);
-    if (requiresPaidActor) {
-      const { getApifyTokenPool } = require('./src/apify-token-pool');
-      const tokenPool = getApifyTokenPool();
-      const budget = tokenPool.checkBudget();
-
-      if (!budget.allowed) {
-        return res.status(402).json({
-          error: 'Payment Required',
-          code: 'APIFY_BUDGET_EXCEEDED',
-          message: 'Apify account budget limit reached or token balance zero',
-          remainingBalance: budget.remainingBalance,
-          budgetLimit: budget.budgetLimit,
-        });
-      }
-
-      tokenPool.deductBudget(1.0);
-    }
 
     const platform = req.body?.platform || 'etsy';
     const query = req.body?.query || (isPaidActor !== undefined ? 'default search' : null);
@@ -1223,22 +1216,24 @@ app.get('/api/apify-tokens/status', (req, res) => {
   }
 });
 
-app.get('/api/apify-tokens/budget', (req, res) => {
+app.get('/api/apify-tokens/budget', async (req, res) => {
   try {
     const { getApifyTokenPool } = require('./src/apify-token-pool');
-    res.json(getApifyTokenPool().getBudgetStatus());
+    // Refresh from the durable ledger: another instance may have spent since.
+    res.json(await getApifyTokenPool().syncBudgetFromLedger());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post('/api/apify-tokens/budget', (req, res) => {
+app.post('/api/apify-tokens/budget', async (req, res) => {
   try {
     const { getApifyTokenPool } = require('./src/apify-token-pool');
-    const updated = getApifyTokenPool().setBudget(req.body || {});
+    const updated = await getApifyTokenPool().applyBudgetUpdate(req.body || {});
     res.json({ success: true, budget: updated });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    const status = err.status === 400 ? 400 : 500;
+    res.status(status).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
   }
 });
 
