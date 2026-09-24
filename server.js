@@ -136,6 +136,17 @@ async function bootstrapDatabase() {
     }
   }
 
+  // bootstrapSuperAdmin() reports success without creating anything when
+  // ADMIN_EMAIL already belongs to a NON-admin user, so "no error" does not
+  // mean "an admin exists". Production must never serve with zero admins.
+  if (process.env.NODE_ENV === 'production' && (await db.countAdmins()) === 0) {
+    console.error(
+      '[Auth] FATAL: no admin account exists after bootstrap. ADMIN_EMAIL may belong to an existing '
+      + 'non-admin user; promote that user or choose a different ADMIN_EMAIL (see scripts/bootstrap-admin.js).'
+    );
+    process.exit(1);
+  }
+
   // Boot-time crash recovery
   void recoverOrphanedRuns(db).catch((err) =>
     console.error('[RestartRecovery] Boot-time recovery failed:', err.message)
