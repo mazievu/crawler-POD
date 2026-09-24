@@ -89,6 +89,7 @@ function parseTokenSignal(signal) {
 }
 
 const DEFAULT_ESTIMATED_RUN_COST_USD = 0.05;
+const DEFAULT_INITIAL_BALANCE_USD = 100.0;
 const USD_DECIMALS = 4;
 
 function roundUsd(value) {
@@ -186,7 +187,19 @@ class ApifyTokenPoolManager {
 
     const envInitial = process.env.APIFY_INITIAL_BALANCE_USD !== undefined ? Number(process.env.APIFY_INITIAL_BALANCE_USD) : null;
     const optInitial = options.initialApifyBalance !== undefined ? Number(options.initialApifyBalance) : null;
-    this.remainingBalanceUsd = optInitial !== null ? optInitial : (envInitial !== null ? envInitial : 100.0);
+    this.remainingBalanceUsd = optInitial !== null ? optInitial : (envInitial !== null ? envInitial : DEFAULT_INITIAL_BALANCE_USD);
+
+    // What the durable ledger may apply at attach time. Only EXPLICITLY
+    // configured values (option or env) override the stored row; a default
+    // never does, so a restart without config keeps tracked balance/limits.
+    this._ledgerSeed = {
+      initialBalanceUsd: this.remainingBalanceUsd,
+      balanceExplicit: optInitial !== null || envInitial !== null,
+      budgetLimitUsd: this.budgetLimitUsd === Infinity ? null : this.budgetLimitUsd,
+      minBalanceUsd: options.minBalanceThresholdUsd !== undefined || process.env.APIFY_MIN_BALANCE_USD !== undefined
+        ? this.minBalanceThresholdUsd
+        : null,
+    };
 
     this.defaultRunCostUsd = Number(options.defaultRunCostUsd || process.env.APIFY_DEFAULT_RUN_COST_USD || 1.0);
     this.totalSpentUsd = 0.0;
@@ -405,7 +418,8 @@ class ApifyTokenPoolManager {
     if (!this.budgetLedger) return null;
     if (!this._ledgerReady) {
       this._ledgerReady = this.budgetLedger
-        .init({ initialBalanceUsd: this.remainingBalanceUsd })
+        .init({ ...this._ledgerSeed })
+        .then((state) => { this._applyLedgerState(state); })
         .catch((err) => { this._ledgerReady = null; throw err; });
     }
     await this._ledgerReady;
@@ -416,6 +430,14 @@ class ApifyTokenPoolManager {
     if (state) {
       this.totalSpentUsd = roundUsd(state.spentUsd);
       this.remainingBalanceUsd = roundUsd(state.remainingBalanceUsd);
+      // The row's cap/floor win (durable, cluster-wide); null = not configured
+      // there, so the locally configured value stays in effect.
+      if (state.budgetLimitUsd !== null && state.budgetLimitUsd !== undefined) {
+        this.budgetLimitUsd = state.budgetLimitUsd;
+      }
+      if (state.minBalanceUsd !== null && state.minBalanceUsd !== undefined) {
+        this.minBalanceThresholdUsd = state.minBalanceUsd;
+      }
       this.lastBudgetSyncAt = new Date().toISOString();
     }
     return this.getBudgetStatus();
@@ -431,6 +453,9 @@ class ApifyTokenPoolManager {
   /**
    * Admin budget update that is persisted when a ledger is attached. Same
    * input/output shape as setBudget(); rejects non-numeric values (400).
+   * With a ledger the DB write happens FIRST (balance, spend reset, cap and
+   * floor in one statement) and memory is only updated from its result, so a
+   * failed write leaves this instance unchanged.
    */
   async applyBudgetUpdate(options = {}) {
     const input = options && typeof options === 'object' ? options : {};
@@ -443,13 +468,15 @@ class ApifyTokenPoolManager {
     }
 
     const ledger = await this._ensureLedger();
-    const status = this.setBudget(input);
-    if (!ledger) return status;
+    if (!ledger) return this.setBudget(input);
 
     const state = await ledger.update({
       remainingBalanceUsd: input.remainingBalanceUsd,
       resetSpent: input.resetSpent === true,
+      budgetLimitUsd: input.budgetLimitUsd,
+      minBalanceUsd: input.minBalanceThresholdUsd,
     });
+    if (!state) throw new Error(`Apify budget ledger row "${ledger.key}" not found`);
     return this._applyLedgerState(state);
   }
 

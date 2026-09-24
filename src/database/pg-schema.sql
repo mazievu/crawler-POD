@@ -607,6 +607,21 @@ CREATE TABLE IF NOT EXISTS apify_budget_ledger (
   updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Budget configuration lives on the ledger row so it is durable and shared by
+-- every instance (initDatabase re-runs this file on each boot: keep idempotent).
+--   seed_balance_usd       balance value the row was last seeded from; an
+--                          explicit APIFY_INITIAL_BALANCE_USD that differs re-seeds
+--   budget_limit_usd       effective spend cap (NULL = no cap)
+--   min_balance_usd        effective balance floor (NULL = the caller's default)
+--   *_seed_usd             last explicit env/config value applied; a different
+--                          explicit value overrides, an admin update does not
+--                          touch the seed (so it persists until env changes)
+ALTER TABLE apify_budget_ledger ADD COLUMN IF NOT EXISTS seed_balance_usd      NUMERIC(14, 6);
+ALTER TABLE apify_budget_ledger ADD COLUMN IF NOT EXISTS budget_limit_usd      NUMERIC(14, 6);
+ALTER TABLE apify_budget_ledger ADD COLUMN IF NOT EXISTS budget_limit_seed_usd NUMERIC(14, 6);
+ALTER TABLE apify_budget_ledger ADD COLUMN IF NOT EXISTS min_balance_usd       NUMERIC(14, 6);
+ALTER TABLE apify_budget_ledger ADD COLUMN IF NOT EXISTS min_balance_seed_usd  NUMERIC(14, 6);
+
 -- One row per admitted paid-actor attempt.
 --   reserved  -> estimate counted as spend; actor not (yet) known to be started
 --   committed -> actor started: the estimate is now spend and is NEVER refunded
