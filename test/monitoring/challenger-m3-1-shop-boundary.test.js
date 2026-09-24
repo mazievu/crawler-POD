@@ -51,6 +51,19 @@ async function createIsolatedTestDb() {
   return db;
 }
 
+/**
+ * SSOT §3.2 only counts an unchanged window toward the 30-day stop when
+ * consecutive observations are at most MAX_VALID_OBSERVATION_GAP (7d) apart;
+ * a bare Day 0 -> Day 30 pair is a broken chain and resets the window. Fill in
+ * the normal 5-day probe cadence (Day 5..25) so the Day 30 probe really stops.
+ */
+async function applyIntermediateObservations(ops, entityId, value) {
+  for (let day = 5; day <= 25; day += 5) {
+    const observedAt = new Date(Date.UTC(2026, 8, 1 + day)).toISOString();
+    await ops.applyShopObservation(entityId, { value, observedAt, quality: 'exact' });
+  }
+}
+
 // =============================================================================
 // CHALLENGE 1: 30-DAY BOUNDARY PRECISION
 // =============================================================================
@@ -415,8 +428,8 @@ test('CHALLENGE 5.1: applyShopObservation maintains strict metric scope isolatio
 
   // Seed listing in product_current
   await db.prepare(`
-    INSERT INTO product_current (item_uid, platform, query, title, url, current_sold, current_price, first_seen_at, last_seen_at)
-    VALUES ('etsy:item-isolated-scope', 'etsy', 'handmade pottery', 'Pottery Mug', 'https://etsy.com/listing/123', 42, 29.99, now(), now())
+    INSERT INTO product_current (item_uid, platform, query, title, url, current_sold, current_price, status, first_seen_at, last_seen_at)
+    VALUES ('etsy:item-isolated-scope', 'etsy', 'handmade pottery', 'Pottery Mug', 'https://etsy.com/listing/123', 42, 29.99, 'active', now(), now())
   `).run();
 
   await ops.registerItemForMonitoring({
@@ -479,6 +492,7 @@ test('CHALLENGE 5.2: applyShopObservation cascades stoppage to child items upon 
     observedAt: '2026-09-01T00:00:00.000Z',
     quality: 'exact',
   });
+  await applyIntermediateObservations(ops, entity.id, 1000);
 
   // Day 30: Fresh observation matching baseline triggers stoppage
   const day30Res = await ops.applyShopObservation(entity.id, {
@@ -491,7 +505,7 @@ test('CHALLENGE 5.2: applyShopObservation cascades stoppage to child items upon 
   assert.equal(day30Res.reason, 'shop_sales_unchanged_30d');
 
   // Verify child items are cascaded to paused
-  const items = await ops.getChildItemsForEntity(entity.id);
+  const items = await ops.getChildItemsForEntity(entity.id, { itemStatus: 'all' }); // default filter is active-only
   assert.equal(items.length, 3);
   for (const item of items) {
     assert.equal(item.item_status, 'paused', 'Child item must be paused when parent shop stops');

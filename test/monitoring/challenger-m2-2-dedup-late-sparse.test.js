@@ -194,7 +194,8 @@ test('Objective 1.3: Cross-date replay defense (delayed re-delivery on subsequen
 
   // Day 2 row must NOT have been created
   const day2Row = await db.prepare('SELECT * FROM daily_packed_history WHERE item_uid = ? AND date = ?').get(itemUid, '2026-09-17');
-  assert.equal(day2Row, null, 'No history row should be created for duplicate cross-date replay');
+  assert.equal(day2Row, undefined, // Statement#get() mirrors better-sqlite3: no row -> undefined
+    'No history row should be created for duplicate cross-date replay');
 });
 
 test('Objective 1.4: Special characters, UUIDs, and complex colons in observationId are handled safely', async () => {

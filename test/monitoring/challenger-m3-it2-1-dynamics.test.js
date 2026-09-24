@@ -51,6 +51,19 @@ async function createIsolatedTestDb() {
   return db;
 }
 
+/**
+ * SSOT §3.2 only counts an unchanged window toward the 30-day stop when
+ * consecutive observations are at most MAX_VALID_OBSERVATION_GAP (7d) apart;
+ * a bare Day 0 -> Day 30 pair is a broken chain and resets the window. Fill in
+ * the normal 5-day probe cadence (Day 5..25) so the Day 30 probe really stops.
+ */
+async function applyIntermediateObservations(ops, entityId, value) {
+  for (let day = 5; day <= 25; day += 5) {
+    const observedAt = new Date(Date.UTC(2026, 8, 1 + day)).toISOString();
+    await ops.applyShopObservation(entityId, { value, observedAt, quality: 'exact' });
+  }
+}
+
 // =============================================================================
 // CHALLENGE 1: NUMERIC EPOCH TIMESTAMP PARSING
 // =============================================================================
@@ -359,6 +372,7 @@ test('CHALLENGE 4.1: Database cascade stoppage query cancels queued item_refresh
     observedAt: '2026-09-01T00:00:00.000Z',
     quality: 'exact',
   });
+  await applyIntermediateObservations(ops, entity.id, 100);
 
   // Day 30 observation triggers stoppage cascade
   const resStop = await ops.applyShopObservation(entity.id, {

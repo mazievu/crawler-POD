@@ -202,7 +202,7 @@ test('SSOT 3.2: Transaction rollback leaves zero orphaned records', async () => 
   }
 
   const row = await db.prepare("SELECT * FROM monitoring_entities WHERE external_id = 'rollback-entity'").get();
-  assert.equal(row, null);
+  assert.equal(row, undefined); // Statement#get() mirrors better-sqlite3: no row -> undefined
 });
 
 test('SSOT 3.3: Sparse field updates preserve existing values without zero coercion', async () => {

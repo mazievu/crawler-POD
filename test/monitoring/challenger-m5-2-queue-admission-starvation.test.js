@@ -51,6 +51,18 @@ async function createIsolatedTestDb() {
 }
 
 /**
+ * monitoring_items.item_uid is a foreign key to product_current(item_uid), so a
+ * monitored item always needs its Discovery row to exist first.
+ */
+async function seedProductCurrent(db, itemUid) {
+  const platform = itemUid.split(':')[0];
+  await db.prepare(`
+    INSERT INTO product_current (item_uid, platform, query, title, url, status, first_seen_at, last_seen_at)
+    VALUES (?, ?, 'q', 'title', 'https://example.com', 'active', now(), now())
+  `).run(itemUid, platform);
+}
+
+/**
  * Mock RunQueue for ResourceScheduler to simulate bursts of Discovery runs.
  */
 class MockDiscoveryRunQueue {
@@ -444,6 +456,7 @@ test('Focus 4.1: Eligible shop probe is claimed before child item refreshes', as
   `).run();
 
   // Create child item
+  await seedProductCurrent(db, 'etsy:item-401');
   await db.prepare(`
     INSERT INTO monitoring_items (id, entity_id, item_uid, eligibility, item_status, next_due_at)
     VALUES (401, 301, 'etsy:item-401', 'ready', 'active', now())
@@ -483,6 +496,7 @@ test('Focus 4.2: Unstarred shop probe is claimed before STARRED item refresh (Pr
     VALUES (303, 'tiktok', 'author', 'starred-creator', 'id', 's1', now(), now(), true)
   `).run();
 
+  await seedProductCurrent(db, 'tiktok:video-402');
   await db.prepare(`
     INSERT INTO monitoring_items (id, entity_id, item_uid, eligibility, item_status, next_due_at)
     VALUES (402, 303, 'tiktok:video-402', 'ready', 'active', now())
@@ -541,6 +555,7 @@ test('Focus 4.4: Inactive or future shop probe does not block eligible item refr
     VALUES (306, 'etsy', 'shop', 'future-shop', 'id', 's1', now(), now(), false)
   `).run();
 
+  await seedProductCurrent(db, 'etsy:item-406');
   await db.prepare(`
     INSERT INTO monitoring_items (id, entity_id, item_uid, eligibility, item_status, next_due_at)
     VALUES (406, 306, 'etsy:item-406', 'ready', 'active', now())

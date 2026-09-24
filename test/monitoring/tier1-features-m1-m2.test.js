@@ -365,13 +365,15 @@ test('F5.1: monitoring_limiter uses key as PRIMARY KEY without an id column', as
 
 test('F5.2: Inserting into monitoring_limiter succeeds without SQL error about missing id', async () => {
   const db = await createTestDb();
+  // pg-schema.sql already seeds the 'global_monitoring_capture' singleton row,
+  // so use a separate key to exercise a plain INSERT on the id-less table.
   await db.prepare(`
     INSERT INTO monitoring_limiter (key, owner_token, next_allowed_at)
     VALUES (?, ?, now())
-  `).run('global_monitoring_capture', 'token-123');
+  `).run('f5_2_limiter_key', 'token-123');
 
-  const row = await db.prepare('SELECT * FROM monitoring_limiter WHERE key = ?').get('global_monitoring_capture');
-  assert.equal(row.key, 'global_monitoring_capture');
+  const row = await db.prepare('SELECT * FROM monitoring_limiter WHERE key = ?').get('f5_2_limiter_key');
+  assert.equal(row.key, 'f5_2_limiter_key');
   assert.equal(row.owner_token, 'token-123');
 });
 

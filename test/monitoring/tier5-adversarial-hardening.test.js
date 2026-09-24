@@ -190,7 +190,10 @@ describe('Domain A: Admin Dashboard & HTTP Concurrency Hardening', () => {
     const safeId = escapeHtml(hostileId);
     const buttonHtml = `<button class="btn btn-sm btn-danger" data-action="toggle" data-task-id="${safeId}" data-enabled="false">Disable</button>`;
 
-    assert.ok(!buttonHtml.includes("onclick="), 'HTML must not create a broken onclick attribute');
+    // The hostile text survives only as inert data inside the quoted data-task-id
+    // value; with every quoted attribute value removed, no onclick attribute remains.
+    const attributeNamesOnly = buttonHtml.replace(/"[^"]*"/g, '""');
+    assert.ok(!attributeNamesOnly.includes('onclick'), 'HTML must not create a broken onclick attribute');
     assert.ok(buttonHtml.includes('data-task-id="task-1&#39; onclick=&#39;evil()&quot;&lt;script&gt;"'));
 
     // Verify DOM attribute decoding recovers exact raw string
@@ -322,20 +325,36 @@ describe('Domain B: Limiter & Dispatcher Concurrency & Shutdown', () => {
     const limiter = new MonitoringLimiter(db);
     await limiter.init();
 
+    // Each release below (correctly) starts the default 20s cooldown, so the
+    // next worker can only acquire once that cooldown has elapsed; simulate it.
+    const elapseCooldown = () => db.query(
+      "UPDATE monitoring_limiter SET next_allowed_at = now() - INTERVAL '1 second' WHERE key = 'global_monitoring_capture'"
+    );
+    const cooldownRemainingMs = async () => {
+      const { rows } = await db.query(
+        "SELECT EXTRACT(EPOCH FROM (next_allowed_at - now())) * 1000 AS ms FROM monitoring_limiter WHERE key = 'global_monitoring_capture'"
+      );
+      return Number(rows[0].ms);
+    };
+
     const token1 = 'worker-nan-test';
-    await limiter.tryAcquireLease(token1, 30000);
+    assert.ok(await limiter.tryAcquireLease(token1, 30000));
     const released1 = await limiter.releaseLease(token1, NaN);
     assert.equal(released1, true, 'releaseLease with NaN must succeed without SQL interval syntax error');
+    assert.ok(await cooldownRemainingMs() > 15000, 'NaN cooldown must sanitize to the 20s default');
 
+    await elapseCooldown();
     const token2 = 'worker-invalid-test';
-    await limiter.tryAcquireLease(token2, 30000);
+    assert.ok(await limiter.tryAcquireLease(token2, 30000));
     const released2 = await limiter.releaseLease(token2, 'invalid');
     assert.equal(released2, true, 'releaseLease with invalid string must succeed');
 
+    await elapseCooldown();
     const token3 = 'worker-negative-test';
-    await limiter.tryAcquireLease(token3, 30000);
+    assert.ok(await limiter.tryAcquireLease(token3, 30000));
     const released3 = await limiter.releaseLease(token3, -5000);
     assert.equal(released3, true, 'releaseLease with negative cooldown must sanitize to default');
+    assert.ok(await cooldownRemainingMs() > 15000, 'Negative cooldown must sanitize to the 20s default');
   });
 
   test('T5.9: Stolen lease detection prevents split-brain capture writes', async () => {
@@ -465,9 +484,11 @@ describe('Domain C: Database & Patch Writer Payload Hardening', () => {
     const db = await createTestDb();
     const itemUid = 'etsy:item:dense-pack-10k';
 
+    // last_crawled_at must predate the 2026-09-22 observation, otherwise the
+    // default now() makes it a late arrival that never updates product_current.
     await db.prepare(`
-      INSERT INTO product_current (item_uid, platform, title, current_price, status)
-      VALUES (?, 'etsy', 'Dense History Item', 50.0, 'active')
+      INSERT INTO product_current (item_uid, platform, title, current_price, status, last_crawled_at)
+      VALUES (?, 'etsy', 'Dense History Item', 50.0, 'active', '2026-09-22 00:00:00')
     `).run(itemUid);
 
     const denseEntries = [];
