@@ -30,6 +30,7 @@ const { createAuthOps } = require('./database/auth-ops');
 const { MonitoringLimiter, acquireMonitoringLease, releaseMonitoringLease } = require('./monitoring/limiter');
 const { MonitoringDispatcher, parseMonitoringFlag } = require('./monitoring/dispatcher');
 const { acquireItemAdvisoryLock, getAdvisoryLockKeys } = require('./database/concurrency');
+const { createApifyBudgetLedger } = require('./apify-budget-ledger');
 // Job History "stuck" filter (getRunsFiltered() below) must reuse the exact
 // thresholds StuckDetector itself enforces, never a re-typed copy — see
 // reliability/stuck-detector.js. Safe to require at module scope: that file's
@@ -2227,6 +2228,9 @@ const api = {
   listApiKeys: async (...args) => authOps.listApiKeys(...args),
   listApiKeysByUserId: async (...args) => authOps.listApiKeysByUserId(...args),
   deleteApiKey: async (...args) => authOps.deleteApiKey(...args),
+  // Durable Apify budget ledger over this connection (sync factory; call after
+  // initDatabase(), which creates apify_budget_ledger from pg-schema.sql).
+  createApifyBudgetLedger: (options) => createApifyBudgetLedger(db, options),
 };
 
 /**

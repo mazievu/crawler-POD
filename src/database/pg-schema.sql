@@ -590,3 +590,42 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys (user_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys (key_hash) WHERE is_revoked = FALSE;
 
+-- ============================================================================
+-- Apify Budget Ledger (P0: durable, cluster-wide spend cap)
+-- ============================================================================
+-- Spend used to live in process memory: a restart reset it to 0 and every
+-- instance enforced the cap on its own. The single ledger row per key is the
+-- source of truth; a reservation is admitted with one conditional
+--   UPDATE ... SET spent_usd = spent_usd + $cost WHERE spent_usd + $cost <= $cap
+-- so concurrent reservations (any process) can never overshoot the cap.
+-- The cap itself (APIFY_BUDGET_LIMIT_USD) stays configuration, not data.
+
+CREATE TABLE IF NOT EXISTS apify_budget_ledger (
+  key                   TEXT PRIMARY KEY,
+  spent_usd             NUMERIC(14, 6) NOT NULL DEFAULT 0,
+  remaining_balance_usd NUMERIC(14, 6) NOT NULL DEFAULT 0,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per admitted paid-actor attempt.
+--   reserved  -> estimate counted as spend; actor not (yet) known to be started
+--   committed -> actor started: the estimate is now spend and is NEVER refunded
+--   settled   -> spend adjusted to the run's real usageTotalUsd (or kept at the
+--                estimate when no final figure was available)
+--   released  -> actor never started: the estimate was refunded
+CREATE TABLE IF NOT EXISTS apify_budget_reservations (
+  id            TEXT PRIMARY KEY,
+  ledger_key    TEXT NOT NULL REFERENCES apify_budget_ledger(key) ON DELETE CASCADE,
+  estimated_usd NUMERIC(14, 6) NOT NULL CHECK (estimated_usd >= 0),
+  actual_usd    NUMERIC(14, 6) CHECK (actual_usd IS NULL OR actual_usd >= 0),
+  status        TEXT NOT NULL DEFAULT 'reserved'
+                CHECK (status IN ('reserved', 'committed', 'settled', 'released')),
+  apify_run_id  TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_apify_budget_reservations_open
+  ON apify_budget_reservations (ledger_key, status)
+  WHERE status IN ('reserved', 'committed');
+

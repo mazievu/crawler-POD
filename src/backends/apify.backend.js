@@ -2,9 +2,52 @@ const BaseBackend = require('./base.backend');
 const apifyClient = require('../apify-client');
 const { getApifyTokenPool } = require('../apify-token-pool');
 
+const DEFAULT_POLL_INTERVAL_MS = 3000;
+const DEFAULT_MAX_POLL_ATTEMPTS = 120; // 3000ms * 120 = 360 seconds timeout
+const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT', 'TIMED_OUT']);
+
 class ApifyBackend extends BaseBackend {
-  constructor() {
+  /**
+   * @param {{ pollIntervalMs?: number, maxPollAttempts?: number }} [options]
+   *   Server-side tuning only (tests shorten the poll); never taken from a request.
+   */
+  constructor(options = {}) {
     super({ name: 'apify', kind: 'apify' });
+    const interval = Number(options.pollIntervalMs);
+    const attempts = Number(options.maxPollAttempts);
+    this.pollIntervalMs = Number.isFinite(interval) && interval >= 0 ? interval : DEFAULT_POLL_INTERVAL_MS;
+    this.maxPollAttempts = Number.isInteger(attempts) && attempts > 0 ? attempts : DEFAULT_MAX_POLL_ATTEMPTS;
+  }
+
+  /**
+   * Polls until the run is terminal (or the attempt budget runs out), reporting
+   * Apify's usageTotalUsd to the token pool on every poll so the budget ledger
+   * settles to the real cost — for failed/aborted/timed-out runs too.
+   */
+  async pollRun(runId, apiClient, admission, signal) {
+    let status = 'RUNNING';
+    let attempts = 0;
+
+    while (attempts < this.maxPollAttempts) {
+      // Gap #2 closure: stop OUR polling promptly on abort. This does not
+      // stop the remote Apify actor itself (it is not this process's to
+      // stop) — it only lets this execution settle so its local resources
+      // (worker slot/RAM) can be released honestly.
+      if (signal && signal.aborted) {
+        throw new Error('ABORTED: execution cancelled while polling Apify run status');
+      }
+      attempts++;
+      await new Promise(r => setTimeout(r, this.pollIntervalMs));
+      const info = await apifyClient.getRunInfo(runId, apiClient);
+      status = info.status;
+      const isTerminal = TERMINAL_RUN_STATUSES.has(status);
+      if (info.usageTotalUsd !== null && admission && typeof admission.reportRunCost === 'function') {
+        admission.reportRunCost(info.usageTotalUsd, { final: isTerminal });
+      }
+      if (isTerminal) break;
+    }
+
+    return { status, attempts };
   }
 
   async probe(channel, backendConfig) {
@@ -44,13 +87,19 @@ class ApifyBackend extends BaseBackend {
       return await this.runPaged(channel, backendConfig, query, options, requestedItems, pageCap);
     }
 
-    return await tokenPool.withTokenFailover(async (apiClient, tokenRecord) => {
+    return await tokenPool.withTokenFailover(async (apiClient, tokenRecord, admission) => {
       const { runId, datasetId } = await apifyClient.startActor(backendConfig.actorId, channel.name, {
         query,
         maxItems: requestedItems,
         country: options.country,
         page: options.page
       }, apiClient);
+
+      // From here on the run costs real money: the pool turns the budget
+      // reservation into non-refundable spend, settled to usageTotalUsd later.
+      if (admission && typeof admission.reportActorStarted === 'function') {
+        admission.reportActorStarted(runId);
+      }
 
       // Gap #4 closure (Final Gap Closure Round): the actor keeps running on
       // Apify's own infrastructure regardless of this Node process — report
@@ -60,26 +109,9 @@ class ApifyBackend extends BaseBackend {
         options.reportExternalExecution({ executionClass: 'CLOUD_API', externalExecutionId: runId });
       }
 
-      let status = 'RUNNING';
-      let attempts = 0;
-      const maxAttempts = 120; // 3000ms * 120 = 360 seconds timeout
-
       // Simple poll here so the router can await run() completely.
-      while (attempts < maxAttempts) {
-        // Gap #2 closure: stop OUR polling promptly on abort. This does not
-        // stop the remote Apify actor itself (it is not this process's to
-        // stop) — it only lets this execution settle so its local resources
-        // (worker slot/RAM) can be released honestly.
-        if (options.signal && options.signal.aborted) {
-          throw new Error('ABORTED: execution cancelled while polling Apify run status');
-        }
-        attempts++;
-        await new Promise(r => setTimeout(r, 3000));
-        status = await apifyClient.getRunStatus(runId, apiClient);
-        if (status === 'SUCCEEDED' || status === 'FAILED' || status === 'ABORTED') {
-          break;
-        }
-      }
+      const { status, attempts } = await this.pollRun(runId, apiClient, admission, options.signal);
+      const maxAttempts = this.maxPollAttempts;
 
       if (status !== 'SUCCEEDED') {
         throw new Error(`Apify run ended with status: ${status}`);

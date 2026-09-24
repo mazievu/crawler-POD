@@ -654,8 +654,13 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
   });
 
   // --- LIVE TEST 4: Apify Budget Kill Switch Boundary, Concurrency & Free Scraper Bypass ---
-  await t.test('Live Vector 4: Apify Budget Kill Switch: $0.00 / -$10.00 blocks paid runs (402), micro-spend precision, 10-parallel race for $5, and free scraper bypass', async () => {
-    // 4.1 Exact Zero Boundary ($0.00) -> 402 APIFY_BUDGET_EXCEEDED
+  // P0 update: the ingress no longer reads the client-supplied `isPaidActor`
+  // flag for budget purposes (it let callers burn or dodge the budget). The
+  // $0 / negative-balance / last-dollar race guarantees are now enforced by the
+  // token pool's atomic DB reservation at actor start — see
+  // test/apify-budget-settlement.test.js (a)-(f) and test/apify-budget-server.test.js.
+  await t.test('Live Vector 4: Apify Budget: client isPaidActor flag cannot touch the budget; admin budget state persists; free scraper bypass', async () => {
+    // 4.1 Exact Zero Boundary ($0.00): no ingress 402, no ingress deduction
     const setZero = await adminFetch('/api/apify-tokens/budget', {
       method: 'POST',
       body: JSON.stringify({ remainingBalanceUsd: 0.0, resetSpent: true }),
@@ -666,20 +671,16 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
       method: 'POST',
       body: JSON.stringify({ platform: 'apify_paid', isPaidActor: true, query: 'paid-zero-test' }),
     });
-    assert.strictEqual(paidZeroRes.status, 402, 'Paid actor run at $0.00 must return HTTP 402');
-    const paidZeroBody = await paidZeroRes.json();
-    assert.strictEqual(paidZeroBody.code, 'APIFY_BUDGET_EXCEEDED');
+    assert.notStrictEqual(paidZeroRes.status, 402, 'Ingress must not trust the client isPaidActor flag');
 
-    // 4.2 Negative Boundary (-$10.00) -> 402 APIFY_BUDGET_EXCEEDED
+    // 4.2 Negative Boundary (-$10.00) is persisted and reported as exhausted
     await adminFetch('/api/apify-tokens/budget', {
       method: 'POST',
       body: JSON.stringify({ remainingBalanceUsd: -10.0 }),
     });
-    const paidNegRes = await keyFetch('/api/runs', memberApiKeys[0], {
-      method: 'POST',
-      body: JSON.stringify({ platform: 'apify_paid', isPaidActor: true, query: 'paid-neg-test' }),
-    });
-    assert.strictEqual(paidNegRes.status, 402, 'Paid actor run at -$10.00 must return HTTP 402');
+    const negStatus = await (await adminFetch('/api/apify-tokens/budget')).json();
+    assert.strictEqual(negStatus.remainingBalanceUsd, -10.0);
+    assert.strictEqual(negStatus.isExhausted, true);
 
     // 4.3 Free Scraper Bypass Verification at -$10.00 Apify balance
     // Platform etsy_local with isPaidActor: false must succeed even with negative Apify budget
@@ -694,51 +695,31 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
     const budgetCheckJson = await budgetCheck.json();
     assert.strictEqual(budgetCheckJson.remainingBalanceUsd, -10.0);
 
-    // 4.4 Budget Deduction Concurrency: 10 parallel paid runs competing for $5.00 budget
-    // Reset budget to exactly $5.00
+    // 4.4 A burst of client-flagged "paid" runs deducts nothing at ingress
     await adminFetch('/api/apify-tokens/budget', {
       method: 'POST',
       body: JSON.stringify({ remainingBalanceUsd: 5.0, resetSpent: true }),
     });
 
-    // Fire 10 parallel paid runs using 10 distinct API keys
-    const parallelPaidPromises = memberApiKeys.slice(0, 10).map((key, idx) =>
+    const parallelPaidResponses = await Promise.all(memberApiKeys.slice(0, 3).map((key, idx) =>
       keyFetch('/api/runs', key, {
         method: 'POST',
-        body: JSON.stringify({
-          platform: 'apify_paid',
-          isPaidActor: true,
-          query: `parallel-budget-compete-${idx}`,
-        }),
+        body: JSON.stringify({ platform: 'apify_paid', isPaidActor: true, query: `parallel-budget-${idx}` }),
       })
-    );
-
-    const parallelPaidResponses = await Promise.all(parallelPaidPromises);
-
-    let paidSucceeded = 0;
-    let paidExceeded = 0;
-
+    ));
     for (const res of parallelPaidResponses) {
-      if (res.status === 201) {
-        paidSucceeded++;
-      } else if (res.status === 402) {
-        paidExceeded++;
-        const body = await res.json();
-        assert.strictEqual(body.code, 'APIFY_BUDGET_EXCEEDED');
-      } else {
-        assert.fail(`Unexpected status code: ${res.status}`);
-      }
+      assert.notStrictEqual(res.status, 402, 'Ingress must never answer 402 from the client flag');
     }
 
-    assert.strictEqual(paidSucceeded, 5, 'Exactly 5 paid runs must succeed on $5.00 budget');
-    assert.strictEqual(paidExceeded, 5, 'Exactly 5 paid runs must be blocked with HTTP 402');
+    const finalBudgetJson = await (await adminFetch('/api/apify-tokens/budget')).json();
+    assert.strictEqual(finalBudgetJson.remainingBalanceUsd, 5.0, 'Ingress must not deduct balance');
+    assert.strictEqual(finalBudgetJson.totalSpentUsd, 0, 'Ingress must not record spend');
 
-    // Verify final budget status
-    const finalBudgetRes = await adminFetch('/api/apify-tokens/budget');
-    const finalBudgetJson = await finalBudgetRes.json();
-    assert.strictEqual(finalBudgetJson.remainingBalanceUsd, 0.0, 'Final remaining balance must be 0.00');
-    assert.strictEqual(finalBudgetJson.totalSpentUsd, 5.0, 'Total spent must be exactly 5.00');
-    assert.strictEqual(finalBudgetJson.isExhausted, true);
-    assert.strictEqual(finalBudgetJson.status, 'EXHAUSTED');
+    // 4.5 Invalid admin input is rejected, not coerced to NaN
+    const badUpdate = await adminFetch('/api/apify-tokens/budget', {
+      method: 'POST',
+      body: JSON.stringify({ remainingBalanceUsd: 'lots' }),
+    });
+    assert.strictEqual(badUpdate.status, 400);
   });
 });
