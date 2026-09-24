@@ -20,6 +20,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const net = require('node:net');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 
 const PORT = 32198;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
@@ -27,14 +28,12 @@ const LIVE_SERVICE_KEY = 'live-server-internal-service-key-32b-secret!';
 const QUERY_PATH = '/api/internal/mcp-bridge/query';
 
 test('Live Server: MCP Bridge Lockdown End-to-End Adversarial Verification', async () => {
-  const env = {
-    ...process.env,
+  const { env, paths } = makeHermeticEnv({
     PORT: String(PORT),
-    PG_MODE: 'pglite',
     ADMIN_EMAIL: 'admin@system.local',
     ADMIN_PASSWORD: 'SuperAdminPassword123!',
     INTERNAL_SERVICE_KEY: LIVE_SERVICE_KEY,
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -191,5 +190,6 @@ test('Live Server: MCP Bridge Lockdown End-to-End Adversarial Verification', asy
     );
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(paths);
   }
 });

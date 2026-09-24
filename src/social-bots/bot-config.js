@@ -56,7 +56,11 @@ const DEFAULT_BOT_CONFIGS = {
 class BotConfigManager {
   constructor(filePath = null) {
     const path = require('path');
-    this.filePath = filePath || path.join(__dirname, '..', '..', 'data', 'social-bots.json');
+    // Allow tests (and any hermetic subprocess) to override where bot
+    // configs persist, so they never read or write the real
+    // data/social-bots.json used by a developer's local run.
+    const envPath = process.env.SOCIAL_BOTS_CONFIG_PATH;
+    this.filePath = filePath || (envPath ? path.resolve(envPath) : path.join(__dirname, '..', '..', 'data', 'social-bots.json'));
     this.configs = new Map();
     this.load();
   }

@@ -10,6 +10,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { runBootstrapAdmin, parseArgs } = require('../../scripts/bootstrap-admin');
 
@@ -102,20 +105,43 @@ test('runBootstrapAdmin: requires a database instance', async () => {
 
 test('CLI spawn: node scripts/bootstrap-admin.js creates admin via pglite and exits 0', async () => {
   const repoRoot = path.join(__dirname, '..', '..');
-  const env = {
-    ...process.env,
-    PG_MODE: 'pglite',
-    PGLITE_DIR: path.join(repoRoot, '.tmp-pglite-bootstrap-cli-test'),
-    ADMIN_EMAIL: 'cli-spawn-admin@system.local',
-    ADMIN_PASSWORD: 'CliSpawnAdminPassword123!',
-  };
+  // Hermetic: use a unique PGLITE_DIR under the OS temp dir per run, so a
+  // leftover admin from a prior run (or a shared repo-local directory)
+  // never causes a false "admin already exists" failure. Also strip any
+  // real Postgres connection env vars (PGHOST/PGPORT/PGUSER/PGPASSWORD/
+  // PGDATABASE/DATABASE_URL) the outer test runner may have exported (CI
+  // sets these for the Postgres-backed suites) so the spawned process
+  // cannot accidentally fall through to the shared Postgres database.
+  const pgliteDir = path.join(
+    os.tmpdir(),
+    `crawler-pod-bootstrap-cli-test-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  );
 
-  const result = spawnSync(process.execPath, ['scripts/bootstrap-admin.js'], {
-    cwd: repoRoot,
-    env,
-    encoding: 'utf8',
-  });
+  const env = { ...process.env };
+  delete env.PGHOST;
+  delete env.PGPORT;
+  delete env.PGUSER;
+  delete env.PGPASSWORD;
+  delete env.PGDATABASE;
+  delete env.DATABASE_URL;
+  delete env.PG_CONNECTION_STRING;
+  env.PG_MODE = 'pglite';
+  env.PGLITE_DIR = pgliteDir;
+  env.ADMIN_EMAIL = 'cli-spawn-admin@system.local';
+  env.ADMIN_PASSWORD = 'CliSpawnAdminPassword123!';
 
-  assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
-  assert.match(result.stdout, /Super Admin account created: cli-spawn-admin@system\.local/);
+  try {
+    const result = spawnSync(process.execPath, ['scripts/bootstrap-admin.js'], {
+      cwd: repoRoot,
+      env,
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /Super Admin account created: cli-spawn-admin@system\.local/);
+  } finally {
+    // Clean up the temp dir this test created — never touch anything under
+    // the repo's real data/ directory.
+    fs.rmSync(pgliteDir, { recursive: true, force: true });
+  }
 });

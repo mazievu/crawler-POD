@@ -12,18 +12,17 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 
 const PORT = 32202;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 
 test('DELETE /api/runs/:id requires admin; member is rejected with 403', async () => {
-  const env = {
-    ...process.env,
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(PORT),
-    PG_MODE: 'pglite',
     ADMIN_EMAIL: 'admin@system.local',
     ADMIN_PASSWORD: 'SuperAdminPassword123!',
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -97,5 +96,6 @@ test('DELETE /api/runs/:id requires admin; member is rejected with 403', async (
     assert.equal(unauthDeleteRes.status, 401);
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(hermeticPaths);
   }
 });

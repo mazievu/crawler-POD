@@ -1,3 +1,14 @@
+// This file exercises runUserJourney() (src/journey/user-journey-runner.js)
+// directly, which creates a CheckpointStore at its default on-disk location
+// under the repo's real data/captures directory unless overridden. Point it
+// at a unique temp dir first so this test file never writes into data/.
+{
+  const path = require('node:path');
+  const os = require('node:os');
+  process.env.CAPTURES_DIR = process.env.CAPTURES_DIR
+    || path.join(os.tmpdir(), `crawler-pod-reliability-captures-${process.pid}-${Date.now()}`);
+}
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Database = require('better-sqlite3');

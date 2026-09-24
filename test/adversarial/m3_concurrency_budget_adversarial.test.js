@@ -22,6 +22,7 @@ const path = require('node:path');
 const { ResourceScheduler } = require('../../src/scheduler/scheduler');
 const { ApifyTokenPoolManager, ApifyBudgetExceededError } = require('../../src/apify-token-pool');
 const { AdminDashboardService } = require('../../src/admin/dashboard');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 
 // Test port for live server integration
 const LIVE_PORT = 32299;
@@ -400,17 +401,15 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
   }
 
   // Before all live tests: spawn live server process
-  const env = {
-    ...process.env,
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(LIVE_PORT),
-    PG_MODE: 'pglite',
     ADMIN_EMAIL: 'admin@system.local',
     ADMIN_PASSWORD: 'SuperAdminPassword123!',
     INTERNAL_SERVICE_KEY: LIVE_SERVICE_KEY,
     MAX_CONCURRENT_RUNS: '3', // Start with ceiling = 3 for Vector 1
     APIFY_INITIAL_BALANCE_USD: '100.0',
     EMERGENCY_DISPATCH_FREEZE: 'false',
-  };
+  });
 
   serverProcess = spawn(process.execPath, ['server.js'], {
     cwd: path.resolve(__dirname, '../..'),
@@ -470,6 +469,7 @@ test('Milestone M3 Adversarial: Live Server HTTP Stress Suite', async (t) => {
     if (serverProcess) {
       serverProcess.kill('SIGKILL');
     }
+    cleanupHermeticEnv(hermeticPaths);
   });
 
   // --- LIVE TEST 1: Concurrency Saturation & Rejection at API Ingress ---

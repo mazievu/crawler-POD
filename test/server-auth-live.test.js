@@ -3,18 +3,17 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('./helpers/hermetic-spawn-env');
 
 const PORT = 32189;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 
 test('Live Server: Probes, Bootstrap, Auth Barrier, and RBAC Matrix', async () => {
-  const env = {
-    ...process.env,
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(PORT),
-    PG_MODE: 'pglite',
     ADMIN_EMAIL: 'admin@system.local',
     ADMIN_PASSWORD: 'SuperAdminPassword123!',
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -203,5 +202,6 @@ test('Live Server: Probes, Bootstrap, Auth Barrier, and RBAC Matrix', async () =
 
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(hermeticPaths);
   }
 });

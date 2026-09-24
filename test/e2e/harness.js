@@ -678,6 +678,30 @@ function createTestApp(config = {}) {
     const { platform = 'etsy', query, isPaidActor = false } = req.body || {};
 
     // Check Apify Budget Kill Switch (F12)
+    //
+    // NOTE on divergence from the real server: server.js used to let a
+    // client-supplied `isPaidActor` flag drive budget accounting directly
+    // in this same POST /api/runs handler — a client could burn the budget
+    // with fake paid runs, or dodge the check by omitting the flag. That
+    // was fixed (see server.js's own comment above its /api/runs handler,
+    // and test/apify-budget-server.test.js /
+    // test/adversarial/m3_concurrency_budget_adversarial.test.js "Live
+    // Vector 4"): the real server now enforces the budget only inside the
+    // Apify token pool, atomically, at the moment a real actor actually
+    // starts, and ignores the client's isPaidActor for accounting.
+    //
+    // This mock harness intentionally still models the OLD client-driven
+    // behavior below. It is a deliberately simplified in-memory fake used
+    // only by the F12 harness tests (test/e2e/tier1_features.test.js,
+    // tier2_boundaries.test.js, tier3_combinations.test.js) to exercise the
+    // *shape* of the budget-kill-switch contract (402 + APIFY_BUDGET_EXCEEDED
+    // once balance is exhausted) without a real Apify token pool. Those
+    // tests assert against this mock's own modeled balance
+    // (`controls.getApifyBalance()`), not against server.js, so keeping the
+    // simpler client-driven model here does not claim the real server still
+    // works this way — the real, non-spoofable enforcement path is covered
+    // separately by the live-server spawn tests referenced above. Do not
+    // read this block as documentation of current server.js behavior.
     if (isPaidActor) {
       if (apifyBudgetBalance <= 0) {
         return res.status(402).json({ error: 'Payment Required', code: 'APIFY_BUDGET_EXCEEDED', message: 'Apify account budget limit reached or token balance zero' });

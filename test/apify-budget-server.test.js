@@ -34,6 +34,10 @@ async function waitForLivez(deadlineMs) {
 
 test('POST /api/runs with isPaidActor:true does not touch the Apify budget', async (t) => {
   const pgliteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apify-budget-server-'));
+  const apifyTokensPath = path.join(pgliteDir, '..', `apify-budget-server-tokens-${path.basename(pgliteDir)}.json`);
+  const socialBotsPath = path.join(pgliteDir, '..', `apify-budget-server-social-bots-${path.basename(pgliteDir)}.json`);
+  const capturesDir = path.join(pgliteDir, '..', `apify-budget-server-captures-${path.basename(pgliteDir)}`);
+  const everbeeProfileRoot = path.join(pgliteDir, '..', `apify-budget-server-everbee-${path.basename(pgliteDir)}`);
   const child = spawn(process.execPath, ['server.js'], {
     cwd: path.resolve(__dirname, '..'),
     env: {
@@ -41,6 +45,10 @@ test('POST /api/runs with isPaidActor:true does not touch the Apify budget', asy
       PORT: String(PORT),
       PG_MODE: 'pglite',
       PGLITE_DIR: pgliteDir,
+      APIFY_TOKENS_PATH: apifyTokensPath,
+      SOCIAL_BOTS_CONFIG_PATH: socialBotsPath,
+      CAPTURES_DIR: capturesDir,
+      EVERBEE_PROFILE_ROOT: everbeeProfileRoot,
       ADMIN_EMAIL: ADMIN.email,
       ADMIN_PASSWORD: ADMIN.password,
       APIFY_INITIAL_BALANCE_USD: '100.0',
@@ -53,6 +61,10 @@ test('POST /api/runs with isPaidActor:true does not touch the Apify budget', asy
   t.after(() => {
     child.kill('SIGKILL');
     try { fs.rmSync(pgliteDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { fs.rmSync(apifyTokensPath, { force: true }); } catch { /* best effort */ }
+    try { fs.rmSync(capturesDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { fs.rmSync(everbeeProfileRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { fs.rmSync(socialBotsPath, { force: true }); } catch { /* best effort */ }
   });
 
   assert.ok(await waitForLivez(20000), 'server failed to start');
