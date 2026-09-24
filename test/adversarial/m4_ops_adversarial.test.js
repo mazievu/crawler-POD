@@ -31,11 +31,32 @@
  *    Path normalization across Windows/POSIX slashes.
  */
 
+// `require('../../server')` below runs server.js's full module-level boot
+// in THIS process (it is not spawned as a subprocess), which otherwise
+// instantiates the Apify token pool / social bot scheduler / journey
+// checkpoint store / everbee profile store at their default on-disk
+// locations under the repo's real data/ directory. Point them at a unique
+// temp location first so this test file never writes into data/.
+{
+  const path = require('node:path');
+  const os = require('node:os');
+  const runId = `${process.pid}-${Date.now()}`;
+  process.env.APIFY_TOKENS_PATH = process.env.APIFY_TOKENS_PATH
+    || path.join(os.tmpdir(), `crawler-pod-m4-ops-apify-tokens-${runId}.json`);
+  process.env.SOCIAL_BOTS_CONFIG_PATH = process.env.SOCIAL_BOTS_CONFIG_PATH
+    || path.join(os.tmpdir(), `crawler-pod-m4-ops-social-bots-${runId}.json`);
+  process.env.CAPTURES_DIR = process.env.CAPTURES_DIR
+    || path.join(os.tmpdir(), `crawler-pod-m4-ops-captures-${runId}`);
+  process.env.EVERBEE_PROFILE_ROOT = process.env.EVERBEE_PROFILE_ROOT
+    || path.join(os.tmpdir(), `crawler-pod-m4-ops-everbee-${runId}`);
+}
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 const { spawn } = require('node:child_process');
 const express = require('express');
 
@@ -718,14 +739,12 @@ test('Milestone M4: Operations & Lifecycle Adversarial Challenge Suite', async (
     });
 
     await t3.test('3.5: Live Server Process: Boot and 50-request probe flood over real network socket', async () => {
-      const env = {
-        ...process.env,
+      const { env, paths: hermeticPaths } = makeHermeticEnv({
         PORT: String(M4_LIVE_PORT),
-        PG_MODE: 'pglite',
         ADMIN_EMAIL: 'ops_admin@system.local',
         ADMIN_PASSWORD: 'OpsAdminPassword123!',
         INTERNAL_SERVICE_KEY: 'ops-adversarial-internal-key-32ch',
-      };
+      });
 
       const child = spawn(process.execPath, ['server.js'], {
         cwd: path.resolve(__dirname, '../..'),
@@ -775,6 +794,7 @@ test('Milestone M4: Operations & Lifecycle Adversarial Challenge Suite', async (
         assert.ok(!stderr.includes('[FATAL]'), `Live server stderr should not contain fatal crashes: ${stderr}`);
       } finally {
         child.kill();
+        cleanupHermeticEnv(hermeticPaths);
       }
     });
   });

@@ -17,6 +17,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 const dns = require('node:dns/promises');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 
 const {
   SSRFSecurityError,
@@ -634,14 +635,12 @@ const LIVE_PORT = 32299;
 const LIVE_BASE = `http://127.0.0.1:${LIVE_PORT}`;
 
 test('ADV-M2-6.1: Live Server Ingress CORS and CSRF Protection Verification', async () => {
-  const env = {
-    ...process.env,
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(LIVE_PORT),
-    PG_MODE: 'pglite',
     ADMIN_EMAIL: 'admin@system.local',
     ADMIN_PASSWORD: 'SuperAdminPassword123!',
     ALLOWED_ORIGINS: 'https://trusted.app.internal',
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -830,6 +829,7 @@ test('ADV-M2-6.1: Live Server Ingress CORS and CSRF Protection Verification', as
 
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(hermeticPaths);
   }
 });
 

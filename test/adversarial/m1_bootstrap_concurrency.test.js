@@ -8,6 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 
 const {
   AuthService,
@@ -150,13 +151,11 @@ test('BOOT-ADV-4: Live HTTP Server: bootstrap happens once from env at boot, and
   const PORT = 32190;
   const BASE_URL = `http://127.0.0.1:${PORT}`;
 
-  const env = {
-    ...process.env,
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(PORT),
-    PG_MODE: 'pglite',
     ADMIN_EMAIL: 'concurrent_admin@system.local',
     ADMIN_PASSWORD: 'LiveConcurrentAdminPassword123!',
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -215,5 +214,6 @@ test('BOOT-ADV-4: Live HTTP Server: bootstrap happens once from env at boot, and
     );
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(hermeticPaths);
   }
 });

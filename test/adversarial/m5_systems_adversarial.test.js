@@ -30,6 +30,26 @@
  *    - .dockerignore exclusions audit (.env*, proxies.txt, .backup/, data/, logs/, public/media/, node_modules/)
  */
 
+// `require('../../server')` below runs server.js's full module-level boot
+// in THIS process (it is not spawned as a subprocess), which otherwise
+// instantiates the Apify token pool / social bot scheduler / journey
+// checkpoint store / everbee profile store at their default on-disk
+// locations under the repo's real data/ directory. Point them at a unique
+// temp location first so this test file never writes into data/.
+{
+  const nodePath = require('node:path');
+  const nodeOs = require('node:os');
+  const runId = `${process.pid}-${Date.now()}`;
+  process.env.APIFY_TOKENS_PATH = process.env.APIFY_TOKENS_PATH
+    || nodePath.join(nodeOs.tmpdir(), `crawler-pod-m5-systems-apify-tokens-${runId}.json`);
+  process.env.SOCIAL_BOTS_CONFIG_PATH = process.env.SOCIAL_BOTS_CONFIG_PATH
+    || nodePath.join(nodeOs.tmpdir(), `crawler-pod-m5-systems-social-bots-${runId}.json`);
+  process.env.CAPTURES_DIR = process.env.CAPTURES_DIR
+    || nodePath.join(nodeOs.tmpdir(), `crawler-pod-m5-systems-captures-${runId}`);
+  process.env.EVERBEE_PROFILE_ROOT = process.env.EVERBEE_PROFILE_ROOT
+    || nodePath.join(nodeOs.tmpdir(), `crawler-pod-m5-systems-everbee-${runId}`);
+}
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');

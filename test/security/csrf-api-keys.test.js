@@ -14,24 +14,23 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 
 const PORT = 32201;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 
 test('CSRF: api-keys create/revoke require CSRF header on session-cookie auth; spoofed internal-key header cannot bypass it', async () => {
-  const env = {
-    ...process.env,
+  // Each spawn gets its own isolated PGLITE_DIR/Apify-token-pool/social-bot
+  // config (see test/helpers/hermetic-spawn-env.js) and bootstraps its own
+  // fresh admin from ADMIN_EMAIL/ADMIN_PASSWORD below, rather than relying
+  // on the default on-disk pgdata directory shared with other spawn tests
+  // (which pollutes the repo's real data/ directory).
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(PORT),
-    PG_MODE: 'pglite',
-    // Reuses the same admin credentials as the other live-server spawn tests
-    // (test/server-auth-live.test.js et al.): the shared PGLITE_DIR already
-    // has an admin from earlier test runs, and bootstrapDatabase() only
-    // creates an admin when none exists yet — reusing this email/password
-    // pair is what makes login work idempotently across test files/runs.
     ADMIN_EMAIL: 'admin@system.local',
     ADMIN_PASSWORD: 'SuperAdminPassword123!',
     INTERNAL_SERVICE_KEY: 'the-real-internal-service-key',
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -114,5 +113,6 @@ test('CSRF: api-keys create/revoke require CSRF header on session-cookie auth; s
     //    the login-exempt path (login itself, already covered above).
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(hermeticPaths);
   }
 });

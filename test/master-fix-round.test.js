@@ -17,6 +17,17 @@
  *     hint text) are pure public/app.js DOM rendering changes; this repo has
  *     no DOM/jsdom test harness. Verified by code review.
  */
+// This file exercises runUserJourney() (src/journey/user-journey-runner.js)
+// directly, which creates a CheckpointStore at its default on-disk location
+// under the repo's real data/captures directory unless overridden. Point it
+// at a unique temp dir first so this test file never writes into data/.
+{
+  const path = require('node:path');
+  const os = require('node:os');
+  process.env.CAPTURES_DIR = process.env.CAPTURES_DIR
+    || path.join(os.tmpdir(), `crawler-pod-master-fix-round-captures-${process.pid}-${Date.now()}`);
+}
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const db = require('../src/database');

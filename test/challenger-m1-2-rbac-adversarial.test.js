@@ -18,6 +18,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('./helpers/hermetic-spawn-env');
 
 const PORT = 32198;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
@@ -102,13 +103,16 @@ function rawSocketRequest(rawHttpString) {
 }
 
 test('Challenger 2 Empirical RBAC Adversarial Test Suite', async (t) => {
-  const env = {
-    ...process.env,
+  // Hermetic: this test spawns a real server process that persists state
+  // (pglite data dir, Apify token pool, social bot configs). Point every
+  // one of those at a unique temp location instead of the repo's real
+  // data/ directory, so runs never leak into (or are polluted by) other
+  // suites or a developer's local data.
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(PORT),
-    PG_MODE: 'pglite',
     ADMIN_EMAIL: 'admin@system.local',
     ADMIN_PASSWORD: 'SuperAdminPassword123!',
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -788,5 +792,6 @@ test('Challenger 2 Empirical RBAC Adversarial Test Suite', async (t) => {
 
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(hermeticPaths);
   }
 });

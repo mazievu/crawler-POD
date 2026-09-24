@@ -7,6 +7,26 @@
  * Feature 19: Graceful Shutdown Lifecycle (SIGINT/SIGTERM, draining, DB pool closing)
  */
 
+// `require('../server')` below runs server.js's full module-level boot in
+// THIS process (it is not spawned as a subprocess), which otherwise
+// instantiates the Apify token pool / social bot scheduler / journey
+// checkpoint store / everbee profile store at their default on-disk
+// locations under the repo's real data/ directory. Point them at a unique
+// temp location first so this test file never writes into data/.
+{
+  const path = require('node:path');
+  const os = require('node:os');
+  const runId = `${process.pid}-${Date.now()}`;
+  process.env.APIFY_TOKENS_PATH = process.env.APIFY_TOKENS_PATH
+    || path.join(os.tmpdir(), `crawler-pod-health-shutdown-apify-tokens-${runId}.json`);
+  process.env.SOCIAL_BOTS_CONFIG_PATH = process.env.SOCIAL_BOTS_CONFIG_PATH
+    || path.join(os.tmpdir(), `crawler-pod-health-shutdown-social-bots-${runId}.json`);
+  process.env.CAPTURES_DIR = process.env.CAPTURES_DIR
+    || path.join(os.tmpdir(), `crawler-pod-health-shutdown-captures-${runId}`);
+  process.env.EVERBEE_PROFILE_ROOT = process.env.EVERBEE_PROFILE_ROOT
+    || path.join(os.tmpdir(), `crawler-pod-health-shutdown-everbee-${runId}`);
+}
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');

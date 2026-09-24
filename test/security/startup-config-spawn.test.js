@@ -10,6 +10,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
+const { makeHermeticEnv, cleanupHermeticEnv } = require('../helpers/hermetic-spawn-env');
 
 function runServer(env, timeoutMs = 10000) {
   return new Promise((resolve) => {
@@ -43,41 +44,41 @@ function runServer(env, timeoutMs = 10000) {
 }
 
 test('Spawn: server.js exits non-zero in production when required config is missing', async () => {
-  const env = {
-    ...process.env,
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: '32199',
-    PG_MODE: 'pglite',
     NODE_ENV: 'production',
-  };
+  });
   delete env.ADMIN_EMAIL;
   delete env.ADMIN_PASSWORD;
   delete env.CREDENTIAL_ENCRYPTION_KEY;
   delete env.INTERNAL_SERVICE_KEY;
   delete env.ALLOWED_ORIGINS;
 
-  const result = await runServer(env);
+  try {
+    const result = await runServer(env);
 
-  assert.equal(result.exited, true, 'Server must exit rather than keep serving traffic');
-  assert.notEqual(result.code, 0, 'Exit code must be non-zero');
-  assert.ok(
-    /CREDENTIAL_ENCRYPTION_KEY|INTERNAL_SERVICE_KEY|ALLOWED_ORIGINS|ADMIN_EMAIL/.test(result.stderr),
-    `stderr must explain what is missing, got: ${result.stderr}`
-  );
+    assert.equal(result.exited, true, 'Server must exit rather than keep serving traffic');
+    assert.notEqual(result.code, 0, 'Exit code must be non-zero');
+    assert.ok(
+      /CREDENTIAL_ENCRYPTION_KEY|INTERNAL_SERVICE_KEY|ALLOWED_ORIGINS|ADMIN_EMAIL/.test(result.stderr),
+      `stderr must explain what is missing, got: ${result.stderr}`
+    );
+  } finally {
+    cleanupHermeticEnv(hermeticPaths);
+  }
 });
 
 test('Spawn: server.js starts normally in production once all required config is present', async () => {
   const PORT = 32200;
-  const env = {
-    ...process.env,
+  const { env, paths: hermeticPaths } = makeHermeticEnv({
     PORT: String(PORT),
-    PG_MODE: 'pglite',
     NODE_ENV: 'production',
     ADMIN_EMAIL: 'prod-admin@system.local',
     ADMIN_PASSWORD: 'ProdSuperAdminPassword123!',
     CREDENTIAL_ENCRYPTION_KEY: 'a'.repeat(64),
     INTERNAL_SERVICE_KEY: 'prod-internal-service-key',
     ALLOWED_ORIGINS: 'https://app.example.com',
-  };
+  });
 
   const child = spawn(process.execPath, ['server.js'], {
     cwd: process.cwd(),
@@ -98,5 +99,6 @@ test('Spawn: server.js starts normally in production once all required config is
     assert.ok(ready, 'Server with full production config must start within 15s');
   } finally {
     child.kill('SIGKILL');
+    cleanupHermeticEnv(hermeticPaths);
   }
 });
