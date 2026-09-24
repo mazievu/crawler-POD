@@ -8,6 +8,8 @@ proxies.txt
 debug/
 scratch-run.js
 .agent/
+.agents/
+.codegraph/
 .backup/
 .claude/
 docs/BACKUPS/

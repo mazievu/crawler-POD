@@ -67,11 +67,23 @@ const PG_OID_INT8 = 20;
 const PG_OID_NUMERIC = 1700;
 const toNumberOrNull = (value) => (value === null || value === undefined ? null : Number(value));
 
-pgTypes.setTypeParser(PG_OID_INT8, toNumberOrNull);
+/**
+ * int8 -> number, except when the value is outside Number.MAX_SAFE_INTEGER:
+ * converting it would silently round (9223372036854775800 -> ...776000), so
+ * the exact decimal text Postgres sent is kept instead. Counts and ordinary
+ * BIGINT counters stay numbers; only values a JS number cannot hold stay text.
+ */
+const toSafeInt8 = (value) => {
+  if (value === null || value === undefined) return null;
+  const num = Number(value);
+  return Number.isSafeInteger(num) ? num : String(value);
+};
+
+pgTypes.setTypeParser(PG_OID_INT8, toSafeInt8);
 pgTypes.setTypeParser(PG_OID_NUMERIC, toNumberOrNull);
 
 /** Same two parsers, in the shape PGlite's per-query `parsers` option wants. */
-const PG_NUMERIC_PARSERS = { [PG_OID_INT8]: toNumberOrNull, [PG_OID_NUMERIC]: toNumberOrNull };
+const PG_NUMERIC_PARSERS = { [PG_OID_INT8]: toSafeInt8, [PG_OID_NUMERIC]: toNumberOrNull };
 
 /** PGlite exposes exec() for multi-statement scripts; a pg Pool/Client does not. */
 function isPgliteDriver(driver) {
@@ -80,7 +92,7 @@ function isPgliteDriver(driver) {
 
 // Tables whose primary key is not a column named `id`; `RETURNING id` must not
 // be appended for these, and lastInsertRowid is meaningless for them.
-const TABLES_WITHOUT_ID = new Set(['product_current', 'migration_checkpoints', 'post_comments']);
+const TABLES_WITHOUT_ID = new Set(['product_current', 'migration_checkpoints', 'post_comments', 'monitoring_limiter']);
 
 /** Tables are quoted/unquoted in the source SQL; match either form. */
 function insertTargetTable(sql) {

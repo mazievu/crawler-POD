@@ -299,7 +299,8 @@ test('F4.B5: Cascade delete on monitoring_items when parent product_current is d
 
   await db.prepare("DELETE FROM product_current WHERE item_uid = 'etsy:cascade-parent'").run();
   const child = await db.prepare("SELECT * FROM monitoring_items WHERE item_uid = 'etsy:cascade-parent'").get();
-  assert.equal(child, null, 'Child monitoring item must be cascade-deleted');
+  assert.equal(child, undefined, // Statement#get() mirrors better-sqlite3: no row -> undefined
+    'Child monitoring item must be cascade-deleted');
 });
 
 // ==========================================
@@ -316,7 +317,7 @@ test('F5.B1: UPDATE on monitoring_limiter without RETURNING executes without err
 test('F5.B2: Querying non-existent key in monitoring_limiter returns null cleanly', async () => {
   const db = await createTestDb();
   const row = await db.prepare("SELECT * FROM monitoring_limiter WHERE key = 'ghost_key'").get();
-  assert.equal(row, null);
+  assert.equal(row, undefined); // Statement#get() mirrors better-sqlite3: no row -> undefined
 });
 
 test('F5.B3: Storing ISO string vs TIMESTAMPTZ in monitoring_limiter', async () => {

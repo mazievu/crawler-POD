@@ -1,5 +1,6 @@
 const { search } = require('../../scripts/searxng');
 const { cleanImageUrl } = require('../image-utils');
+const { safeFetch } = require('../security/outbound-guard');
 
 function cleanText(value, maxLength = 300) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -88,27 +89,37 @@ function imageFromSearchResult(result) {
   );
 }
 
-async function imageFromProductPage(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+const PRODUCT_PAGE_TIMEOUT_MS = 10000;
+const PRODUCT_PAGE_MAX_BYTES = 3 * 1024 * 1024;
+const PRODUCT_PAGE_HEADERS = Object.freeze({
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml',
+  'Accept-Language': 'en-US,en;q=0.9',
+});
+
+function extractSocialImage(html) {
+  const match = html.match(/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)["']/i)
+    || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image|twitter:image)["']/i);
+  return cleanImageUrl(match?.[1] || '');
+}
+
+/**
+ * Fetches a (search-result supplied, attacker-influenced) product page through the SSRF
+ * guard and returns its og:image / twitter:image. `guardOptions` exists only for test
+ * seams (dnsLookup / testOnly); production callers pass the URL alone.
+ */
+async function imageFromProductPage(url, guardOptions = {}) {
   try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+    const response = await safeFetch(url, {
+      ...guardOptions,
+      timeoutMs: PRODUCT_PAGE_TIMEOUT_MS,
+      maxSizeBytes: PRODUCT_PAGE_MAX_BYTES,
+      headers: PRODUCT_PAGE_HEADERS,
     });
     if (!response.ok) return '';
-    const html = await response.text();
-    const match = html.match(/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)["']/i)
-      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image|twitter:image)["']/i);
-    return cleanImageUrl(match?.[1] || '');
+    return extractSocialImage(await response.text());
   } catch {
     return '';
-  } finally {
-    clearTimeout(timeout);
   }
 }
 

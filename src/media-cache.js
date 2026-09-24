@@ -89,16 +89,60 @@ function sniffImageExt(buf) {
   return null;
 }
 
+const { safeFetch, validateOutboundUrl } = require('./security/outbound-guard');
+
 async function downloadOne(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    // 1. SSRF Pre-flight validation
+    await validateOutboundUrl(url);
+
+    // 2. Fetch using safeFetch enforcing manual redirect re-validation & content-length check
+    const res = await safeFetch(url, {
+      signal: controller.signal,
+      maxSizeBytes: MAX_BYTES,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
+        'Accept': 'image/*,*/*;q=0.8',
+      },
+    });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-    const buf = Buffer.from(await res.arrayBuffer());
+    // 3. True streaming byte limit: read chunks incrementally without allocating full memory
+    const chunks = [];
+    let receivedBytes = 0;
+
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        receivedBytes += value.length || value.byteLength || 0;
+        if (receivedBytes > MAX_BYTES) {
+          try { await reader.cancel(); } catch (_) {}
+          controller.abort();
+          throw new Error(`too large (${receivedBytes} bytes)`);
+        }
+        chunks.push(Buffer.isBuffer(value) ? value : Buffer.from(value));
+      }
+    } else if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
+      for await (const chunk of res.body) {
+        receivedBytes += chunk.length || chunk.byteLength || 0;
+        if (receivedBytes > MAX_BYTES) {
+          controller.abort();
+          throw new Error(`too large (${receivedBytes} bytes)`);
+        }
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+    } else {
+      const directBuf = Buffer.from(await res.arrayBuffer());
+      if (directBuf.length > MAX_BYTES) throw new Error(`too large (${directBuf.length} bytes)`);
+      chunks.push(directBuf);
+    }
+
+    const buf = Buffer.concat(chunks);
     if (buf.length === 0) throw new Error('empty body');
-    if (buf.length > MAX_BYTES) throw new Error(`too large (${buf.length} bytes)`);
 
     // The bytes decide. A correct content-type is a nice hint and nothing more;
     // this host sends binary/octet-stream for real JPEGs.

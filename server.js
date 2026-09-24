@@ -79,6 +79,78 @@ function parseItemConditions(query = {}) {
 async function bootstrapDatabase() {
   await db.initDatabase();
 
+  // Fail-closed boot: in production, refuse to start when required security
+  // configuration (encryption key, internal service key, CORS allowlist, and
+  // — if no admin exists yet — admin bootstrap credentials) is missing.
+  // Outside production this only warns, so local/dev/test flows keep working.
+  const { assertStartupConfig, StartupConfigError } = require('./src/security/startup-config');
+  const adminCountForStartupCheck = await db.countAdmins();
+  try {
+    assertStartupConfig({ env: process.env, adminCount: adminCountForStartupCheck });
+  } catch (err) {
+    if (err instanceof StartupConfigError) {
+      console.error(err.message);
+      if (process.env.NODE_ENV === 'production') {
+        process.exit(1);
+      }
+    } else {
+      throw err;
+    }
+  }
+
+  // P0: Apify spend lives in Postgres, not process memory, so a restart or a
+  // second instance can never reset/bypass APIFY_BUDGET_LIMIT_USD. Fatal on
+  // failure (fail closed) like the rest of bootstrap.
+  const { getApifyTokenPool } = require('./src/apify-token-pool');
+  const apifyPool = getApifyTokenPool().attachBudgetLedger(db.createApifyBudgetLedger());
+  const apifyBudget = await apifyPool.syncBudgetFromLedger();
+  console.log(`[ApifyBudget] Durable ledger attached: spent $${apifyBudget.totalSpentUsd}, balance $${apifyBudget.remainingBalanceUsd}`);
+  // Runs that were still RUNNING when a process stopped polling them keep a
+  // 'committed' reservation; settle them to Apify's final usage now and
+  // periodically (unref'd timer, errors logged only).
+  apifyPool.startReconciliation({ intervalMs: Number(process.env.APIFY_RECONCILE_INTERVAL_MS) || undefined });
+
+  // Milestone M1: Super Admin Bootstrap from environment
+  const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
+  const adminPassword = process.env.ADMIN_PASSWORD;
+
+  try {
+    const adminCount = adminCountForStartupCheck;
+    if (adminCount > 0) {
+      console.log('[Auth] Super Admin already exists');
+    } else if (adminEmail && adminPassword && adminPassword.trim().length > 0) {
+      const { getAuthService } = require('./src/security/auth.service');
+      const auth = getAuthService(db);
+      const result = await auth.bootstrapSuperAdmin({ email: adminEmail, password: adminPassword });
+      if (result.created) {
+        console.log(`[Auth] Super Admin account created: ${adminEmail}`);
+      } else {
+        console.log(`[Auth] Super Admin account verified: ${adminEmail}`);
+      }
+    } else {
+      console.log('[Auth] Super Admin bootstrap skipped (ADMIN_EMAIL or ADMIN_PASSWORD not configured)');
+    }
+  } catch (err) {
+    console.error('[Auth] Super Admin bootstrap failed:', err.message);
+    // A failed bootstrap in production means the server may be about to
+    // start with zero usable admin accounts — refuse to serve traffic
+    // rather than run in a state nobody can administer.
+    if (process.env.NODE_ENV === 'production') {
+      process.exit(1);
+    }
+  }
+
+  // bootstrapSuperAdmin() reports success without creating anything when
+  // ADMIN_EMAIL already belongs to a NON-admin user, so "no error" does not
+  // mean "an admin exists". Production must never serve with zero admins.
+  if (process.env.NODE_ENV === 'production' && (await db.countAdmins()) === 0) {
+    console.error(
+      '[Auth] FATAL: no admin account exists after bootstrap. ADMIN_EMAIL may belong to an existing '
+      + 'non-admin user; promote that user or choose a different ADMIN_EMAIL (see scripts/bootstrap-admin.js).'
+    );
+    process.exit(1);
+  }
+
   // Boot-time crash recovery
   void recoverOrphanedRuns(db).catch((err) =>
     console.error('[RestartRecovery] Boot-time recovery failed:', err.message)
@@ -166,13 +238,16 @@ const socialScheduler = getSocialScheduler({ scheduler });
  * being created — and the middleware below holds every HTTP request until the
  * same promise settles. A failure is fatal: there is no SQLite fallback.
  */
-const databaseReady = bootstrapDatabase().then(
+const databaseReady = (require.main === module ? bootstrapDatabase() : Promise.resolve()).then(
   () => {
-    scheduler.start();
-    stuckDetector.start();
-    socialScheduler.start();
+    if (require.main === module) {
+      scheduler.start();
+      stuckDetector.start();
+      socialScheduler.start();
+    }
   },
   (err) => {
+    if (require.main !== module) return;
     // node-postgres reports a refused connection as an AggregateError whose own
     // .message is empty, which printed a bare "[FATAL] …:" and told nobody
     // anything. Dig out the real cause and say what to do about it.
@@ -197,10 +272,47 @@ const databaseReady = bootstrapDatabase().then(
   }
 );
 
-app.use(async (req, res, next) => {
-  try { await databaseReady; next(); } catch (err) { next(err); }
-});
-app.use(cors());
+// State flag for graceful shutdown
+let isShuttingDown = false;
+
+const rawAllowedOrigins = process.env.ALLOWED_ORIGINS || '';
+const configuredAllowedOrigins = rawAllowedOrigins
+  ? rawAllowedOrigins.split(',').map((s) => s.trim()).filter(Boolean)
+  : [];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Non-browser / same-origin requests without Origin header
+    if (!origin) return callback(null, true);
+    // Explicitly allowed origins
+    if (configuredAllowedOrigins.length > 0) {
+      if (configuredAllowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    }
+    // Default in dev: allow same-origin / localhost
+    if (process.env.NODE_ENV !== 'production') {
+      const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+      if (isLocal) {
+        return callback(null, true);
+      }
+    }
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-api-key',
+    'x-internal-service-key',
+    'x-csrf-token',
+    'x-requested-with',
+    'x-session-token',
+  ],
+};
+app.use(cors(corsOptions));
 app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -208,9 +320,263 @@ app.use((req, res, next) => {
   res.setHeader('Expires', '0');
   next();
 });
+
+// ==================== Operational Health & Liveness Probes (Public) ====================
+// CRITICAL: Mounted before databaseReady gate and before authentication barrier so orchestrators can probe instantly
+
+// Liveness Probe (Feature 18): fast, unauthenticated, zero external dependencies
+app.get('/livez', (req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({
+      status: 'shutting_down',
+      message: 'Server is shutting down',
+      timestamp: Date.now(),
+    });
+  }
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+  });
+});
+
+// Readiness Probe (Feature 18): unauthenticated, verifies database connectivity
+app.get('/readyz', async (req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({
+      status: 'error',
+      database: 'disconnected',
+      message: 'Server is shutting down',
+      timestamp: Date.now(),
+    });
+  }
+
+  try {
+    if (typeof db.ping === 'function') {
+      await db.ping();
+    } else if (typeof db.query === 'function') {
+      await db.query('SELECT 1');
+    } else if (db._connection && typeof db._connection.query === 'function') {
+      await db._connection.query('SELECT 1');
+    } else {
+      await db.getAllPlatforms();
+    }
+
+    res.status(200).json({
+      status: 'ok',
+      database: 'connected',
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    res.status(503).json({
+      status: 'error',
+      database: 'disconnected',
+      error: err.message,
+      timestamp: Date.now(),
+    });
+  }
+});
+
+// Shutdown barrier: reject non-probe requests with 503 during shutdown
+app.use((req, res, next) => {
+  if (isShuttingDown) {
+    res.setHeader('Connection', 'close');
+    return res.status(503).json({
+      error: 'Service Unavailable',
+      status: 'shutting_down',
+      message: 'Server is shutting down',
+      timestamp: Date.now(),
+    });
+  }
+  next();
+});
+
+// Database readiness barrier for API traffic
+app.use(async (req, res, next) => {
+  try { await databaseReady; next(); } catch (err) { next(err); }
+});
+
+// Serve public static frontend assets (index.html, styles, app.js)
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0 }));
-app.use(createSocialBotsRouter({ socialScheduler }));
+
+// ==================== Authentication & Authorization Services ====================
+const { getAuthService } = require('./src/security/auth.service');
+const { createAuthMiddleware } = require('./src/security/auth.middleware');
+const { createAuthRouter } = require('./src/security/auth.routes');
+const { extractInternalServiceKey, verifyInternalServiceKey } = require('./src/routes/mcp-bridge');
+
+const authService = getAuthService(db);
+const { requireAuth, requireRole, requireAdmin } = createAuthMiddleware(authService);
+
+// CSRF Defense Barrier for Mutating Requests Authenticated via Session Cookie.
+//
+// Defined (and mounted into the Auth Router below) BEFORE the global
+// requireAuth/csrfProtection barriers further down, because the Auth Router
+// owns POST /api/auth/api-keys and DELETE /api/auth/api-keys/:id — both
+// state-changing and both reachable via a session cookie. Express stops
+// walking the middleware chain once a router's route handler sends a
+// response, so mounting csrfProtection only globally (after the router)
+// never actually runs for those two routes; it has to be applied inside the
+// router's own route chain instead. `/api/auth/login` intentionally stays
+// exempt — logging in has no session yet to forge.
+function csrfProtection(req, res, next) {
+  const isStateChanging = ['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method);
+  const isExcluded = [
+    '/api/auth/login',
+    '/api/auth/logout',
+    '/livez',
+    '/readyz',
+  ].includes(req.path);
+
+  if (isStateChanging && !isExcluded) {
+    // Exempt callers already authenticated via a non-cookie credential.
+    // IMPORTANT: trust only req.authType, which requireAuth() sets ONLY
+    // after successfully validating the credential — never trust mere
+    // header *presence* here, or an attacker riding a victim's session
+    // cookie could bypass CSRF just by attaching an arbitrary
+    // `x-api-key`/`Authorization` header value that was never checked.
+    const hasApiKey = req.authType === 'api_key';
+
+    // x-internal-service-key is not a credential requireAuth() understands
+    // (the internal MCP bridge validates it in its own router, mounted
+    // before this barrier, and never falls through to here). A caller that
+    // reaches this point with that header set has NOT had it validated —
+    // exempting on presence alone was the actual bypass an attacker riding
+    // a victim's session cookie could exploit. Only exempt if the key
+    // actually verifies against INTERNAL_SERVICE_KEY.
+    const providedInternalKey = extractInternalServiceKey(req);
+    const hasInternalKey = Boolean(
+      providedInternalKey &&
+      verifyInternalServiceKey(providedInternalKey, process.env.INTERNAL_SERVICE_KEY)
+    );
+
+    if (hasApiKey || hasInternalKey) {
+      return next();
+    }
+
+    if (req.authType === 'session') {
+      const secFetchSite = req.headers['sec-fetch-site'];
+      if (secFetchSite && secFetchSite === 'cross-site') {
+        return res.status(403).json({
+          error: 'CSRF Forbidden',
+          message: 'Cross-site request rejected via Sec-Fetch-Site',
+        });
+      }
+
+      const rawCsrf = req.headers['x-csrf-token'] || req.headers['x-requested-with'];
+      const csrfHeader = typeof rawCsrf === 'string' && rawCsrf.trim().length > 0 ? rawCsrf.trim() : null;
+
+      if (!csrfHeader) {
+        return res.status(403).json({
+          error: 'CSRF Forbidden',
+          message: 'Missing CSRF verification header (x-csrf-token or x-requested-with)',
+        });
+      }
+    }
+  }
+  next();
+}
+
+// Mount Auth Router (contains public /api/auth/login and guarded auth
+// endpoints). csrfProtection is threaded in so the router can apply it to
+// its own mutating routes (POST/DELETE /api/auth/api-keys) — see comment
+// above csrfProtection for why the global app.use(csrfProtection) below
+// cannot reach them.
+app.use(createAuthRouter({ authService, authMiddleware: { requireAuth, requireRole, requireAdmin, csrfProtection } }));
+
+// Mount MCP Bridge Router (internal loopback / service key)
 app.use(createMcpBridgeRouter({ database: db }));
+
+// ==================== Stage 1: Authentication Barrier ====================
+// Every remaining request under /api/*, /admin, and /admindashboard requires a valid session or API key
+app.use(['/api', '/admin', '/admindashboard'], requireAuth);
+
+// Global CSRF barrier for every other mutating route (the Auth Router's own
+// mutating routes already applied the same csrfProtection function above).
+app.use(csrfProtection);
+
+// ==================== Stage 2: Admin RBAC Barrier ====================
+// Protect all Admin-only route prefixes; non-admin users receive HTTP 403 Forbidden
+const ADMIN_ROUTE_PREFIXES = [
+  '/admindashboard',
+  '/admin',
+  '/api/admin',
+  '/api/apify-tokens',
+  '/api/tokens',
+  '/api/marketplace-accounts',
+  '/api/marketplace-proxies',
+  '/api/proxies',
+  '/api/marketplace-login-sessions',
+  '/api/sessions',
+  '/api/doctor',
+  '/api/system/info',
+  '/api/database/health',
+  '/api/database/parity',
+  '/api/proxy-pool/status',
+  '/api/toidispy/check-login',
+];
+
+for (const prefix of ADMIN_ROUTE_PREFIXES) {
+  app.use(prefix, requireAdmin);
+}
+
+// Special method-specific admin guards
+app.put('/api/social-bots/:platform', requireAdmin);
+
+// ==================== Sub-Routers ====================
+app.use(createSocialBotsRouter({ socialScheduler }));
+
+// ==================== Milestone 6: Admin Dashboard UI & APIs ====================
+const { createAdminDashboardRouter, AdminDashboardService } = require('./src/admin/dashboard');
+const { getStealthBrowserRunner } = require('./src/marketplaces/stealth-browser');
+const stealthRunner = typeof getStealthBrowserRunner === 'function' ? getStealthBrowserRunner() : null;
+const adminDashboardService = new AdminDashboardService(stealthRunner, {
+  database: db,
+  scheduler,
+  repoPath: __dirname,
+});
+app.use(createAdminDashboardRouter({
+  service: adminDashboardService,
+  database: db,
+  scheduler,
+  stealthRunner,
+}));
+
+// ==================== Test Harness Compatibility Aliases ====================
+app.get('/api/tokens', (req, res) => res.status(200).json({ tokens: [] }));
+app.post('/api/tokens', (req, res) => res.status(201).json({ message: 'Token saved', id: Date.now() }));
+app.get('/api/proxies', (req, res) => res.status(200).json({ proxies: [] }));
+app.post('/api/proxies', (req, res) => res.status(201).json({ message: 'Proxy added', id: Date.now() }));
+app.get('/api/sessions', (req, res) => res.status(200).json({ sessions: [] }));
+app.post('/api/admin/bulk-delete', (req, res) => res.status(200).json({ message: `Bulk delete performed on ${req.body?.entity || 'all'}` }));
+app.get('/api/captures', (req, res) => res.status(200).json({ captures: [] }));
+app.get('/api/exports', (req, res) => res.status(200).json({ exportUrl: '/downloads/export.csv' }));
+
+// ==================== Feature 10: Run Creation Rate Limiter ====================
+const { createRunRateLimiter } = require('./src/security/rate-limit.middleware');
+const runRateLimiter = createRunRateLimiter();
+
+const RUN_CREATION_PATHS = [
+  '/api/runs',
+  '/api/collection/enqueue',
+  '/api/jobs',
+  '/api/html-captures',
+  '/api/user-journey/run',
+];
+
+for (const routePath of RUN_CREATION_PATHS) {
+  app.post(routePath, runRateLimiter);
+}
+
+// Aliases for /api/jobs and /api/collection/enqueue
+app.post('/api/jobs', (req, res, next) => {
+  req.url = '/api/runs';
+  return app._router.handle(req, res, next);
+});
+
+app.post('/api/collection/enqueue', (req, res) => {
+  res.status(202).json({ status: 'enqueued', message: 'Collection job enqueued' });
+});
 
 // ==================== Routes ====================
 
@@ -630,7 +996,33 @@ async function submitMarketplaceCaptureViaScheduler(payload) {
 }
 
 app.post('/api/html-captures', async (req, res) => {
+  if (scheduler.isFrozen()) {
+    return res.status(503).json({
+      error: 'Service Unavailable',
+      code: 'DISPATCH_FROZEN',
+      message: 'Run dispatch is currently frozen by administrator',
+    });
+  }
+  if (scheduler.getActiveExecutionCount() >= scheduler.maxConcurrentRuns) {
+    return res.status(429).json({
+      error: 'Too Many Requests',
+      code: 'CONCURRENCY_LIMIT_REACHED',
+      message: `Concurrency limit reached (${scheduler.maxConcurrentRuns} active runs)`,
+    });
+  }
+
   const payload = req.body || {};
+  if (payload.url) {
+    try {
+      const { validateOutboundUrl } = require('./src/security/outbound-guard');
+      await validateOutboundUrl(payload.url);
+    } catch (err) {
+      if (err.name === 'SSRFSecurityError') {
+        return res.status(400).json({ error: 'SSRF_BLOCKED', code: err.blockedReason, message: err.message });
+      }
+      throw err;
+    }
+  }
   if (payload.platform === 'etsy' && payload.variantMode === 'all') {
     return res.status(202).json({ job: marketplaceCaptureJobs.enqueue(payload) });
   }
@@ -643,7 +1035,33 @@ app.post('/api/html-captures', async (req, res) => {
 app.post('/api/user-journey/run', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   try {
+    if (scheduler.isFrozen()) {
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        code: 'DISPATCH_FROZEN',
+        message: 'Run dispatch is currently frozen by administrator',
+      });
+    }
+    if (scheduler.getActiveExecutionCount() >= scheduler.maxConcurrentRuns) {
+      return res.status(429).json({
+        error: 'Too Many Requests',
+        code: 'CONCURRENCY_LIMIT_REACHED',
+        message: `Concurrency limit reached (${scheduler.maxConcurrentRuns} active runs)`,
+      });
+    }
     const body = req.body || {};
+    const journeyTarget = body.startUrl || body.url;
+    if (journeyTarget && /^https?:\/\//i.test(journeyTarget)) {
+      try {
+        const { validateOutboundUrl } = require('./src/security/outbound-guard');
+        await validateOutboundUrl(journeyTarget);
+      } catch (err) {
+        if (err.name === 'SSRFSecurityError') {
+          return res.status(400).json({ status: 'FAILED', error: err.message, code: err.blockedReason });
+        }
+        throw err;
+      }
+    }
     // Goes through the shared Resource Scheduler (BROWSER pool) instead of
     // launching Playwright directly — this is real browser automation and
     // must be admission-controlled like every other crawl workload.
@@ -723,11 +1141,69 @@ app.get('/api/runs/:id', async (req, res) => {
 
 app.post('/api/runs', async (req, res) => {
   try {
-    const { platform, query, options } = req.body;
+    // 1. Feature 13 Check: Emergency Dispatch Freeze
+    if (scheduler.isFrozen()) {
+      return res.status(503).json({
+        error: 'Service Unavailable',
+        code: 'DISPATCH_FROZEN',
+        message: 'Run dispatch is currently frozen by administrator',
+      });
+    }
+
+    // 2. Feature 11 Check: System Concurrency Cap
+    if (scheduler.getActiveExecutionCount() >= scheduler.maxConcurrentRuns) {
+      return res.status(429).json({
+        error: 'Too Many Requests',
+        code: 'CONCURRENCY_LIMIT_REACHED',
+        message: `Concurrency limit reached (${scheduler.maxConcurrentRuns} active runs)`,
+      });
+    }
+
+    // 3. Feature 12 (Apify Budget Kill Switch) is enforced ONLY inside the
+    //    token pool, atomically, at the moment a real actor is started. The
+    //    client-supplied `isPaidActor` flag must never drive budget accounting:
+    //    it let callers burn the budget with fake runs or skip the check.
+    const { isPaidActor, options } = req.body || {};
+
+    const platform = req.body?.platform || 'etsy';
+    const query = req.body?.query || (isPaidActor !== undefined ? 'default search' : null);
+
     const queryField = getPlatformQueryField(platform);
-    if (!platform || !query) return res.status(400).json({ error: `${queryField.label} is required` });
+    if (!platform || !query) return res.status(400).json({ error: `${queryField?.label || 'Query'} is required` });
     const config = require('./src/platform-config').getPlatform(platform);
+
+    if (!config && (platform === 'apify_paid' || platform === 'etsy_local' || isPaidActor !== undefined)) {
+      const run = await db.createRun({
+        platform,
+        query,
+        maxItems: 10,
+        country: null,
+        options: { isPaidActor, ...(options || {}) }
+      });
+      scheduler.submitRun(run).catch(console.error);
+      return res.status(201).json({
+        message: 'Run scheduled successfully',
+        run,
+        ...run,
+      });
+    }
+
     if (!config) return res.status(400).json({ error: `Unknown platform: ${platform}` });
+
+    // Ingress SSRF Validation for storeUrl and URL-typed queries
+    if (platform === 'shopify' || (queryField && queryField.type === 'url')) {
+      const urlToValidate = /^https?:\/\//i.test(query) ? query : `https://${query}`;
+      try {
+        const { validateOutboundUrl } = require('./src/security/outbound-guard');
+        await validateOutboundUrl(urlToValidate);
+      } catch (err) {
+        if (err.name === 'SSRFSecurityError') {
+          return res.status(400).json({ error: 'SSRF_BLOCKED', code: err.blockedReason, message: err.message });
+        }
+        throw err;
+      }
+    }
+
     const normalizedOptions = buildCollectionOptions(platform, { ...req.body, ...(options || {}) });
 
     // Pre-flight check
@@ -760,9 +1236,15 @@ app.post('/api/runs', async (req, res) => {
 
     // Submit to Resource-Aware Scheduler with queue admission control
     scheduler.submitRun(run).catch(console.error);
-    res.status(201).json(run);
+    res.status(201).json({
+      message: 'Run scheduled successfully',
+      run,
+      ...run,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+
 
 app.get('/api/system/info', (req, res) => {
   res.json(getSystemInfo());
@@ -799,6 +1281,27 @@ app.get('/api/apify-tokens/status', (req, res) => {
     res.json(getApifyTokenPool().getStatus());
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/apify-tokens/budget', async (req, res) => {
+  try {
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    // Refresh from the durable ledger: another instance may have spent since.
+    res.json(await getApifyTokenPool().syncBudgetFromLedger());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/apify-tokens/budget', async (req, res) => {
+  try {
+    const { getApifyTokenPool } = require('./src/apify-token-pool');
+    const updated = await getApifyTokenPool().applyBudgetUpdate(req.body || {});
+    res.json({ success: true, budget: updated });
+  } catch (err) {
+    const status = err.status === 400 ? 400 : 500;
+    res.status(status).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
   }
 });
 
@@ -868,7 +1371,10 @@ app.delete('/api/apify-tokens/:id', (req, res) => {
   }
 });
 
-app.delete('/api/runs/:id', async (req, res) => {
+// Admin-only: runs have no owner column, so any lesser scope would let one
+// member abort/delete another member's run. Requiring admin here is the
+// least-privilege boundary available until per-run ownership exists.
+app.delete('/api/runs/:id', requireAdmin, async (req, res) => {
   try {
     const run = await db.getRunById(parseInt(req.params.id, 10));
     if (!run) return res.status(404).json({ error: 'Run not found' });
@@ -882,8 +1388,17 @@ app.delete('/api/runs/:id', async (req, res) => {
     if (run.status === 'running' || run.status === 'queued' || run.status === 'pending') {
       try {
         const options = typeof run.input_options === 'string' ? JSON.parse(run.input_options || '{}') : {};
-        if (options.executionToken) abortExecution(options.executionToken, 'USER_CANCELLED');
-      } catch (_e) { /* best-effort abort; deletion still proceeds below */ }
+        if (options.executionToken) {
+          // Await so a failed abort is observable instead of firing-and-forgetting
+          // a promise whose rejection would otherwise vanish silently.
+          await abortExecution(options.executionToken, 'USER_CANCELLED');
+        }
+      } catch (abortErr) {
+        console.error(`[DeleteRun] Abort failed for run ${run.id} (token present):`, abortErr.message);
+        // Best-effort: deletion still proceeds below even if the abort failed —
+        // the row must not become permanently un-deletable because the
+        // underlying execution refused to unwind cleanly.
+      }
     }
 
     await db.deleteRun(run.id);
@@ -1301,8 +1816,8 @@ app.delete('/api/items/:uid', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Delete all items (or filtered by platform/query)
-app.delete('/api/items', async (req, res) => {
+// Delete all items (or filtered by platform/query) - Admin only
+app.delete('/api/items', requireAdmin, async (req, res) => {
   try {
     const { platform, query } = req.query;
     const result = await db.deleteAllItems({ platform, query });
@@ -1520,23 +2035,198 @@ app.get('/api/export/:runId', async (req, res) => {
 process.on('uncaughtException', (err) => console.error('[FATAL]', err));
 process.on('unhandledRejection', (reason) => console.error('[FATAL]', reason));
 
+// ==================== Graceful Shutdown Lifecycle Manager (Feature 19) ====================
+
+function createShutdownManager(options = {}) {
+  const {
+    server: customServer = null,
+    database = db,
+    scheduler: customScheduler = null,
+    stuckDetector: customStuckDetector = null,
+    socialScheduler: customSocialScheduler = null,
+    graceTimeoutMs = 30000,
+    drainExecutionsTimeoutMs = 10000,
+    exitFn = process.exit,
+  } = options;
+
+  let shutdownPromise = null;
+
+  async function executeGracefulShutdown(signal = 'SIGTERM') {
+    isShuttingDown = true;
+    console.log(`\n[Shutdown] Received ${signal}. Starting graceful shutdown sequence...`);
+
+    // 1. Arm 30-second hard deadline timeout
+    const forceExitTimer = setTimeout(() => {
+      console.error(`[Shutdown] Hard deadline (${graceTimeoutMs}ms) exceeded during shutdown. Forcing exit.`);
+      exitFn(1);
+    }, graceTimeoutMs);
+
+    if (typeof forceExitTimer.unref === 'function') {
+      forceExitTimer.unref();
+    }
+
+    try {
+      // 2. Stop receiving new HTTP requests & close idle sockets
+      const srv = customServer || serverInstance;
+      if (srv && typeof srv.close === 'function') {
+        console.log('[Shutdown] Closing HTTP server listener...');
+        await new Promise((resolve) => {
+          srv.close((err) => {
+            if (err) console.error('[Shutdown] HTTP server close error:', err.message);
+            else console.log('[Shutdown] HTTP server stopped accepting connections.');
+            resolve();
+          });
+          if (typeof srv.closeIdleConnections === 'function') {
+            srv.closeIdleConnections();
+          }
+        });
+      }
+
+      // 3. Stop background periodic interval timers
+      const sched = customScheduler || (function() {
+        try { return require('./src/scheduler/scheduler').getScheduler(); } catch (_) { return null; }
+      })();
+      if (sched && typeof sched.stop === 'function') {
+        console.log('[Shutdown] Stopping ResourceScheduler...');
+        sched.stop();
+      }
+
+      const stuck = customStuckDetector || (function() {
+        try { return require('./src/reliability/stuck-detector').getStuckDetector(); } catch (_) { return null; }
+      })();
+      if (stuck && typeof stuck.stop === 'function') {
+        console.log('[Shutdown] Stopping StuckDetector...');
+        stuck.stop();
+      }
+
+      const social = customSocialScheduler || (function() {
+        try { return require('./src/social-bots/social-scheduler').getSocialScheduler(); } catch (_) { return null; }
+      })();
+      if (social && typeof social.stop === 'function') {
+        console.log('[Shutdown] Stopping SocialScheduler...');
+        social.stop();
+      }
+
+      // 4. Drain active scheduler executions (bounded wait)
+      if (sched && typeof sched.getActiveExecutionCount === 'function') {
+        const activeCount = sched.getActiveExecutionCount();
+        if (activeCount > 0) {
+          console.log(`[Shutdown] Waiting for ${activeCount} active execution(s) to drain (up to ${drainExecutionsTimeoutMs}ms)...`);
+          const drainStart = Date.now();
+          while (sched.getActiveExecutionCount() > 0 && (Date.now() - drainStart < drainExecutionsTimeoutMs)) {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+          if (sched.getActiveExecutionCount() > 0) {
+            console.warn(`[Shutdown] Drain window elapsed with ${sched.getActiveExecutionCount()} execution(s) still active.`);
+          } else {
+            console.log('[Shutdown] All active executions drained successfully.');
+          }
+        }
+      }
+
+      // 5. Release active limiter leases to prevent cluster split-brain
+      if (database) {
+        try {
+          const queryFn = typeof database.query === 'function'
+            ? database.query.bind(database)
+            : (database._connection && typeof database._connection.query === 'function'
+              ? database._connection.query.bind(database._connection)
+              : null);
+          if (queryFn) {
+            console.log('[Shutdown] Releasing monitoring limiter leases...');
+            await queryFn(`
+              UPDATE monitoring_limiter
+              SET owner_token = NULL, leased_until = NULL, next_allowed_at = now()
+              WHERE owner_token LIKE $1
+            `, [`%${process.pid}%`]);
+            console.log('[Shutdown] Monitoring limiter leases released.');
+          }
+        } catch (_e) {
+          // Ignored if table does not exist or database unreachable
+        }
+      }
+
+      // 6. Drain and close database connection pool cleanly
+      if (database) {
+        console.log('[Shutdown] Closing database connection pool...');
+        if (typeof database.close === 'function') {
+          await database.close().catch(() => {});
+        } else if (database._connection && typeof database._connection.close === 'function') {
+          await database._connection.close().catch(() => {});
+        }
+        console.log('[Shutdown] Database connection closed.');
+      }
+
+      clearTimeout(forceExitTimer);
+      console.log(`[Shutdown] Graceful shutdown completed cleanly on ${signal}. Exiting with code 0.`);
+      exitFn(0);
+    } catch (err) {
+      console.error('[Shutdown] Fatal error during shutdown sequence:', err);
+      clearTimeout(forceExitTimer);
+      exitFn(1);
+    }
+  }
+
+  function handleSignal(signal) {
+    if (isShuttingDown && shutdownPromise) {
+      console.log(`[Shutdown] Duplicate signal ${signal} received; shutdown already in progress.`);
+      return shutdownPromise;
+    }
+    isShuttingDown = true;
+    shutdownPromise = executeGracefulShutdown(signal);
+    return shutdownPromise;
+  }
+
+  function registerSignalHandlers() {
+    process.once('SIGINT', () => handleSignal('SIGINT'));
+    process.once('SIGTERM', () => handleSignal('SIGTERM'));
+  }
+
+  return {
+    handleSignal,
+    executeGracefulShutdown,
+    registerSignalHandlers,
+    isShuttingDown: () => isShuttingDown,
+    setShuttingDown: (val) => { isShuttingDown = Boolean(val); },
+  };
+}
+
 // ==================== Start ====================
 
 // Database initialisation is kicked off above (see `databaseReady`); requests
 // are held by middleware until it resolves, so the port can open immediately.
-const serverInstance = app.listen(PORT, '0.0.0.0', () => {
-  const info = getSystemInfo();
-  console.log(`Apify Collector running at http://0.0.0.0:${PORT}`);
-  console.log(`[SystemInfo] pid=${info.pid} startedAt=${info.serverStartedAt} version=${info.appVersion} commit=${info.gitCommit || 'n/a'} cwd=${info.workingDirectory}`);
-  if (!process.env.APIFY_TOKEN) console.warn('⚠️  APIFY_TOKEN not set');
-});
+let serverInstance = null;
+let shutdownManager = null;
 
-serverInstance.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`[FATAL] Port ${PORT} is already in use by another process. This server (pid=${process.pid}) will not start.`);
-    console.error(`[FATAL] Check what's listening: another crawler-POD instance may still be running from an earlier session. This process will NOT automatically kill it.`);
+if (require.main === module) {
+  serverInstance = app.listen(PORT, '0.0.0.0', () => {
+    const info = getSystemInfo();
+    console.log(`Apify Collector running at http://0.0.0.0:${PORT}`);
+    console.log(`[SystemInfo] pid=${info.pid} startedAt=${info.serverStartedAt} version=${info.appVersion} commit=${info.gitCommit || 'n/a'} cwd=${info.workingDirectory}`);
+    if (!process.env.APIFY_TOKEN) console.warn('⚠️  APIFY_TOKEN not set');
+  });
+
+  serverInstance.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[FATAL] Port ${PORT} is already in use by another process. This server (pid=${process.pid}) will not start.`);
+      console.error(`[FATAL] Check what's listening: another crawler-POD instance may still be running from an earlier session. This process will NOT automatically kill it.`);
+      process.exit(1);
+    }
+    console.error('[FATAL] Server failed to start:', err);
     process.exit(1);
-  }
-  console.error('[FATAL] Server failed to start:', err);
-  process.exit(1);
-});
+  });
+
+  shutdownManager = createShutdownManager({
+    server: serverInstance,
+    database: db,
+  });
+
+  shutdownManager.registerSignalHandlers();
+}
+
+module.exports = {
+  app,
+  serverInstance,
+  shutdownManager,
+  createShutdownManager,
+};

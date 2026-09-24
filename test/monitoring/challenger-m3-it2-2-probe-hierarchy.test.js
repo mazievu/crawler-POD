@@ -50,6 +50,19 @@ async function createIsolatedTestDb() {
   return db;
 }
 
+/**
+ * SSOT §3.2 only counts an unchanged window toward the 30-day stop when
+ * consecutive observations are at most MAX_VALID_OBSERVATION_GAP (7d) apart;
+ * a bare Day 0 -> Day 30 pair is a broken chain and resets the window. Fill in
+ * the normal 5-day probe cadence (Day 5..25) so the Day 30 probe really stops.
+ */
+async function applyIntermediateObservations(ops, entityId, value) {
+  for (let day = 5; day <= 25; day += 5) {
+    const observedAt = new Date(Date.UTC(2026, 8, 1 + day)).toISOString();
+    await ops.applyShopObservation(entityId, { value, observedAt, quality: 'exact' });
+  }
+}
+
 // =============================================================================
 // CHALLENGE 1: JOB CANCELLATION QUERY & UPDATED_AT COLUMN INVARIANTS
 // =============================================================================
@@ -91,6 +104,7 @@ test('CHALLENGE 1.1: applyShopObservation cancels queued item_refresh jobs match
     observedAt: '2026-09-01T00:00:00.000Z',
     quality: 'exact',
   });
+  await applyIntermediateObservations(ops, entity.id, 500);
 
   // 5. Day 30 stoppage trigger
   const res = await ops.applyShopObservation(entity.id, {
@@ -144,6 +158,7 @@ test('CHALLENGE 1.2: applyShopObservation cancels queued item_refresh jobs where
     observedAt: '2026-09-01T00:00:00.000Z',
     quality: 'exact',
   });
+  await applyIntermediateObservations(ops, entity.id, 1200);
 
   // Day 30 Stoppage
   await ops.applyShopObservation(entity.id, {
@@ -188,6 +203,7 @@ test('CHALLENGE 1.3: Schema invariant - monitoring_jobs has NO updated_at column
     observedAt: '2026-09-01T00:00:00.000Z',
     quality: 'exact',
   });
+  await applyIntermediateObservations(ops, entity.id, 800);
 
   await assert.doesNotReject(async () => {
     await ops.applyShopObservation(entity.id, {
@@ -229,6 +245,7 @@ test('CHALLENGE 1.4: Job status selectivity - already claimed or running jobs ar
 
   // Baseline and Stoppage
   await ops.applyShopObservation(entity.id, { value: 300, observedAt: '2026-09-01T00:00:00Z', quality: 'exact' });
+  await applyIntermediateObservations(ops, entity.id, 300);
   await ops.applyShopObservation(entity.id, { value: 300, observedAt: '2026-10-01T00:00:00Z', quality: 'exact' });
 
   // Verify claimed and running jobs are intact
@@ -257,6 +274,7 @@ test('CHALLENGE 1.5: Job kind selectivity - shop_probe jobs are NOT cancelled by
   `).run(entity.id);
 
   await ops.applyShopObservation(entity.id, { value: 300, observedAt: '2026-09-01T00:00:00Z', quality: 'exact' });
+  await applyIntermediateObservations(ops, entity.id, 300);
   await ops.applyShopObservation(entity.id, { value: 300, observedAt: '2026-10-01T00:00:00Z', quality: 'exact' });
 
   const probeJob = await db.prepare('SELECT status FROM monitoring_jobs WHERE id = 2001').get();
@@ -291,6 +309,7 @@ test('CHALLENGE 1.6: Shop boundary isolation - jobs of other shops are strictly 
 
   // Shop A stops
   await ops.applyShopObservation(shopA.id, { value: 100, observedAt: '2026-09-01T00:00:00Z', quality: 'exact' });
+  await applyIntermediateObservations(ops, shopA.id, 100);
   await ops.applyShopObservation(shopA.id, { value: 100, observedAt: '2026-10-01T00:00:00Z', quality: 'exact' });
 
   const jobA = await db.prepare('SELECT status FROM monitoring_jobs WHERE id = 3001').get();
@@ -332,6 +351,7 @@ test('CHALLENGE 2.1: Child monitoring_items are cascaded to paused and updated_a
 
   // Day 0 & Day 30 Stoppage
   await ops.applyShopObservation(entity.id, { value: 50, observedAt: '2026-09-01T00:00:00Z', quality: 'exact' });
+  await applyIntermediateObservations(ops, entity.id, 50);
   await ops.applyShopObservation(entity.id, { value: 50, observedAt: '2026-10-01T00:00:00Z', quality: 'exact' });
 
   const childItems = await ops.getChildItemsForEntity(entity.id, { itemStatus: 'all' });
@@ -366,6 +386,7 @@ test('CHALLENGE 2.2: Non-active child items (unavailable) preserve their status 
   });
 
   await ops.applyShopObservation(entity.id, { value: 50, observedAt: '2026-09-01T00:00:00Z', quality: 'exact' });
+  await applyIntermediateObservations(ops, entity.id, 50);
   await ops.applyShopObservation(entity.id, { value: 50, observedAt: '2026-10-01T00:00:00Z', quality: 'exact' });
 
   const item = await ops.getItem('etsy:listing-unavail');
@@ -410,6 +431,7 @@ test('CHALLENGE 3.1: product_current.status is strictly untouched across all lis
 
   // Baseline & Stoppage
   await ops.applyShopObservation(entity.id, { value: 200, observedAt: '2026-09-01T00:00:00Z', quality: 'exact' });
+  await applyIntermediateObservations(ops, entity.id, 200);
   await ops.applyShopObservation(entity.id, { value: 200, observedAt: '2026-10-01T00:00:00Z', quality: 'exact' });
 
   // Verify that each product_current row retains EXACTLY its original status!
@@ -474,7 +496,7 @@ test('CHALLENGE 4.1: monitoring_entities.sales is isolated from listing current_
 // =============================================================================
 
 test('CHALLENGE 5.1: ShopLifecyclePolicy parses numeric epoch ms without error_ignored or string corruption', () => {
-  const t0 = 1725148800000; // 2026-09-01T00:00:00.000Z
+  const t0 = 1788220800000; // 2026-09-01T00:00:00.000Z
   const initial = { sales: null, unchangedSince: null };
 
   // Pass numeric epoch directly as observedAt
@@ -491,7 +513,7 @@ test('CHALLENGE 5.1: ShopLifecyclePolicy parses numeric epoch ms without error_i
 });
 
 test('CHALLENGE 5.2: ShopLifecyclePolicy handles stringified epoch cleanly without NaN or Z suffixing', () => {
-  const t0Str = '1725148800000';
+  const t0Str = '1788220800000'; // 2026-09-01T00:00:00.000Z
   const initial = { sales: null, unchangedSince: null };
 
   const res = ShopLifecyclePolicy.evaluateObservation(initial, {
@@ -516,7 +538,7 @@ test('CHALLENGE 5.3: applyShopObservation with numeric epoch timestamp in option
     identitySource: 'id',
   });
 
-  const t0 = 1725148800000; // 2026-09-01T00:00:00.000Z
+  const t0 = 1788220800000; // 2026-09-01T00:00:00.000Z
   const res = await ops.applyShopObservation(entity.id, {
     value: 400,
     observedAt: t0,

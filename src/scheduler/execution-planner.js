@@ -63,7 +63,8 @@ const DEFAULT_SHARD_SIZES = {
 const NON_CHANNEL_JOB_PLANS = {
   user_journey: { executionClass: 'BROWSER', backend: 'browser', backendName: 'user-journey-runner' },
   marketplace_capture: { executionClass: 'BROWSER', backend: 'browser', backendName: 'marketplace-html-capture' },
-  marketplace_discovery: { executionClass: 'LOCAL_HTTP', backend: 'local', backendName: 'marketplace-discovery' }
+  marketplace_discovery: { executionClass: 'LOCAL_HTTP', backend: 'local', backendName: 'marketplace-discovery' },
+  monitoring_capture: { executionClass: 'BROWSER', backend: 'browser', backendName: 'monitoring-stealth-capture' }
 };
 
 class ExecutionPlanner {

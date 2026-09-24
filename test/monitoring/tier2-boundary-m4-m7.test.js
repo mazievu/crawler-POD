@@ -22,7 +22,20 @@ const {
   StealthBrowserRunner,
   AdminDashboardService,
   CONSTANTS,
+  hashItemUidToAdvisoryKey,
+  applyMonitoringObservation,
 } = require('./harness');
+
+// last_crawled_at is pinned before the fixed 2026-09 observation dates used
+// below; the column otherwise defaults to now() and those observations would be
+// (correctly) treated as late arrivals.
+async function seedProduct(db, itemUid) {
+  await db.prepare(`
+    INSERT INTO product_current (item_uid, platform, query, title, url, current_price, status, first_seen_at, last_seen_at, last_crawled_at)
+    VALUES (?, 'etsy', 'q', 'Original Title', ?, 25.0, 'active', '2026-09-01 00:00:00', '2026-09-01 00:00:00', '2026-09-01 00:00:00')
+    ON CONFLICT (item_uid) DO NOTHING
+  `).run(itemUid, `https://www.etsy.com/listing/${itemUid}`);
+}
 
 // ==========================================
 // FEATURE F18: Author Session Deadline Boundaries

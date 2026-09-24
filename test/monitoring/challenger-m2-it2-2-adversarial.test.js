@@ -233,7 +233,8 @@ test('Challenge 2.1: Midnight clock boundary shift (23:59:55 -> 00:00:05) cross-
 
   // Day 2 row must NOT be created in daily_packed_history
   const day2Row = await db.prepare('SELECT * FROM daily_packed_history WHERE item_uid = ? AND date = ?').get(itemUid, '2026-09-22');
-  assert.equal(day2Row, null, 'No history row must be created on Day 2 for duplicate replay');
+  assert.equal(day2Row, undefined, // Statement#get() mirrors better-sqlite3: no row -> undefined
+    'No history row must be created on Day 2 for duplicate replay');
 
   // observation_count remains incremented only by Day 1 (from 2 to 3)
   const current = await db.prepare('SELECT observation_count FROM product_current WHERE item_uid = ?').get(itemUid);

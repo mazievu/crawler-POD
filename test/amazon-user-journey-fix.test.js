@@ -11,8 +11,19 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const db = require('../src/database');
 const { parseMarketplaceHtml } = require('../src/marketplaces/html-parser');
+
+// Test A below intentionally reads real, gitignored fixtures from the
+// repo's actual data/captures directory (see its own comment), so
+// CHECKPOINT_DIR must stay pointed at the real path. But Tests C/D
+// instantiate a fresh CheckpointStore with no fixture involved — that
+// class defaults to writing under the same real data/captures directory
+// unless overridden, so redirect ONLY new CheckpointStore writes (not this
+// read-only fixture lookup) to a temp dir.
+process.env.CAPTURES_DIR = process.env.CAPTURES_DIR
+  || path.join(os.tmpdir(), `crawler-pod-amazon-user-journey-captures-${process.pid}-${Date.now()}`);
 const { CheckpointStore } = require('../src/journey/checkpoint-store');
 
 const CHECKPOINT_DIR = path.join(__dirname, '..', 'data', 'captures', 'journey_amazon_1787797844022');

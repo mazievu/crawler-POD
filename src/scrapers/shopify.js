@@ -3,6 +3,8 @@
  * Input can be store domain or full URL.
  */
 
+const { validateOutboundUrl, safeFetch } = require('../security/outbound-guard');
+
 function normalizeHost(input) {
   let s = String(input || '').trim();
   if (!s) throw new Error('query/store url is required');
@@ -11,14 +13,19 @@ function normalizeHost(input) {
   return u.hostname.replace(/^www\./, '');
 }
 
-async function fetchProductsJson(host, limit, signal = null) {
+async function fetchProductsJson(host, limit, signal = null, options = {}) {
   const url = 'https://' + host + '/products.json?limit=' + limit;
-  const resp = await fetch(url, {
+  // SSRF Protection: Pre-flight validation of outbound URL
+  await validateOutboundUrl(url, options);
+
+  const resp = await safeFetch(url, {
     signal,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36',
       'Accept': 'application/json,text/html;q=0.9,*/*;q=0.8',
     },
+    maxSizeBytes: 8 * 1024 * 1024,
+    ...options,
   });
   if (!resp.ok) throw new Error('HTTP ' + resp.status + ' at ' + url);
   const ct = resp.headers.get('content-type') || '';
@@ -30,8 +37,12 @@ async function fetchProductsJson(host, limit, signal = null) {
 async function scrape(query, options) {
   options = options || {};
   const limit = options.limit || 50;
+  // Pre-validate full input query if provided as URL
+  if (typeof query === 'string' && /^https?:\/\//i.test(query.trim())) {
+    await validateOutboundUrl(query.trim(), options);
+  }
   const host = normalizeHost(query);
-  const data = await fetchProductsJson(host, limit, options.signal);
+  const data = await fetchProductsJson(host, limit, options.signal, options);
   const products = data.products || [];
   if (!products.length) throw new Error('EMPTY_RESULT: no Shopify products found for ' + host);
 
@@ -61,4 +72,4 @@ async function scrape(query, options) {
   return { items };
 }
 
-module.exports = { scrape };
+module.exports = { normalizeHost, fetchProductsJson, scrape };

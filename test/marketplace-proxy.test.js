@@ -1,3 +1,15 @@
+// createEverbeeContextSession() below creates a browser profile directory
+// at its default on-disk location under the repo's real
+// data/everbee-profiles directory unless overridden (even when the actual
+// browser launch is mocked). Point it at a unique temp dir first so this
+// test file never writes into data/.
+{
+  const path = require('node:path');
+  const os = require('node:os');
+  process.env.EVERBEE_PROFILE_ROOT = process.env.EVERBEE_PROFILE_ROOT
+    || path.join(os.tmpdir(), `crawler-pod-marketplace-proxy-everbee-${process.pid}-${Date.now()}`);
+}
+
 const test = require('node:test');
 const assert = require('node:assert/strict');
 

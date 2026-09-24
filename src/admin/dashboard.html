@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>crawler-POD Admin Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #111827;
+      --card-sub: #1e293b;
+      --border: #1f2937;
+      --border-focus: #374151;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --success: #10b981;
+      --success-bg: rgba(16, 185, 129, 0.12);
+      --warning: #f59e0b;
+      --warning-bg: rgba(245, 158, 11, 0.12);
+      --danger: #ef4444;
+      --danger-bg: rgba(239, 68, 68, 0.12);
+      --text: #f9fafb;
+      --text-muted: #9ca3af;
+      --text-sub: #6b7280;
+      --radius: 10px;
+      --shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      padding: 0 0 60px 0;
+    }
+
+    /* Top Navigation */
+    .nav {
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      padding: 12px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .nav-brand h1 {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .badge-primary { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); }
+    .badge-success { background: var(--success-bg); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .badge-warning { background: var(--warning-bg); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .badge-danger { background: var(--danger-bg); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    /* Container */
+    .container {
+      max-width: 1400px;
+      margin: 24px auto;
+      padding: 0 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* Grid Layouts */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 20px;
+    }
+    .grid-4 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+    }
+
+    /* Cards */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--card-sub);
+      color: var(--text);
+      transition: all 0.15s ease;
+      text-decoration: none;
+    }
+    .btn:hover { background: var(--border-focus); }
+    .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-sm { padding: 4px 8px; font-size: 12px; }
+    .btn-danger { background: var(--danger-bg); border-color: rgba(239, 68, 68, 0.4); color: var(--danger); }
+    .btn-danger:hover { background: rgba(239, 68, 68, 0.25); }
+
+    /* Browser Metrics Cards */
+    .engine-card {
+      background: var(--card-sub);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .engine-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .engine-name { font-size: 14px; font-weight: 700; color: #fff; }
+    .metric-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 6px 0;
+      border-bottom: 1px dashed rgba(255, 255, 255, 0.07);
+      font-size: 13px;
+    }
+    .metric-label { color: var(--text-muted); }
+    .metric-val { font-weight: 600; font-family: monospace; }
+
+    /* Tables */
+    .table-responsive {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+    th {
+      padding: 10px 12px;
+      background: var(--card-sub);
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 16px;
+    }
+    .tab {
+      padding: 8px 16px;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--text-muted);
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    /* Terminal Console */
+    .terminal {
+      background: #030712;
+      border: 1px solid #1f2937;
+      border-radius: 6px;
+      padding: 14px;
+      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+      font-size: 12px;
+      color: #10b981;
+      min-height: 120px;
+      max-height: 240px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* Switch toggle */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background-color: #374151;
+      transition: .2s;
+      border-radius: 20px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 14px;
+      width: 14px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      transition: .2s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: var(--accent); }
+    input:checked + .slider:before { transform: translateX(16px); }
+  </style>
+</head>
+<body>
+
+  <!-- Navigation -->
+  <nav class="nav">
+    <div class="nav-brand">
+      <h1>crawler-POD Admin</h1>
+      <span class="badge badge-primary">v1.0.0</span>
+      <span class="badge badge-success" id="sys-status">Healthy</span>
+    </div>
+    <div class="nav-actions">
+      <label style="color:var(--text-muted); font-size:12px;">Auto Refresh:</label>
+      <select id="refresh-interval" class="btn" style="padding:4px 8px; font-size:12px;">
+        <option value="0">Off</option>
+        <option value="3000" selected>3s</option>
+        <option value="5000">5s</option>
+        <option value="10000">10s</option>
+      </select>
+      <button id="btn-emergency-freeze" class="btn btn-danger btn-sm" onclick="toggleEmergencyFreeze()">
+        <span id="btn-freeze-label">Emergency Freeze</span>
+      </button>
+      <button class="btn btn-primary" onclick="refreshAllData()">Refresh Now</button>
+      <a href="/" class="btn" target="_blank">Collector UI &rarr;</a>
+    </div>
+  </nav>
+
+  <div class="container">
+
+    <!-- Emergency Dispatch Freeze Control Banner -->
+    <div class="card" id="freeze-control-card" style="border-left: 4px solid var(--accent); margin-bottom: 20px;">
+      <div class="card-header">
+        <div class="card-title">
+          <span style="font-size:16px;">🛑 Emergency Dispatch Freeze & Concurrency Control (F11, F13)</span>
+        </div>
+        <div>
+          <span id="freeze-status-badge" class="badge badge-success">DISPATCH ACTIVE</span>
+        </div>
+      </div>
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
+        <div style="max-width: 600px;">
+          <p style="color: var(--text-muted); font-size: 13px; margin: 0;">
+            When <strong>Emergency Freeze</strong> is active, all new run admissions from the queue are halted immediately and new API run submissions return <code>HTTP 503 Service Unavailable</code>. Currently executing runs will finish safely.
+          </p>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <button id="btn-freeze-toggle" class="btn btn-danger" onclick="toggleEmergencyFreeze()">
+            Freeze All Dispatches
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Top Summary Row -->
+    <div class="grid-4">
+      <div class="card">
+        <div class="metric-label">Running Tasks</div>
+        <div style="font-size:24px; font-weight:700; margin-top:4px;" id="count-running">0</div>
+        <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">Active executions</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Queued / Scheduled</div>
+        <div style="font-size:24px; font-weight:700; margin-top:4px;" id="count-queued">0</div>
+        <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">Pending admission</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Stealth Engine Status</div>
+        <div style="font-size:16px; font-weight:700; margin-top:8px; color:var(--success);" id="engine-status">Cloak &bull; Camoufox Active</div>
+        <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">Automatic fallback ready</div>
+      </div>
+      <div class="card">
+        <div class="metric-label">Repo Version (Commit)</div>
+        <div style="font-size:16px; font-weight:700; margin-top:8px;" id="git-commit">HEAD</div>
+        <div style="font-size:12px; color:var(--text-muted); margin-top:4px;" id="git-branch">Branch: main</div>
+      </div>
+    </div>
+
+    <!-- Browser Performance Metrics (F31) -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>Browser Performance & Reliability Metrics (F31)</span>
+        </div>
+        <div style="font-size:12px; color:var(--text-muted);">Real-time Anti-Bot Execution Telemetry</div>
+      </div>
+      <div class="grid-2">
+        <!-- CloakBrowser Card -->
+        <div class="engine-card">
+          <div class="engine-header">
+            <span class="engine-name">CloakBrowser Engine</span>
+            <span class="badge badge-primary">Priority 1 (Primary)</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Total Executions</span>
+            <span class="metric-val" id="cloak-runs">0</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Average Execution Duration</span>
+            <span class="metric-val" id="cloak-duration">0 ms</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Error / Block Rate</span>
+            <span class="metric-val" id="cloak-error-rate" style="color:var(--success);">0.0%</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Engine Adapter Control</span>
+            <label class="switch">
+              <input type="checkbox" id="toggle-cloak" checked onchange="toggleAdapter('cloakbrowser', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Camoufox Card -->
+        <div class="engine-card">
+          <div class="engine-header">
+            <span class="engine-name">Camoufox Stealth Engine</span>
+            <span class="badge badge-warning">Priority 2 (Fallback)</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Total Executions</span>
+            <span class="metric-val" id="camou-runs">0</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Average Execution Duration</span>
+            <span class="metric-val" id="camou-duration">0 ms</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Error / Block Rate</span>
+            <span class="metric-val" id="camou-error-rate" style="color:var(--success);">0.0%</span>
+          </div>
+          <div class="metric-row">
+            <span class="metric-label">Engine Adapter Control</span>
+            <label class="switch">
+              <input type="checkbox" id="toggle-camou" checked onchange="toggleAdapter('camoufox', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Task Monitor & Controls (F30 & F32) -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>Task Monitor & Operational Controls (F30, F32)</span>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="task-filter-input" placeholder="Filter tasks..." class="btn" style="padding:4px 10px; font-size:12px; width:160px;" oninput="renderTasks()">
+          <select id="task-platform-select" class="btn" style="padding:4px 8px; font-size:12px;" onchange="renderTasks()">
+            <option value="">All Platforms</option>
+            <option value="etsy">Etsy</option>
+            <option value="tiktok">TikTok</option>
+            <option value="ebay">eBay</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button class="tab active" id="tab-running" onclick="switchTaskTab('running')">Running Tasks (<span id="tab-count-running">0</span>)</button>
+        <button class="tab" id="tab-queued" onclick="switchTaskTab('queued')">Queued Tasks (<span id="tab-count-queued">0</span>)</button>
+      </div>
+
+      <!-- Running Tasks Table -->
+      <div id="view-running" class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Task ID</th>
+              <th>Task Name</th>
+              <th>Type / Kind</th>
+              <th>Platform</th>
+              <th>Started At</th>
+              <th>Elapsed Time</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="running-tasks-tbody">
+            <tr><td colspan="8" style="text-align:center; color:var(--text-muted);">Loading active tasks...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Queued Tasks Table -->
+      <div id="view-queued" class="table-responsive" style="display:none;">
+        <table>
+          <thead>
+            <tr>
+              <th>Priority</th>
+              <th>Task ID</th>
+              <th>Task Name</th>
+              <th>Type / Kind</th>
+              <th>Platform</th>
+              <th>Scheduled For</th>
+              <th>Enabled</th>
+              <th>Reorder Actions</th>
+            </tr>
+          </thead>
+          <tbody id="queued-tasks-tbody">
+            <tr><td colspan="8" style="text-align:center; color:var(--text-muted);">Loading queued tasks...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Repo Auto-Update Trigger Panel (F33) -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>Repo Auto-Update Trigger (F33)</span>
+        </div>
+        <div>
+          <button class="btn btn-primary" id="btn-update-repo" onclick="triggerRepoUpdate()">
+            <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            Trigger Git Fast-Forward Update
+          </button>
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:10px;">
+        <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-muted);">
+          <span>Execution Output (Monitored):</span>
+          <span id="last-update-time">Last update: Never</span>
+        </div>
+        <div class="terminal" id="update-terminal">Ready. Click "Trigger Git Fast-Forward Update" to safely execute "git pull --ff-only".</div>
+      </div>
+    </div>
+
+    <!-- Live API Explorer Panel -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">API Explorer & Interactive JSON Console</div>
+        <div style="display:flex; gap:6px;">
+          <button class="btn btn-sm" onclick="testApi('/api/admin/tasks')">GET /tasks</button>
+          <button class="btn btn-sm" onclick="testApi('/api/admin/browser-metrics')">GET /browser-metrics</button>
+          <button class="btn btn-sm" onclick="testApi('/api/scheduler/status')">GET /scheduler/status</button>
+        </div>
+      </div>
+      <div class="terminal" id="api-output" style="color:#38bdf8; max-height:180px;">Select an endpoint above to view live JSON response payload...</div>
+    </div>
+
+  </div>
+
+  <script>
+    let currentTab = 'running';
+    let cachedTasks = { running: [], queued: [] };
+    let refreshTimer = null;
+
+    async function loadTasks() {
+      try {
+        const res = await fetch('/api/admin/tasks');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        cachedTasks = await res.json();
+        document.getElementById('count-running').innerText = (cachedTasks.running || []).length;
+        document.getElementById('count-queued').innerText = (cachedTasks.queued || []).length;
+        document.getElementById('tab-count-running').innerText = (cachedTasks.running || []).length;
+        document.getElementById('tab-count-queued').innerText = (cachedTasks.queued || []).length;
+        renderTasks();
+      } catch (err) {
+        console.error('Error fetching tasks:', err);
+      }
+    }
+
+    async function loadBrowserMetrics() {
+      try {
+        const res = await fetch('/api/admin/browser-metrics');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // CloakBrowser
+        if (data.cloakbrowser) {
+          document.getElementById('cloak-runs').innerText = data.cloakbrowser.totalRuns;
+          document.getElementById('cloak-duration').innerText = (data.cloakbrowser.avgDurationMs || 0) + ' ms';
+          const rate = data.cloakbrowser.errorRatePct || 0;
+          const el = document.getElementById('cloak-error-rate');
+          el.innerText = rate.toFixed(1) + '%';
+          el.style.color = rate > 10 ? 'var(--danger)' : 'var(--success)';
+        }
+
+        // Camoufox
+        if (data.camoufox) {
+          document.getElementById('camou-runs').innerText = data.camoufox.totalRuns;
+          document.getElementById('camou-duration').innerText = (data.camoufox.avgDurationMs || 0) + ' ms';
+          const rate = data.camoufox.errorRatePct || 0;
+          const el = document.getElementById('camou-error-rate');
+          el.innerText = rate.toFixed(1) + '%';
+          el.style.color = rate > 10 ? 'var(--danger)' : 'var(--success)';
+        }
+      } catch (err) {
+        console.error('Error fetching browser metrics:', err);
+      }
+    }
+
+    function switchTaskTab(tab) {
+      currentTab = tab;
+      document.getElementById('tab-running').className = 'tab ' + (tab === 'running' ? 'active' : '');
+      document.getElementById('tab-queued').className = 'tab ' + (tab === 'queued' ? 'active' : '');
+      document.getElementById('view-running').style.display = tab === 'running' ? 'block' : 'none';
+      document.getElementById('view-queued').style.display = tab === 'queued' ? 'block' : 'none';
+      renderTasks();
+    }
+
+    function escapeHtml(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function renderTasks() {
+      const filterText = (document.getElementById('task-filter-input').value || '').toLowerCase().trim();
+      const platformFilter = document.getElementById('task-platform-select').value;
+
+      function matchesFilter(t) {
+        if (platformFilter && (t.platform || '').toLowerCase() !== platformFilter.toLowerCase()) return false;
+        if (filterText) {
+          const hay = `${t.id} ${t.name} ${t.platform} ${t.type} ${t.kind}`.toLowerCase();
+          if (!hay.includes(filterText)) return false;
+        }
+        return true;
+      }
+
+      if (currentTab === 'running') {
+        const tbody = document.getElementById('running-tasks-tbody');
+        const filtered = (cachedTasks.running || []).filter(matchesFilter);
+        if (filtered.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">No active running tasks.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = filtered.map(t => {
+          const elapsedSec = t.elapsedMs ? Math.round(t.elapsedMs / 1000) : 0;
+          const safeId = escapeHtml(t.id);
+          const safeName = escapeHtml(t.name || t.id);
+          const safeType = escapeHtml(t.type || 'task');
+          const safePlatform = escapeHtml(t.platform || 'all');
+          return `
+            <tr>
+              <td><code>${safeId}</code></td>
+              <td><strong>${safeName}</strong></td>
+              <td><span class="badge ${t.type === 'discovery' ? 'badge-primary' : 'badge-warning'}">${safeType}</span></td>
+              <td>${safePlatform}</td>
+              <td>${t.startedAt ? escapeHtml(new Date(t.startedAt).toLocaleTimeString()) : '-'}</td>
+              <td><code>${elapsedSec}s</code></td>
+              <td><span class="badge badge-success">Running</span></td>
+              <td>
+                <button class="btn btn-sm btn-danger" data-action="toggle" data-task-id="${safeId}" data-enabled="false">Disable</button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      } else {
+        const tbody = document.getElementById('queued-tasks-tbody');
+        const filtered = (cachedTasks.queued || []).filter(matchesFilter);
+        if (filtered.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:20px;">No queued tasks in backlog.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = filtered.map((t, index) => {
+          const safeId = escapeHtml(t.id);
+          const safeName = escapeHtml(t.name || t.id);
+          const safeType = escapeHtml(t.type || 'task');
+          const safePlatform = escapeHtml(t.platform || 'all');
+          return `
+            <tr>
+              <td><strong>#${t.priority || (index + 1)}</strong></td>
+              <td><code>${safeId}</code></td>
+              <td><strong>${safeName}</strong></td>
+              <td><span class="badge ${t.type === 'discovery' ? 'badge-primary' : 'badge-warning'}">${safeType}</span></td>
+              <td>${safePlatform}</td>
+              <td>${t.scheduledFor ? escapeHtml(new Date(t.scheduledFor).toLocaleTimeString()) : 'Immediate'}</td>
+              <td>
+                <label class="switch">
+                  <input type="checkbox" data-action="toggle-check" data-task-id="${safeId}" ${t.enabled !== false ? 'checked' : ''}>
+                  <span class="slider"></span>
+                </label>
+              </td>
+              <td>
+                <button class="btn btn-sm" data-action="move" data-task-id="${safeId}" data-delta="-1" ${index === 0 ? 'disabled' : ''}>&uarr; Up</button>
+                <button class="btn btn-sm" data-action="move" data-task-id="${safeId}" data-delta="1" ${index === filtered.length - 1 ? 'disabled' : ''}>&darr; Down</button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      }
+    }
+
+    async function toggleTask(taskId, enabled) {
+      try {
+        const res = await fetch('/api/admin/tasks/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ taskId, enabled })
+        });
+        const result = await res.json();
+        if (result.success) {
+          await loadTasks();
+        } else {
+          alert('Error toggling task: ' + (result.error || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Toggle failed: ' + err.message);
+      }
+    }
+
+    async function toggleAdapter(adapterId, enabled) {
+      try {
+        await fetch('/api/admin/tasks/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adapterId, enabled })
+        });
+      } catch (err) {
+        console.error('Adapter toggle error:', err);
+      }
+    }
+
+    async function movePriority(taskId, delta) {
+      const list = [...(cachedTasks.queued || [])];
+      const idx = list.findIndex(t => t.id === taskId);
+      if (idx === -1) return;
+      const targetIdx = idx + delta;
+      if (targetIdx < 0 || targetIdx >= list.length) return;
+
+      // Swap
+      const temp = list[idx];
+      list[idx] = list[targetIdx];
+      list[targetIdx] = temp;
+
+      const newOrder = list.map(t => t.id);
+      try {
+        const res = await fetch('/api/admin/tasks/reorder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ taskOrder: newOrder })
+        });
+        if (res.ok) {
+          await loadTasks();
+        }
+      } catch (err) {
+        alert('Reorder failed: ' + err.message);
+      }
+    }
+
+    async function triggerRepoUpdate() {
+      const btn = document.getElementById('btn-update-repo');
+      const term = document.getElementById('update-terminal');
+      btn.disabled = true;
+      btn.innerText = 'Updating repo...';
+      term.innerText = '$ git pull --ff-only origin main\nRunning fast-forward update check...';
+
+      try {
+        const res = await fetch('/api/admin/repo/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        const data = await res.json();
+        btn.disabled = false;
+        btn.innerText = 'Trigger Git Fast-Forward Update';
+
+        if (data.success) {
+          term.innerText = `$ ${data.command || 'git pull --ff-only'}\n${data.output || 'Already up to date.'}\n[OK] Fast-forward update completed successfully.`;
+          document.getElementById('last-update-time').innerText = 'Last update: ' + new Date(data.executedAt || data.timestamp).toLocaleTimeString();
+        } else {
+          term.innerText = `$ ${data.command || 'git pull --ff-only'}\n[ERROR] ${data.error || 'Failed'}\n${data.output || ''}`;
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.innerText = 'Trigger Git Fast-Forward Update';
+        term.innerText = '[FATAL] Request failed: ' + err.message;
+      }
+    }
+
+    async function testApi(endpoint) {
+      const out = document.getElementById('api-output');
+      out.innerText = 'Requesting ' + endpoint + '...';
+      try {
+        const res = await fetch(endpoint);
+        const data = await res.json();
+        out.innerText = JSON.stringify(data, null, 2);
+      } catch (err) {
+        out.innerText = 'Error: ' + err.message;
+      }
+    }
+
+    let isCurrentlyFrozen = false;
+
+    async function checkFreezeStatus() {
+      try {
+        const res = await fetch('/api/admin/freeze');
+        if (!res.ok) return;
+        const data = await res.json();
+        isCurrentlyFrozen = Boolean(data.isFrozen);
+        updateFreezeUI(isCurrentlyFrozen);
+      } catch (err) {
+        console.error('Failed to load freeze status:', err);
+      }
+    }
+
+    function updateFreezeUI(frozen) {
+      const statusBadge = document.getElementById('freeze-status-badge');
+      const sysStatus = document.getElementById('sys-status');
+      const toggleBtn = document.getElementById('btn-freeze-toggle');
+      const navBtn = document.getElementById('btn-emergency-freeze');
+      const navLabel = document.getElementById('btn-freeze-label');
+      const card = document.getElementById('freeze-control-card');
+
+      if (!statusBadge || !toggleBtn) return;
+
+      if (frozen) {
+        statusBadge.className = 'badge badge-danger';
+        statusBadge.innerText = 'DISPATCH FROZEN';
+        if (sysStatus) {
+          sysStatus.className = 'badge badge-danger';
+          sysStatus.innerText = 'FROZEN';
+        }
+        toggleBtn.className = 'btn btn-primary';
+        toggleBtn.innerText = 'Lift Emergency Freeze (Resume)';
+        if (navBtn) navBtn.className = 'btn btn-primary btn-sm';
+        if (navLabel) navLabel.innerText = 'Lift Freeze';
+        if (card) card.style.borderLeftColor = 'var(--danger)';
+      } else {
+        statusBadge.className = 'badge badge-success';
+        statusBadge.innerText = 'DISPATCH ACTIVE';
+        if (sysStatus) {
+          sysStatus.className = 'badge badge-success';
+          sysStatus.innerText = 'Healthy';
+        }
+        toggleBtn.className = 'btn btn-danger';
+        toggleBtn.innerText = 'Freeze All Dispatches';
+        if (navBtn) navBtn.className = 'btn btn-danger btn-sm';
+        if (navLabel) navLabel.innerText = 'Emergency Freeze';
+        if (card) card.style.borderLeftColor = 'var(--accent)';
+      }
+    }
+
+    async function toggleEmergencyFreeze() {
+      const targetState = !isCurrentlyFrozen;
+      const promptMsg = targetState
+        ? 'Are you sure you want to ENGAGE Emergency Freeze? All new crawler dispatches will be stopped.'
+        : 'Are you sure you want to LIFT Emergency Freeze and resume crawler dispatches?';
+      if (!confirm(promptMsg)) return;
+
+      try {
+        const res = await fetch('/api/admin/freeze', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          body: JSON.stringify({ frozen: targetState }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const result = await res.json();
+        isCurrentlyFrozen = Boolean(result.isFrozen);
+        updateFreezeUI(isCurrentlyFrozen);
+      } catch (err) {
+        alert('Failed to toggle emergency freeze: ' + err.message);
+      }
+    }
+
+    function refreshAllData() {
+      loadTasks();
+      loadBrowserMetrics();
+      checkFreezeStatus();
+    }
+
+    // Auto-refresh timer
+    function setupRefresh() {
+      const interval = parseInt(document.getElementById('refresh-interval').value, 10);
+      if (refreshTimer) clearInterval(refreshTimer);
+      if (interval > 0) {
+        refreshTimer = setInterval(refreshAllData, interval);
+      }
+    }
+
+    document.getElementById('refresh-interval').addEventListener('change', setupRefresh);
+
+    // Event delegation for action buttons & switches (Tier 5 hardening)
+    const runningTbody = document.getElementById('running-tasks-tbody');
+    if (runningTbody) {
+      runningTbody.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-action="toggle"]');
+        if (btn && btn.dataset.taskId) {
+          toggleTask(btn.dataset.taskId, btn.dataset.enabled === 'true');
+        }
+      });
+    }
+
+    const queuedTbody = document.getElementById('queued-tasks-tbody');
+    if (queuedTbody) {
+      queuedTbody.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-action="move"]');
+        if (btn && btn.dataset.taskId && btn.dataset.delta) {
+          movePriority(btn.dataset.taskId, parseInt(btn.dataset.delta, 10));
+        }
+      });
+      queuedTbody.addEventListener('change', (e) => {
+        const check = e.target.closest('[data-action="toggle-check"]');
+        if (check && check.dataset.taskId) {
+          toggleTask(check.dataset.taskId, check.checked);
+        }
+      });
+    }
+
+    // Initial load
+    refreshAllData();
+    setupRefresh();
+  </script>
+</body>
+</html>

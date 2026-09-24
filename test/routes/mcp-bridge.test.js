@@ -1,28 +1,34 @@
 'use strict';
 
 /**
- * Unit tests for src/routes/mcp-bridge.js — the loopback-only, read-only SQL
- * passthrough MCP processes use instead of opening PGLITE_DIR a second time
- * (see that file's module doc, and mcp/crawler-pod-server.mjs / src/mcp/db.js,
- * both of which route through it when PG_MODE=pglite).
+ * Unit tests for src/routes/mcp-bridge.js — MCP Bridge Lockdown (Milestone M2)
  *
- * Deliberately does NOT require src/database.js or src/database/pg-client.js:
- * the `database` dependency is a plain stub with an in-memory `_connection`,
- * so these tests never open a real PostgreSQL/PGlite connection or touch
- * data/pgdata. The router is exercised over a real loopback HTTP server
- * (127.0.0.1), which is also what exercises the loopback-allow path of the
- * request-origin check for free; the reject path is covered directly via
- * isLoopbackAddress(), since simulating a genuinely non-loopback
- * req.socket.remoteAddress needs a real remote peer.
+ * Verifies:
+ * - Constant-time service key comparison (crypto.timingSafeEqual on SHA-256)
+ * - Header extraction: x-internal-service-key, Authorization: Bearer <key>
+ * - Immediate 403 when key is missing, mismatched, or empty
+ * - Ingress defense-in-depth: loopback socket check and browser check
+ * - Unknown /api/internal/* endpoints return 404 when key is valid, 403 when not
+ * - SQL read-only validation & statement execution
  */
 
 const test = require('node:test');
 const assert = require('node:assert');
 const express = require('express');
-const { createMcpBridgeRouter, assertReadOnlySql, isLoopbackAddress, QUERY_PATH } = require('../../src/routes/mcp-bridge');
+const {
+  createMcpBridgeRouter,
+  assertReadOnlySql,
+  isLoopbackAddress,
+  extractInternalServiceKey,
+  verifyInternalServiceKey,
+  guardInternalService,
+  QUERY_PATH,
+} = require('../../src/routes/mcp-bridge');
+
+const TEST_KEY = 'test-secret-service-key-32-chars-long!';
 
 // ---------------------------------------------------------------------------
-// Pure functions
+// Pure functions: SQL & Loopback Validation
 // ---------------------------------------------------------------------------
 
 test('assertReadOnlySql: accepts a single SELECT or WITH statement', () => {
@@ -49,8 +55,6 @@ test('assertReadOnlySql: rejects a write keyword smuggled after a SELECT via a s
 });
 
 test('assertReadOnlySql: rejects a write keyword smuggled inside a WITH/SELECT statement (e.g. a writable CTE)', () => {
-  // This starts with WITH, so it clears the first (SELECT/WITH-prefix) gate —
-  // the forbidden-keyword scan is what must catch the DELETE inside the CTE.
   assert.throws(
     () => assertReadOnlySql('WITH gone AS (DELETE FROM runs RETURNING id) SELECT * FROM gone'),
     /write or DDL/
@@ -80,11 +84,47 @@ test('createMcpBridgeRouter: throws synchronously without a database dependency'
 });
 
 // ---------------------------------------------------------------------------
-// Router, over a real loopback HTTP server, against a stubbed database
+// Pure functions: Service Key Extraction & Timing-Safe Verification
 // ---------------------------------------------------------------------------
 
-/** Records every (sql, args) the stub was asked to run, and answers with
- *  canned rows keyed by exact sql text — never opens any real connection. */
+test('extractInternalServiceKey: extracts from x-internal-service-key header', () => {
+  assert.strictEqual(extractInternalServiceKey({ headers: { 'x-internal-service-key': 'secret-123' } }), 'secret-123');
+  assert.strictEqual(extractInternalServiceKey({ headers: { 'x-internal-service-key': ['secret-array'] } }), 'secret-array');
+});
+
+test('extractInternalServiceKey: extracts from Authorization: Bearer <key>', () => {
+  assert.strictEqual(extractInternalServiceKey({ headers: { authorization: 'Bearer secret-bearer-456' } }), 'secret-bearer-456');
+  assert.strictEqual(extractInternalServiceKey({ headers: { authorization: 'bearer lowercase-bearer-456' } }), 'lowercase-bearer-456');
+});
+
+test('extractInternalServiceKey: returns null when headers are missing or malformed', () => {
+  assert.strictEqual(extractInternalServiceKey(null), null);
+  assert.strictEqual(extractInternalServiceKey({ headers: {} }), null);
+  assert.strictEqual(extractInternalServiceKey({ headers: { authorization: 'Basic dXNlcjpwYXNz' } }), null);
+  assert.strictEqual(extractInternalServiceKey({ headers: { 'x-internal-service-key': '' } }), null);
+});
+
+test('verifyInternalServiceKey: returns true for identical keys', () => {
+  assert.strictEqual(verifyInternalServiceKey('exact-matching-secret-key-32', 'exact-matching-secret-key-32'), true);
+});
+
+test('verifyInternalServiceKey: returns false for mismatched keys without RangeError', () => {
+  assert.strictEqual(verifyInternalServiceKey('wrong', 'exact-matching-secret-key-32'), false);
+  assert.strictEqual(verifyInternalServiceKey('exact-matching-secret-key-33', 'exact-matching-secret-key-32'), false);
+  assert.strictEqual(verifyInternalServiceKey('', 'exact-matching-secret-key-32'), false);
+  assert.strictEqual(verifyInternalServiceKey(null, 'exact-matching-secret-key-32'), false);
+  assert.strictEqual(verifyInternalServiceKey('exact-matching-secret-key-32', null), false);
+});
+
+test('verifyInternalServiceKey: preserves control characters and rejects embedded newlines', () => {
+  assert.strictEqual(verifyInternalServiceKey('exact-key\r\n', 'exact-key'), false);
+  assert.strictEqual(verifyInternalServiceKey(' exact-key', 'exact-key'), false);
+});
+
+// ---------------------------------------------------------------------------
+// Router over HTTP Server with Stubbed Database
+// ---------------------------------------------------------------------------
+
 function createStubDatabase(rowsBySql = {}) {
   const calls = [];
   return {
@@ -120,106 +160,275 @@ async function withServer(router, fn) {
   }
 }
 
-test('mcp-bridge router: runs a validated SELECT through the stubbed connection and returns its rows', async () => {
-  const stub = createStubDatabase({ 'SELECT * FROM runs': [{ id: 1, status: 'done' }] });
-  const router = createMcpBridgeRouter({ database: stub });
-
-  await withServer(router, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sql: 'SELECT * FROM runs', params: [] }),
-    });
-    assert.strictEqual(res.status, 200);
-    const body = await res.json();
-    assert.deepStrictEqual(body, { rows: [{ id: 1, status: 'done' }] });
-    assert.strictEqual(stub.calls.length, 1);
-  });
-});
-
-test('mcp-bridge router: forwards positional bind params to Statement.all(...)', async () => {
-  const stub = createStubDatabase({ 'SELECT * FROM runs WHERE id = $1': [{ id: 42 }] });
-  const router = createMcpBridgeRouter({ database: stub });
-
-  await withServer(router, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sql: 'SELECT * FROM runs WHERE id = $1', params: [42] }),
-    });
-    assert.strictEqual(res.status, 200);
-    assert.deepStrictEqual(stub.calls[0].args, [42]);
-  });
-});
-
-test('mcp-bridge router: refuses a write statement with 400 and never calls the connection', async () => {
+test('mcp-bridge router: rejects request with 403 if INTERNAL_SERVICE_KEY is unset in environment', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  delete process.env.INTERNAL_SERVICE_KEY;
   const stub = createStubDatabase();
   const router = createMcpBridgeRouter({ database: stub });
 
-  await withServer(router, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sql: 'DELETE FROM runs' }),
+  try {
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-internal-service-key': 'some-key' },
+        body: JSON.stringify({ sql: 'SELECT 1' }),
+      });
+      assert.strictEqual(res.status, 403);
+      const body = await res.json();
+      assert.strictEqual(body.error, 'Forbidden');
     });
-    assert.strictEqual(res.status, 400);
-    const body = await res.json();
-    assert.match(body.error, /SELECT or WITH/);
-    assert.strictEqual(stub.calls.length, 0);
-  });
+  } finally {
+    if (oldKey !== undefined) process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
 });
 
-test('mcp-bridge router: refuses a missing/empty sql field with 400', async () => {
-  const stub = createStubDatabase();
-  const router = createMcpBridgeRouter({ database: stub });
+test('mcp-bridge router: rejects request with 403 when x-internal-service-key is missing', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase();
+    const router = createMcpBridgeRouter({ database: stub });
 
-  await withServer(router, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({}),
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sql: 'SELECT 1' }),
+      });
+      assert.strictEqual(res.status, 403);
+      const body = await res.json();
+      assert.strictEqual(body.error, 'Forbidden');
+      assert.match(body.message, /INTERNAL_SERVICE_KEY required/);
     });
-    assert.strictEqual(res.status, 400);
-    assert.strictEqual(stub.calls.length, 0);
-  });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: rejects request with 403 when service key is invalid', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase();
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-internal-service-key': 'invalid-key' },
+        body: JSON.stringify({ sql: 'SELECT 1' }),
+      });
+      assert.strictEqual(res.status, 403);
+      const body = await res.json();
+      assert.strictEqual(body.error, 'Forbidden');
+      assert.match(body.message, /Invalid service credentials/);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: allows request with valid x-internal-service-key header', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase({ 'SELECT * FROM runs': [{ id: 1, status: 'done' }] });
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-internal-service-key': TEST_KEY,
+        },
+        body: JSON.stringify({ sql: 'SELECT * FROM runs', params: [] }),
+      });
+      assert.strictEqual(res.status, 200);
+      const body = await res.json();
+      assert.deepStrictEqual(body, { rows: [{ id: 1, status: 'done' }] });
+      assert.strictEqual(stub.calls.length, 1);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: forwards positional bind params to Statement.all(...) with valid key', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase({ 'SELECT * FROM runs WHERE id = $1': [{ id: 42 }] });
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-internal-service-key': TEST_KEY,
+        },
+        body: JSON.stringify({ sql: 'SELECT * FROM runs WHERE id = $1', params: [42] }),
+      });
+      assert.strictEqual(res.status, 200);
+      assert.deepStrictEqual(stub.calls[0].args, [42]);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: allows request with valid Authorization: Bearer <key>', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase({ 'SELECT 1': [{ '?column?': 1 }] });
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${TEST_KEY}`,
+        },
+        body: JSON.stringify({ sql: 'SELECT 1' }),
+      });
+      assert.strictEqual(res.status, 200);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: rejects browser-originated requests even with valid service key', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase();
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-internal-service-key': TEST_KEY,
+          origin: 'https://malicious.example.com',
+        },
+        body: JSON.stringify({ sql: 'SELECT 1' }),
+      });
+      assert.strictEqual(res.status, 403);
+      const body = await res.json();
+      assert.match(body.message, /browser-originated/);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: unknown /api/internal/* route returns 403 without key, 404 with key', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase();
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      // Without key -> 403
+      const resNoKey = await fetch(`${baseUrl}/api/internal/unknown-service`, {
+        method: 'GET',
+      });
+      assert.strictEqual(resNoKey.status, 403);
+
+      // With valid key -> 404 (endpoint not defined)
+      const resWithKey = await fetch(`${baseUrl}/api/internal/unknown-service`, {
+        method: 'GET',
+        headers: { 'x-internal-service-key': TEST_KEY },
+      });
+      assert.strictEqual(resWithKey.status, 404);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: refuses write SQL statement with 400 even with valid key', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase();
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-internal-service-key': TEST_KEY,
+        },
+        body: JSON.stringify({ sql: 'DELETE FROM runs' }),
+      });
+      assert.strictEqual(res.status, 400);
+      assert.strictEqual(stub.calls.length, 0);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
+});
+
+test('mcp-bridge router: refuses a missing/empty sql field with 400 with valid key', async () => {
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const stub = createStubDatabase();
+    const router = createMcpBridgeRouter({ database: stub });
+
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-internal-service-key': TEST_KEY,
+        },
+        body: JSON.stringify({}),
+      });
+      assert.strictEqual(res.status, 400);
+      assert.strictEqual(stub.calls.length, 0);
+    });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
 });
 
 test('mcp-bridge router: a connection-level failure surfaces as a 500 with the error message, not a crash', async () => {
-  const router = createMcpBridgeRouter({
-    database: {
-      _connection: {
-        prepare() {
-          return { async all() { throw new Error('connection reset'); } };
+  const oldKey = process.env.INTERNAL_SERVICE_KEY;
+  process.env.INTERNAL_SERVICE_KEY = TEST_KEY;
+  try {
+    const router = createMcpBridgeRouter({
+      database: {
+        _connection: {
+          prepare() {
+            return { async all() { throw new Error('connection reset'); } };
+          },
         },
       },
-    },
-  });
-
-  await withServer(router, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sql: 'SELECT 1' }),
     });
-    assert.strictEqual(res.status, 500);
-    const body = await res.json();
-    assert.match(body.error, /connection reset/);
-  });
-});
 
-test('mcp-bridge router: a loopback request (this test client) is allowed through', async () => {
-  // The reject branch is covered directly by the isLoopbackAddress unit
-  // tests above; this confirms the middleware does not also reject the
-  // allowed case, i.e. it is not accidentally inverted.
-  const stub = createStubDatabase({ 'SELECT 1': [{ '?column?': 1 }] });
-  const router = createMcpBridgeRouter({ database: stub });
-
-  await withServer(router, async (baseUrl) => {
-    const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sql: 'SELECT 1' }),
+    await withServer(router, async (baseUrl) => {
+      const res = await fetch(`${baseUrl}${QUERY_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-internal-service-key': TEST_KEY,
+        },
+        body: JSON.stringify({ sql: 'SELECT 1' }),
+      });
+      assert.strictEqual(res.status, 500);
+      const body = await res.json();
+      assert.match(body.error, /connection reset/);
     });
-    assert.strictEqual(res.status, 200);
-  });
+  } finally {
+    process.env.INTERNAL_SERVICE_KEY = oldKey;
+  }
 });

@@ -81,6 +81,26 @@ function parseUtcMillis(ts) {
 }
 
 /**
+ * Serializes a monitoring_entities row for callers.
+ *
+ * Both node-postgres and PGlite hand TIMESTAMPTZ columns back as JS Date
+ * objects, while the lifecycle policies (SocialLifecyclePolicy /
+ * ShopLifecyclePolicy), their results (expiresAt, unchangedSince, ...) and the
+ * values callers pass in are all canonical ISO 8601 UTC strings. Returning the
+ * entity with Dates meant `entity.expires_at` and `result.expiresAt` for the
+ * same instant had different types. Timestamp columns are therefore returned
+ * as ISO strings; the row object itself is copied, never mutated.
+ */
+function serializeEntityRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  const out = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[key] = value instanceof Date && !isNaN(value.getTime()) ? value.toISOString() : value;
+  }
+  return out;
+}
+
+/**
  * Checks whether a metric value is explicitly present and numeric.
  * Preserves 0 as a valid measurement; rejects null, undefined, '', boolean, and NaN.
  */
@@ -89,6 +109,21 @@ function isMetricPresent(val) {
   if (typeof val === 'boolean') return false;
   const num = Number(val);
   return !isNaN(num) && Number.isFinite(num);
+}
+
+/**
+ * Observation identity/time given at the top level of the config object form
+ * ({ itemUid, patch, observationId, observedAt | observedIso }) rather than in
+ * metadata/patch. Dropping them silently would replace the caller's stable
+ * observationId with a random one and disable deduplication for that write.
+ */
+function pickTopLevelObservationFields(config) {
+  const picked = {};
+  if (!config || typeof config !== 'object') return picked;
+  if (config.observationId != null) picked.observationId = config.observationId;
+  if (config.observedAt != null) picked.observedAt = config.observedAt;
+  if (config.observedIso != null) picked.observedIso = config.observedIso;
+  return picked;
 }
 
 function createMonitoringOps(db, options = {}) {
@@ -157,6 +192,10 @@ function createMonitoringOps(db, options = {}) {
 
   const findItemByUid = db.prepare(`
     SELECT * FROM monitoring_items WHERE item_uid = ?;
+  `);
+
+  const findItemById = db.prepare(`
+    SELECT * FROM monitoring_items WHERE id = ?;
   `);
 
   const findItemWithEntityStmt = db.prepare(`
@@ -446,17 +485,17 @@ function createMonitoringOps(db, options = {}) {
       state_version: Number(stateVersion) || 1,
     });
 
-    return row;
+    return serializeEntityRow(row);
   }
 
   async function getEntity(id) {
     if (id == null) return null;
-    return await findEntityById.get(Number(id)) || null;
+    return serializeEntityRow(await findEntityById.get(Number(id))) || null;
   }
 
   async function getEntityByCompositeKey(platform, entityType, externalId) {
     if (!platform || !entityType || !externalId) return null;
-    return await findEntityByComposite.get(platform, entityType, externalId) || null;
+    return serializeEntityRow(await findEntityByComposite.get(platform, entityType, externalId)) || null;
   }
 
   async function findDueEntities(limit = 100, options = {}) {
@@ -466,12 +505,13 @@ function createMonitoringOps(db, options = {}) {
 
     const nowIso = now instanceof Date ? now.toISOString() : new Date(now).toISOString();
 
-    return await findDueEntitiesStmt.all({
+    const rows = await findDueEntitiesStmt.all({
       now: nowIso,
       platform: platform || null,
       entity_type: entityType || null,
       limit: Math.max(1, Number(limit) || 100),
     });
+    return rows.map(serializeEntityRow);
   }
 
   async function updateEntityStatus(id, status, reason = null, options = {}) {
@@ -491,7 +531,7 @@ function createMonitoringOps(db, options = {}) {
       expected_state_version: expectedStateVersion != null ? Number(expectedStateVersion) : null,
     });
 
-    return updated || null;
+    return serializeEntityRow(updated) || null;
   }
 
   async function registerItemForMonitoring(data = {}) {
@@ -535,9 +575,20 @@ function createMonitoringOps(db, options = {}) {
     });
   }
 
-  async function getItem(itemUid) {
-    if (!itemUid) return null;
-    return await findItemByUid.get(itemUid) || null;
+  /**
+   * Looks up a monitoring item by its item_uid (string, e.g. 'etsy:123') or by
+   * its numeric monitoring_items.id. item_uid is always a platform-prefixed
+   * string, so a number is unambiguous and resolves by primary key.
+   */
+  async function getItem(itemUidOrId) {
+    if (itemUidOrId == null || itemUidOrId === '') return null;
+    if (typeof itemUidOrId === 'number') return getMonitoringItemById(itemUidOrId);
+    return await findItemByUid.get(itemUidOrId) || null;
+  }
+
+  async function getMonitoringItemById(itemId) {
+    if (itemId == null) return null;
+    return await findItemById.get(Number(itemId)) || null;
   }
 
   async function getItemWithEntity(itemUid) {
@@ -606,7 +657,7 @@ function createMonitoringOps(db, options = {}) {
         patch = config.patch || config.payload || {};
         metadata = config.metadata || {};
         if (!metadata || typeof metadata !== 'object') metadata = {};
-        options = { ...metadata, ...(config.options || {}) };
+        options = { ...pickTopLevelObservationFields(config), ...metadata, ...(config.options || {}) };
       }
     } else {
       // Signature: applyMonitoringObservation(itemUid, payload, options)
@@ -615,7 +666,7 @@ function createMonitoringOps(db, options = {}) {
         patch = arg1.patch || arg1.payload || arg2 || {};
         metadata = (arg1 && arg1.metadata) || (arg2 && typeof arg2 === 'object' && arg2.metadata ? arg2.metadata : {});
         if (!metadata || typeof metadata !== 'object') metadata = {};
-        options = arg3 || arg1.options || {};
+        options = { ...pickTopLevelObservationFields(arg1), ...(arg3 || arg1.options || {}) };
         if (options.db) targetDb = options.db;
       } else {
         itemUid = arg1;
@@ -643,7 +694,7 @@ function createMonitoringOps(db, options = {}) {
       || (options.jobId ? `monitoring:${options.jobId}:${crypto.randomUUID()}` : null)
       || `monitoring:job:${crypto.randomUUID()}`;
 
-    const rawObservedAt = patch.observedAt || options.observedAt || metadata.observedAt || new Date();
+    const rawObservedAt = patch.observedAt || options.observedAt || metadata.observedAt || options.observedIso || new Date();
     const observedIso = normalizeUtcTimestamp(rawObservedAt);
     const observedDate = observedIso.slice(0, 10);
     const observedTime = observedIso.slice(11, 19);
@@ -851,6 +902,11 @@ function createMonitoringOps(db, options = {}) {
         .map(o => o.price)
         .filter(p => p !== null && p !== undefined && !isNaN(p));
 
+      const obsWithValidPrices = observations.filter(o => o.price !== null && o.price !== undefined && !isNaN(o.price));
+      const latestPriceObs = obsWithValidPrices.length > 0
+        ? obsWithValidPrices.reduce((latest, o) => new Date(o.time).getTime() > new Date(latest.time).getTime() ? o : latest, obsWithValidPrices[0])
+        : null;
+
       if (historyRow) {
         const minPrice = validPrices.length > 0
           ? validPrices.reduce((m, p) => (p < m ? p : m), validPrices[0])
@@ -860,7 +916,7 @@ function createMonitoringOps(db, options = {}) {
           : historyRow.max_price;
         const latestPrice = (isNonNegMetric(patch.price) && !isLateArrival)
           ? Number(patch.price)
-          : (validPrices.length > 0 ? validPrices[validPrices.length - 1] : historyRow.latest_price);
+          : (latestPriceObs ? latestPriceObs.price : historyRow.latest_price);
         const latestLikes = (isNonNegMetric(patch.likes) && !isLateArrival)
           ? Math.trunc(Number(patch.likes))
           : historyRow.latest_likes;
@@ -953,7 +1009,14 @@ function createMonitoringOps(db, options = {}) {
   /**
    * Atomically records an observation for an entity into monitoring_entity_observations.
    */
-  async function recordEntityObservation(entityId, observation = {}, options = {}) {
+  async function recordEntityObservation(entityIdOrObservation, observation = {}, options = {}) {
+    // Also accept the single-object form recordEntityObservation({ entityId, ...observation }).
+    let entityId = entityIdOrObservation;
+    if (entityIdOrObservation && typeof entityIdOrObservation === 'object') {
+      options = observation || {};
+      observation = entityIdOrObservation;
+      entityId = observation.entityId ?? observation.entity_id;
+    }
     if (entityId == null) {
       throw new TypeError('recordEntityObservation: entityId is required');
     }
@@ -1204,7 +1267,7 @@ function createMonitoringOps(db, options = {}) {
       }
 
       return {
-        entity: updatedEntity,
+        entity: serializeEntityRow(updatedEntity),
         evaluation,
         observation: obsRow,
         action: evaluation.action,
@@ -1241,11 +1304,12 @@ function createMonitoringOps(db, options = {}) {
       LIMIT @limit;
     `);
 
-    return await stmt.all({
+    const rows = await stmt.all({
       now: nowIso,
       platform: platform || null,
       limit: Math.max(1, Number(limit) || 100),
     });
+    return rows.map(serializeEntityRow);
   }
 
   /**
@@ -1351,7 +1415,7 @@ function createMonitoringOps(db, options = {}) {
         if (starredBool === Boolean(entity.is_starred) && entity.tracking_status !== 'expired') {
           // Idempotent no-op
           return {
-            entity,
+            entity: serializeEntityRow(entity),
             stateChanged: false,
             action: starredBool ? 'noop_already_starred' : 'noop_already_unstarred',
             isStarred: starredBool,
@@ -1381,7 +1445,7 @@ function createMonitoringOps(db, options = {}) {
           if (starredBool) {
             if (nowMs >= starredMs) {
               return {
-                entity,
+                entity: serializeEntityRow(entity),
                 stateChanged: false,
                 error: 'PAST_60D_WINDOW_CANNOT_REACTIVATE',
                 action: 'past_60d_cannot_reactivate',
@@ -1421,7 +1485,7 @@ function createMonitoringOps(db, options = {}) {
         // Shop or other entity: star updates priority only
         if (starredBool === Boolean(entity.is_starred)) {
           return {
-            entity,
+            entity: serializeEntityRow(entity),
             stateChanged: false,
             action: 'noop_already_set',
             isStarred: starredBool,
@@ -1435,7 +1499,7 @@ function createMonitoringOps(db, options = {}) {
 
       if (!stateChanged && error) {
         return {
-          entity,
+          entity: serializeEntityRow(entity),
           stateChanged: false,
           error,
           action,
@@ -1506,7 +1570,7 @@ function createMonitoringOps(db, options = {}) {
       }
 
       return {
-        entity: updatedEntity,
+        entity: serializeEntityRow(updatedEntity),
         stateChanged: true,
         action,
         isStarred: starredBool,
@@ -1662,11 +1726,12 @@ function createMonitoringOps(db, options = {}) {
       LIMIT @limit;
     `);
 
-    return await stmt.all({
+    const rows = await stmt.all({
       now: nowIso,
       platform: platform || null,
       limit: Math.max(1, Number(limit) || 100),
     });
+    return rows.map(serializeEntityRow);
   }
 
   /**
@@ -1752,7 +1817,7 @@ function createMonitoringOps(db, options = {}) {
       }
 
       return {
-        entity: updatedEntity,
+        entity: serializeEntityRow(updatedEntity),
         action: 'new_session_started',
         sessionId: newSessionId,
         monitoringStartedAt: nowIso,
@@ -1808,7 +1873,7 @@ function createMonitoringOps(db, options = {}) {
           -- Scheduled time (aging)
           j.scheduled_for ASC
         LIMIT 1
-        FOR UPDATE SKIP LOCKED
+        FOR UPDATE OF j SKIP LOCKED
       )
       RETURNING *;
     `, [workerToken, `${leaseDurationMs}`]);
@@ -1946,6 +2011,7 @@ function createMonitoringOps(db, options = {}) {
     registerItemForMonitoring,
     handlePendingIdentity,
     getItem,
+    getMonitoringItemById,
     getItemWithEntity,
     resolvePendingIdentity,
     findDueItems,

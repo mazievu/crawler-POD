@@ -7,7 +7,13 @@ class CheckpointStore {
     this.platform = platform;
     this.keyword = keyword;
     this.sessionId = sessionId;
-    this.baseDir = path.join(__dirname, '..', '..', 'data', 'captures', this.sessionId);
+    // Allow tests (and any hermetic subprocess) to override where journey
+    // checkpoints are written, so they never write into the repo's real
+    // data/captures directory.
+    const capturesRoot = process.env.CAPTURES_DIR
+      ? path.resolve(process.env.CAPTURES_DIR)
+      : path.join(__dirname, '..', '..', 'data', 'captures');
+    this.baseDir = path.join(capturesRoot, this.sessionId);
     
     if (!fs.existsSync(this.baseDir)) {
       fs.mkdirSync(this.baseDir, { recursive: true });

@@ -38,6 +38,13 @@ class MonitoringLimiter {
    * Attempts to atomically acquire the capture lease.
    * Succeeds only if no active unexpired lease exists AND next_allowed_at <= now().
    *
+   * Acquiring does NOT move next_allowed_at. SSOT §6 defines the 20s cooldown
+   * (MONITOR_ITEM_DELAY_MS) as the gap from the END of a capture to the next
+   * start, so only releaseLease() starts it. Arming it here as well measured
+   * the cooldown from the previous START, which made an expired (crashed or
+   * stolen) lease unrecoverable until start + cooldown even after
+   * leased_until had passed.
+   *
    * @param {string} ownerToken - Unique worker identity (e.g. `mon-${pid}-${uuid}`)
    * @param {number} [leaseDurationMs=60000] - TTL in milliseconds
    * @returns {Promise<object|null>} Lease row if acquired, null if denied
@@ -49,13 +56,12 @@ class MonitoringLimiter {
     const res = await this.db.query(`
       UPDATE monitoring_limiter
       SET owner_token = $1,
-          leased_until = now() + ($2 || ' milliseconds')::interval,
-          next_allowed_at = now() + ($3 || ' milliseconds')::interval
-      WHERE key = $4
+          leased_until = now() + ($2 || ' milliseconds')::interval
+      WHERE key = $3
         AND (leased_until IS NULL OR leased_until < now())
         AND next_allowed_at <= now()
       RETURNING key, owner_token, leased_until, next_allowed_at
-    `, [ownerToken, `${duration}`, `${this.cooldownMs}`, this.key]);
+    `, [ownerToken, `${duration}`, this.key]);
 
     return res.rows && res.rows.length > 0 ? res.rows[0] : null;
   }

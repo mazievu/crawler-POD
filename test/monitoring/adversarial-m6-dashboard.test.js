@@ -298,8 +298,13 @@ describe('Challenge 2: POST /api/admin/tasks/reorder verification & stress tests
   });
 
   test('C2.4: Invalid input payloads are rejected with HTTP 400 and descriptive error', async () => {
-    // String instead of array
-    const res1 = await apiRequest(port, 'POST', '/api/admin/tasks/reorder', 'invalid-string');
+    // Bare JSON string body: express.json() (strict mode) rejects non-object
+    // top-level JSON with 400 before the route runs, so there is no route JSON.
+    const res0 = await apiRequest(port, 'POST', '/api/admin/tasks/reorder', 'invalid-string');
+    assert.equal(res0.status, 400);
+
+    // String instead of array inside a valid JSON object
+    const res1 = await apiRequest(port, 'POST', '/api/admin/tasks/reorder', { taskOrder: 'invalid-string' });
     assert.equal(res1.status, 400);
     assert.match(res1.data.error, /array/i);
 

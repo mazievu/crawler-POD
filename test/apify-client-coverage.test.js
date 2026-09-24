@@ -1,5 +1,14 @@
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
+
+// Hermetic: never pick up the developer's real token store or .env tokens —
+// otherwise the "no token" test would start a real (billable) Apify actor.
+// Empty strings (not delete) so dotenv cannot re-populate them from .env.
+process.env.APIFY_TOKENS_PATH = path.join(os.tmpdir(), `apify-tokens-absent-${process.pid}.json`);
+process.env.APIFY_TOKENS = '';
+process.env.APIFY_TOKEN = '';
 
 const {
   INPUT_BUILDERS,
