@@ -71,12 +71,15 @@ function detectBlockOrChallenge(htmlOrObj = '', statusOrOptions = 200, maybeErro
   }
 
   // Generic Captchas / anti-bot challenge text
-  if (/verify you are (?:a )?human|robot check|unusual traffic|automated access|pardon our interruption|recaptcha|hcaptcha/i.test(combined)) {
+  if (/verify you are (?:a )?human|robot check|unusual traffic|automated access|pardon our interruption|recaptcha|h-?captcha/i.test(combined)) {
     return { blocked: true, reason: 'CAPTCHA_CHALLENGE' };
   }
 
-  // Partial / Truncated HTML (Boundary F28.B5)
-  if (html && html.length > 0 && !html.includes('</html>')) {
+  // Partial / Truncated HTML (Boundary F28.B5): a response that opened an HTML
+  // document but never closed it. Tag names are case-insensitive, and a body
+  // that is not an HTML document at all (JSON, plain text) cannot be truncated
+  // HTML, so it must not be misread as a block.
+  if (html && /<html[\s>]/i.test(html) && !/<\/html\s*>/i.test(html)) {
     return { blocked: true, reason: 'TRUNCATED_HTML' };
   }
 

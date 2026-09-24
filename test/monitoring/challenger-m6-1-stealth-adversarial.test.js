@@ -544,10 +544,10 @@ test('Challenger 7.2: Adversarial check on uppercase </HTML> tag handling', () =
   const uppercaseHtml = '<!DOCTYPE HTML><HTML><HEAD><TITLE>OK</TITLE></HEAD><BODY>VALID HTML</BODY></HTML>';
   const res = detectBlockOrChallenge({ html: uppercaseHtml, statusCode: 200 });
 
-  // Note: detectBlockOrChallenge checks !html.includes('</html>') which is case-sensitive
-  // Documenting actual behavior: it identifies uppercase </HTML> as TRUNCATED_HTML
-  assert.equal(res.blocked, true);
-  assert.equal(res.reason, 'TRUNCATED_HTML');
+  // HTML tag names are case-insensitive: a complete uppercase document must not
+  // be misclassified as TRUNCATED_HTML (which would force a needless fallback).
+  assert.equal(res.blocked, false);
+  assert.equal(res.reason, null);
 });
 
 test('Challenger 7.3: Adversarial check on string vs numeric statusCode in object input', () => {
