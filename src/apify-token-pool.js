@@ -11,7 +11,12 @@ const fs = require('fs');
 const path = require('path');
 const { ApifyClient } = require('apify-client');
 
-const DEFAULT_CONFIG_PATH = path.join(process.cwd(), 'data', 'apify_tokens.json');
+// Allow tests (and any hermetic subprocess) to override where the token
+// pool persists its state, so they never read or write the real
+// data/apify_tokens.json used by a developer's local run.
+const DEFAULT_CONFIG_PATH = process.env.APIFY_TOKENS_PATH
+  ? path.resolve(process.env.APIFY_TOKENS_PATH)
+  : path.join(process.cwd(), 'data', 'apify_tokens.json');
 
 const AUTH_PATTERNS = [
   /unauthorized/i,
