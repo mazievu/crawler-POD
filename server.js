@@ -105,6 +105,10 @@ async function bootstrapDatabase() {
   const apifyPool = getApifyTokenPool().attachBudgetLedger(db.createApifyBudgetLedger());
   const apifyBudget = await apifyPool.syncBudgetFromLedger();
   console.log(`[ApifyBudget] Durable ledger attached: spent $${apifyBudget.totalSpentUsd}, balance $${apifyBudget.remainingBalanceUsd}`);
+  // Runs that were still RUNNING when a process stopped polling them keep a
+  // 'committed' reservation; settle them to Apify's final usage now and
+  // periodically (unref'd timer, errors logged only).
+  apifyPool.startReconciliation({ intervalMs: Number(process.env.APIFY_RECONCILE_INTERVAL_MS) || undefined });
 
   // Milestone M1: Super Admin Bootstrap from environment
   const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
@@ -134,6 +138,17 @@ async function bootstrapDatabase() {
     if (process.env.NODE_ENV === 'production') {
       process.exit(1);
     }
+  }
+
+  // bootstrapSuperAdmin() reports success without creating anything when
+  // ADMIN_EMAIL already belongs to a NON-admin user, so "no error" does not
+  // mean "an admin exists". Production must never serve with zero admins.
+  if (process.env.NODE_ENV === 'production' && (await db.countAdmins()) === 0) {
+    console.error(
+      '[Auth] FATAL: no admin account exists after bootstrap. ADMIN_EMAIL may belong to an existing '
+      + 'non-admin user; promote that user or choose a different ADMIN_EMAIL (see scripts/bootstrap-admin.js).'
+    );
+    process.exit(1);
   }
 
   // Boot-time crash recovery
