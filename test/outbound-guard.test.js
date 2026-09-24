@@ -515,7 +515,12 @@ test('OG7.2: web-reader.js readPublicWebPage rejects private target and readerBa
     (err) => err instanceof SSRFSecurityError && err.blockedReason === 'PRIVATE_IP_BLOCKED'
   );
   await assert.rejects(
-    async () => webReader.readPublicWebPage('https://example.com/page', { readerBase: 'http://169.254.169.254/' }),
+    // Hermetic DNS: the public target must pass pre-flight without a real lookup,
+    // so the assertion isolates the readerBase metadata block.
+    async () => webReader.readPublicWebPage('https://example.com/page', {
+      readerBase: 'http://169.254.169.254/',
+      dnsResolver: async () => '93.184.216.34',
+    }),
     (err) => err instanceof SSRFSecurityError && err.blockedReason === 'CLOUD_METADATA_BLOCKED'
   );
 });
