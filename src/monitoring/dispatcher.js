@@ -9,6 +9,26 @@
 const crypto = require('crypto');
 const { MonitoringLimiter } = require('./limiter');
 
+/**
+ * Races a capture promise against an AbortSignal so that a capture which
+ * ignores the signal (e.g. a hung browser) can never keep executeJob — and
+ * with it the heartbeat interval and the process — alive after shutdown.
+ */
+function raceAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(new Error(`Capture aborted: ${signal.reason || 'aborted'}`));
+  }
+  let onAbort;
+  const aborted = new Promise((_resolve, reject) => {
+    onAbort = () => reject(new Error(`Capture aborted: ${signal.reason || 'aborted'}`));
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  return Promise.race([promise, aborted]).finally(() => {
+    signal.removeEventListener('abort', onAbort);
+  });
+}
+
 function parseMonitoringFlag(val) {
   if (val === undefined || val === null) return false;
   const str = String(val).trim().toLowerCase();
@@ -212,6 +232,8 @@ class MonitoringDispatcher {
         monitoringOps.renewJobLease(job.id, workerToken, 60000).catch(() => {});
       }
     }, 15000);
+    // The heartbeat must never be the only thing keeping the process alive.
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
     try {
       // Acquire browser pool slot if scheduler pools are available
@@ -221,11 +243,10 @@ class MonitoringDispatcher {
 
       // Execute capture via pluggable runner or default fallback
       try {
-        if (typeof this.captureFn === 'function') {
-          captureResult = await this.captureFn(job, { signal, workerToken });
-        } else {
-          captureResult = await this.defaultCapture(job, { signal });
-        }
+        const capturePromise = typeof this.captureFn === 'function'
+          ? Promise.resolve().then(() => this.captureFn(job, { signal, workerToken }))
+          : Promise.resolve().then(() => this.defaultCapture(job, { signal }));
+        captureResult = await raceAbort(capturePromise, signal);
         captureSuccess = Boolean(captureResult && captureResult.status !== 'failed');
       } catch (err) {
         captureSuccess = false;
