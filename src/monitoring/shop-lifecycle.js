@@ -24,11 +24,26 @@ const CONSTANTS = {
   VALID_QUALITIES: ['exact', 'rounded', 'estimated', 'unreliable', 'recalibrated'],
 };
 
+/** ISO 8601 UTC timestamps ('YYYY-MM-DDTHH:MM:SS[.sss]Z') are already canonical. */
+const CANONICAL_UTC_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+
 /**
- * Normalizes input date/string/timestamp into a canonical ISO 8601 UTC string.
+ * Normalizes input date/string/timestamp into an ISO 8601 UTC string.
+ *
+ * A caller-supplied string that is already a valid ISO 8601 UTC timestamp is
+ * returned verbatim (SSOT §3.2: unchanged_since / sales_observed_at /
+ * last_increase_observed_at are "set to observed_at"), so the policy output
+ * round-trips the observation's own timestamp instead of re-serialising it
+ * with added milliseconds. Every other shape (Date, epoch ms, numeric string,
+ * space-separated SQLite text, date-only, offsets) is converted to
+ * Date#toISOString().
  */
 function normalizeIso(dateInput) {
   if (dateInput === null || dateInput === undefined || dateInput === '') return null;
+  if (typeof dateInput === 'string') {
+    const trimmed = dateInput.trim();
+    if (CANONICAL_UTC_ISO_RE.test(trimmed) && !isNaN(Date.parse(trimmed))) return trimmed;
+  }
   if (dateInput instanceof Date) {
     return isNaN(dateInput.getTime()) ? null : dateInput.toISOString();
   }
