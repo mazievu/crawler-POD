@@ -90,6 +90,8 @@ function parseTokenSignal(signal) {
 
 const DEFAULT_ESTIMATED_RUN_COST_USD = 0.05;
 const DEFAULT_INITIAL_BALANCE_USD = 100.0;
+const DEFAULT_RECONCILE_INTERVAL_MS = 5 * 60 * 1000;
+const APIFY_TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT', 'TIMED_OUT']);
 const USD_DECIMALS = 4;
 
 function roundUsd(value) {
@@ -118,7 +120,7 @@ function resolveEstimateConfig(raw) {
  * `started` is what decides between refund (release) and settlement.
  */
 function createRunTracker() {
-  return { started: false, runId: null, costUsd: null, costFinal: false, commitPromise: null };
+  return { started: false, runId: null, costUsd: null, costFinal: false, pending: false, commitPromise: null };
 }
 
 /** Folds a callback's return value into the tracker (legacy cost/runId fields). */
@@ -219,6 +221,8 @@ class ApifyTokenPoolManager {
     this.reservationCounter = 0;
     this.budgetLedger = null;
     this._ledgerReady = null;
+    this._reconcileTimer = null;
+    this._reconcileInFlight = null;
     if (options.budgetLedger) this.attachBudgetLedger(options.budgetLedger);
 
     this.tokens = new Map(); // id -> token record
@@ -537,6 +541,137 @@ class ApifyTokenPoolManager {
     }
   }
 
+  /**
+   * The actor started but was still running (or its status unknown) when we
+   * stopped polling: its final cost is not known yet. Keep the reservation
+   * 'committed' with its run id — neither refunded nor settled as final — so
+   * reconcilePendingRuns() can settle it to Apify's real usageTotalUsd later.
+   */
+  async _deferReservation(reservation, tracker) {
+    try {
+      if (tracker.commitPromise) await tracker.commitPromise;
+      if (!reservation.ledger) {
+        const res = this.reservations.get(reservation.id);
+        if (res) {
+          res.committed = true;
+          res.pendingRunId = tracker.runId;
+        }
+      } else {
+        // No-op when already committed; records the run id otherwise.
+        await reservation.ledger.commit(reservation.id, tracker.runId);
+      }
+      console.warn(`[ApifyTokenPool] Run ${tracker.runId} not terminal when polling stopped; reservation ${reservation.id} left committed for reconciliation`);
+    } catch (err) {
+      console.error(`[ApifyTokenPool] Budget deferral failed for ${reservation.id}: ${err.message}`);
+    }
+  }
+
+  /** Settles, or defers when the run is still pending on Apify's side. */
+  async _closeStartedReservation(reservation, tracker) {
+    if (tracker.pending && tracker.runId) return this._deferReservation(reservation, tracker);
+    return this._settleReservation(reservation, tracker);
+  }
+
+  /** Status + usage of a run, trying each token's client (runs are per account). */
+  async _fetchRunInfo(runId) {
+    const { getRunInfo } = require('./apify-client');
+    let lastError = null;
+    for (const client of this.clients.values()) {
+      try {
+        const info = await getRunInfo(runId, client);
+        if (info && info.status) return info;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    if (lastError) throw lastError;
+    return null;
+  }
+
+  _listPendingRuns(limit) {
+    if (this.budgetLedger) return this.budgetLedger.listPendingRuns({ limit });
+    const pending = [];
+    for (const res of this.reservations.values()) {
+      if (res.committed && res.pendingRunId) {
+        pending.push({ reservationId: res.id, apifyRunId: res.pendingRunId, estimatedUsd: res.amount });
+      }
+    }
+    return pending.slice(0, limit);
+  }
+
+  async _settlePendingRun(row, usd) {
+    if (!this.budgetLedger) {
+      this.reconcileBudget(row.reservationId, usd);
+      return true;
+    }
+    const state = await this.budgetLedger.settle(row.reservationId, usd, row.apifyRunId);
+    this._applyLedgerState(state);
+    return Boolean(state);
+  }
+
+  /**
+   * Settles committed reservations whose run has since reached a terminal
+   * status, to the run's usageTotalUsd (the estimate when Apify reports
+   * none). Non-terminal runs are left for the next sweep. Idempotent and safe
+   * across instances: settle() only moves a reservation out of 'committed'
+   * once. Concurrent calls in one process share a single sweep.
+   * @returns {Promise<{ checked: number, settled: number, pending: number, errors: number }>}
+   */
+  reconcilePendingRuns({ limit = 100 } = {}) {
+    if (!this._reconcileInFlight) {
+      this._reconcileInFlight = this._reconcileOnce(limit)
+        .finally(() => { this._reconcileInFlight = null; });
+    }
+    return this._reconcileInFlight;
+  }
+
+  async _reconcileOnce(limit) {
+    if (this.budgetLedger) await this._ensureLedger();
+    const rows = await this._listPendingRuns(limit);
+    const summary = { checked: rows.length, settled: 0, pending: 0, errors: 0 };
+    for (const row of rows) {
+      try {
+        const info = await this._fetchRunInfo(row.apifyRunId);
+        if (!info || !APIFY_TERMINAL_RUN_STATUSES.has(info.status)) {
+          summary.pending += 1;
+          continue;
+        }
+        const usd = info.usageTotalUsd !== null && info.usageTotalUsd !== undefined ? info.usageTotalUsd : row.estimatedUsd;
+        if (await this._settlePendingRun(row, usd)) summary.settled += 1;
+      } catch (err) {
+        summary.errors += 1;
+        console.error(`[ApifyTokenPool] Reconciliation of run ${row.apifyRunId} failed: ${err.message}`);
+      }
+    }
+    if (summary.settled > 0) {
+      console.log(`[ApifyTokenPool] Reconciled ${summary.settled} pending Apify run(s) to their final usage`);
+    }
+    return summary;
+  }
+
+  /**
+   * Runs reconcilePendingRuns() now and then every intervalMs on an unref'd
+   * timer (never keeps the process alive). Errors are logged, never thrown.
+   */
+  startReconciliation({ intervalMs = DEFAULT_RECONCILE_INTERVAL_MS } = {}) {
+    this.stopReconciliation();
+    const period = Number(intervalMs) > 0 ? Number(intervalMs) : DEFAULT_RECONCILE_INTERVAL_MS;
+    const sweep = () => {
+      Promise.resolve()
+        .then(() => this.reconcilePendingRuns())
+        .catch((err) => console.error(`[ApifyTokenPool] Reconciliation sweep failed: ${err.message}`));
+    };
+    sweep();
+    this._reconcileTimer = setInterval(sweep, period);
+    if (typeof this._reconcileTimer.unref === 'function') this._reconcileTimer.unref();
+    return this._reconcileTimer;
+  }
+
+  stopReconciliation() {
+    if (this._reconcileTimer) clearInterval(this._reconcileTimer);
+    this._reconcileTimer = null;
+  }
+
   /** Refunds a reservation whose actor never started. */
   async _releaseReservation(reservation) {
     try {
@@ -568,6 +703,14 @@ class ApifyTokenPoolManager {
         if (usd === null || usd === undefined || !Number.isFinite(n) || n < 0) return;
         tracker.costUsd = n;
         tracker.costFinal = Boolean(final);
+        if (tracker.costFinal) tracker.pending = false;
+      },
+      // The actor is (or may still be) running on Apify but we stopped
+      // watching it: its final cost must be reconciled later, not guessed now.
+      reportRunPending: (runId) => {
+        tracker.started = true;
+        if (runId) tracker.runId = String(runId);
+        tracker.pending = true;
       },
     };
   }
@@ -971,14 +1114,14 @@ class ApifyTokenPoolManager {
           absorbResult(tracker, result);
           const settled = reservation;
           reservation = null;
-          await this._settleReservation(settled, tracker);
+          await this._closeStartedReservation(settled, tracker);
           return result;
         } catch (err) {
           lastError = err;
           if (tracker.started) {
             const settled = reservation;
             reservation = null;
-            await this._settleReservation(settled, tracker);
+            await this._closeStartedReservation(settled, tracker);
           }
           if (!this._shouldRotate(err, tokenId, tokenRecord, attempt, maxRotations, excludeTokenIds)) throw err;
         }
@@ -1064,6 +1207,7 @@ function getApifyTokenPool(options = {}) {
 }
 
 module.exports = {
+  APIFY_TERMINAL_RUN_STATUSES,
   ApifyBudgetExceededError,
   ApifyTokenPoolManager,
   getApifyTokenPool,

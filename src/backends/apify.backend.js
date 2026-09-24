@@ -1,10 +1,9 @@
 const BaseBackend = require('./base.backend');
 const apifyClient = require('../apify-client');
-const { getApifyTokenPool } = require('../apify-token-pool');
+const { getApifyTokenPool, APIFY_TERMINAL_RUN_STATUSES } = require('../apify-token-pool');
 
 const DEFAULT_POLL_INTERVAL_MS = 3000;
 const DEFAULT_MAX_POLL_ATTEMPTS = 120; // 3000ms * 120 = 360 seconds timeout
-const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT', 'TIMED_OUT']);
 
 class ApifyBackend extends BaseBackend {
   /**
@@ -23,31 +22,55 @@ class ApifyBackend extends BaseBackend {
    * Polls until the run is terminal (or the attempt budget runs out), reporting
    * Apify's usageTotalUsd to the token pool on every poll so the budget ledger
    * settles to the real cost — for failed/aborted/timed-out runs too.
+   *
+   * If we stop watching while the run is NOT terminal (local abort, poll
+   * timeout, or a status error) the run keeps costing money on Apify: it is
+   * reported as pending so its reservation is reconciled to the final usage
+   * later, and Apify is asked (best effort) to abort it.
    */
   async pollRun(runId, apiClient, admission, signal) {
     let status = 'RUNNING';
     let attempts = 0;
 
-    while (attempts < this.maxPollAttempts) {
-      // Gap #2 closure: stop OUR polling promptly on abort. This does not
-      // stop the remote Apify actor itself (it is not this process's to
-      // stop) — it only lets this execution settle so its local resources
-      // (worker slot/RAM) can be released honestly.
-      if (signal && signal.aborted) {
-        throw new Error('ABORTED: execution cancelled while polling Apify run status');
+    try {
+      while (attempts < this.maxPollAttempts) {
+        // Gap #2 closure: stop OUR polling promptly on abort so this
+        // execution's local resources (worker slot/RAM) are released.
+        if (signal && signal.aborted) {
+          throw new Error('ABORTED: execution cancelled while polling Apify run status');
+        }
+        attempts++;
+        await new Promise(r => setTimeout(r, this.pollIntervalMs));
+        const info = await apifyClient.getRunInfo(runId, apiClient);
+        status = info.status;
+        const isTerminal = APIFY_TERMINAL_RUN_STATUSES.has(status);
+        if (info.usageTotalUsd !== null && admission && typeof admission.reportRunCost === 'function') {
+          admission.reportRunCost(info.usageTotalUsd, { final: isTerminal });
+        }
+        if (isTerminal) break;
       }
-      attempts++;
-      await new Promise(r => setTimeout(r, this.pollIntervalMs));
-      const info = await apifyClient.getRunInfo(runId, apiClient);
-      status = info.status;
-      const isTerminal = TERMINAL_RUN_STATUSES.has(status);
-      if (info.usageTotalUsd !== null && admission && typeof admission.reportRunCost === 'function') {
-        admission.reportRunCost(info.usageTotalUsd, { final: isTerminal });
-      }
-      if (isTerminal) break;
+    } catch (err) {
+      await this.leaveRunPending(runId, apiClient, admission);
+      throw err;
     }
 
+    if (!APIFY_TERMINAL_RUN_STATUSES.has(status)) {
+      await this.leaveRunPending(runId, apiClient, admission);
+    }
     return { status, attempts };
+  }
+
+  /** Marks the run's cost as pending reconciliation and asks Apify to abort it. */
+  async leaveRunPending(runId, apiClient, admission) {
+    if (admission && typeof admission.reportRunPending === 'function') {
+      admission.reportRunPending(runId);
+    }
+    try {
+      const run = apiClient && typeof apiClient.run === 'function' ? apiClient.run(runId) : null;
+      if (run && typeof run.abort === 'function') await run.abort();
+    } catch (err) {
+      console.warn(`[Apify] Could not abort run ${runId} on Apify: ${err.message}`);
+    }
   }
 
   async probe(channel, backendConfig) {

@@ -105,6 +105,10 @@ async function bootstrapDatabase() {
   const apifyPool = getApifyTokenPool().attachBudgetLedger(db.createApifyBudgetLedger());
   const apifyBudget = await apifyPool.syncBudgetFromLedger();
   console.log(`[ApifyBudget] Durable ledger attached: spent $${apifyBudget.totalSpentUsd}, balance $${apifyBudget.remainingBalanceUsd}`);
+  // Runs that were still RUNNING when a process stopped polling them keep a
+  // 'committed' reservation; settle them to Apify's final usage now and
+  // periodically (unref'd timer, errors logged only).
+  apifyPool.startReconciliation({ intervalMs: Number(process.env.APIFY_RECONCILE_INTERVAL_MS) || undefined });
 
   // Milestone M1: Super Admin Bootstrap from environment
   const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
